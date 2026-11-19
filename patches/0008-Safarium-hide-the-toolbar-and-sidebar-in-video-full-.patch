@@ -1,0 +1,241 @@
+From 6ad4e192771856a5ff1bf7177a158ed1a63ebc7a Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:44:55 -0500
+Subject: [PATCH 8/8] Safarium: hide the toolbar and sidebar in video full
+ screen
+
+When a page element such as a video goes full screen, hide the horizontal
+toolbar or the vertical sidebar, and move an open extension side panel out
+of sight, so only the page shows. They come back when the page leaves full
+screen. The window's own full screen (green button) keeps its toolbar.
+
+Follows FullscreenController's state-change callbacks, so entering page
+full screen from browser full screen and returning to it are covered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/safarium_root_view.cc    | 29 ++++++++++++++++---
+ .../ui/webui_browser/safarium_root_view.h     |  4 +++
+ .../safarium_tab_bar_controller.h             |  3 ++
+ .../safarium_tab_bar_host_mac.mm              | 28 ++++++++++++++++++
+ .../ui/webui_browser/webui_browser_window.cc  | 24 +++++++++++++++
+ .../ui/webui_browser/webui_browser_window.h   |  3 ++
+ 6 files changed, 87 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.cc b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+index c8652ede57..47ab9d550b 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.cc
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+@@ -100,7 +100,7 @@ bool SafariumRootView::VerticalTabs() const {
+ 
+ void SafariumRootView::OnVerticalTabsPrefChanged() {
+   const bool vertical = VerticalTabs();
+-  sidebar_->SetVisible(vertical);
++  sidebar_->SetVisible(vertical && !content_fullscreen_);
+   bar_view_->SetVerticalSidebar(vertical ? sidebar_->GetSidebarNativeView()
+                                         : gfx::NativeView());
+   InvalidateLayout();
+@@ -245,17 +245,38 @@ void SafariumRootView::OnResize(int resize_amount, bool done_resizing) {
+   InvalidateLayout();
+ }
+ 
++void SafariumRootView::SetContentFullscreen(bool fullscreen) {
++  if (content_fullscreen_ == fullscreen) {
++    return;
++  }
++  content_fullscreen_ = fullscreen;
++  sidebar_->SetVisible(VerticalTabs() && !fullscreen);
++  bar_view_->SetContentFullscreen(fullscreen);
++  InvalidateLayout();
++}
++
+ void SafariumRootView::Layout(PassKey) {
+   gfx::Rect area = GetContentsBounds();
+-  if (VerticalTabs()) {
++  if (VerticalTabs() && !content_fullscreen_) {
+     // The sidebar width belongs to the window and is shared by its tabs.
+     // The sidebar draws its own edge line (like the toolbar's bottom line).
+     sidebar_->SetBounds(area.x(), area.y(), sidebar_width_, area.height());
+     area.Inset(gfx::Insets::TLBR(0, sidebar_width_, 0, 0));
+   }
+ 
+-  // Extension side panels dock on the right of the page, full height.
+-  if (IsSidePanelShowing()) {
++  // Extension side panels dock on the right of the page, full height. While
++  // the page is full screen an open panel stays open, out of sight.
++  if (IsSidePanelShowing() && content_fullscreen_) {
++    for (views::View* view :
++         {side_panel_separator_.get(),
++          static_cast<views::View*>(side_panel_header_.get()),
++          static_cast<views::View*>(side_panel_resize_.get()),
++          side_panel_content_.get()}) {
++      if (view) {
++        view->SetBoundsRect(gfx::Rect());
++      }
++    }
++  } else if (IsSidePanelShowing()) {
+     const int max_width = std::max(kMinSidePanelWidth, area.width() / 2);
+     side_panel_width_ =
+         std::clamp(side_panel_width_, kMinSidePanelWidth, max_width);
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.h b/chrome/browser/ui/webui_browser/safarium_root_view.h
+index 48b316be60..43f424fa0e 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.h
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.h
+@@ -110,6 +110,9 @@ class SafariumRootView : public views::View,
+ 
+   void SetActiveContents(content::WebContents* contents);
+   void FocusAddressField();
++  // A page element (e.g. a video) is full screen: only the page shows (no
++  // toolbar, sidebar or side panel) until it leaves.
++  void SetContentFullscreen(bool fullscreen);
+ 
+   // Extension (or other) side panel, docked left or right of the page
+   // (pref side_panel.is_right_aligned).
+@@ -152,6 +155,7 @@ class SafariumRootView : public views::View,
+   raw_ptr<views::View> side_panel_separator_ = nullptr;
+   raw_ptr<VerticalSidebarView> sidebar_ = nullptr;
+   int sidebar_width_ = 250;
++  bool content_fullscreen_ = false;
+   raw_ptr<SidePanelHeaderView> side_panel_header_ = nullptr;
+   raw_ptr<views::View> side_panel_content_ = nullptr;
+   raw_ptr<views::ResizeArea> side_panel_resize_ = nullptr;
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index eb7fa9e617..db9da50166 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -75,6 +75,9 @@ class TabBarView {
+   // window and the page runs to the top edge.
+   virtual void SetVerticalSidebar(gfx::NativeView sidebar) {}
+   virtual void UpdateViewport() {}
++  // A page element (e.g. a video) is full screen: the page takes the whole
++  // screen and the toolbar steps aside until it leaves.
++  virtual void SetContentFullscreen(bool fullscreen) {}
+   // Tab overview thumbnails (only while SetWantsThumbnails(true)).
+   virtual void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) {}
+   // Hover card for `tab_id` (see TabBarController::SetHoverCardTab).
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index f0df24c8a1..e39cfeab67 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -4807,6 +4807,7 @@ - (void)setController:(safarium::TabBarController*)controller;
+ - (void)installInWindow:(NSWindow*)window;
+ - (void)uninstall;
+ - (void)setVerticalSidebar:(SafariumSidebarView*)sidebar;
++- (void)setContentFullscreen:(BOOL)fullscreen;
+ - (void)updateViewport;
+ - (void)updateState:(const safarium::BarState&)state;
+ @end
+@@ -4839,6 +4840,7 @@ @implementation SafariumToolbarController {
+   id _escMonitor;  // Local key monitor: Esc leaves the overview.
+   BOOL _closingOverview;  // Freeze the grid while zooming out of it.
+   BOOL _verticalTabs;
++  BOOL _contentFullscreen;  // A page element (video) is full screen.
+   BOOL _showHome;
+   BOOL _homeItemSynced;   // Initial toolbar/pref reconciliation done.
+   BOOL _syncingHomeItem;  // We are adding/removing the Home item ourselves.
+@@ -4907,6 +4909,27 @@ - (void)setVerticalSidebar:(SafariumSidebarView*)sidebar {
+   [self applyWindowChrome];
+ }
+ 
++// A page element (e.g. a video) is full screen: the page takes the whole
++// screen, as in Safari. The horizontal toolbar hides until it leaves; the
++// vertical sidebar is hidden by SafariumRootView.
++- (void)setContentFullscreen:(BOOL)fullscreen {
++  if (_contentFullscreen == fullscreen) {
++    return;
++  }
++  _contentFullscreen = fullscreen;
++  if (fullscreen) {
++    [_downloadsPopover close];
++    if (_overview) {
++      [self setOverview:NO];
++    }
++    [self endSidebarEditing];
++    [_tabView hideHoverCard];
++  }
++  if (!_verticalTabs && _window.toolbar == _toolbar) {
++    _toolbar.visible = !fullscreen;
++  }
++}
++
+ // --- Vertical sidebar toolbar ----------------------------------------------
+ // The sidebar has its own layout, independent of the horizontal NSToolbar:
+ // a list of toolbar item identifiers saved in its own defaults key, using
+@@ -5320,6 +5343,7 @@ - (void)applyWindowChrome {
+     window.styleMask &= ~NSWindowStyleMaskFullSizeContentView;
+     window.titlebarAppearsTransparent = NO;
+     window.toolbar = _toolbar;
++    _toolbar.visible = !_contentFullscreen;
+   }
+   [self refreshItems];
+ }
+@@ -6253,6 +6277,10 @@ void SetVerticalSidebar(gfx::NativeView sidebar) override {
+ 
+   void UpdateViewport() override { [toolbar_ updateViewport]; }
+ 
++  void SetContentFullscreen(bool fullscreen) override {
++    [toolbar_ setContentFullscreen:fullscreen];
++  }
++
+   void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) override {
+     [toolbar_ thumbnailChanged:gfx::NSImageFromImageSkia(image) forTab:tab_id];
+   }
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 980b604857..3e7a9c4091 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -341,6 +341,18 @@ void WebUIBrowserWindow::Show() {
+ 
+   widget_->Show();
+ 
++  // Safarium: follow page (video) full screen. The exclusive access manager
++  // is created after this window, so subscribe on first show.
++  if (safarium_root_ && !fullscreen_state_subscription_) {
++    if (auto* manager = ExclusiveAccessManager::From(browser_)) {
++      fullscreen_state_subscription_ =
++          manager->fullscreen_controller()->RegisterOnFullscreenStateChanged(
++              base::BindRepeating(
++                  &WebUIBrowserWindow::UpdateSafariumContentFullscreen,
++                  base::Unretained(this)));
++    }
++  }
++
+   // Give our main web contents the focus so that accelerators work.
+   // This must happen after Show() since focusing triggers widget activation,
+   // which calls PaintAsActiveChanged() -> Browser::DidBecomeActive(). The
+@@ -719,6 +731,18 @@ void WebUIBrowserWindow::ProcessFullscreen(bool fullscreen) {
+       ->WindowFullscreenStateChanged();
+ }
+ 
++void WebUIBrowserWindow::UpdateSafariumContentFullscreen() {
++  if (!safarium_root_ || !browser_) {
++    return;
++  }
++  auto* manager = ExclusiveAccessManager::From(browser_);
++  // Only when the window is (going) full screen for the page: not the
++  // window's own full screen, nor a page "full screen" inside its tab.
++  safarium_root_->SetContentFullscreen(
++      manager && IsFullscreen() &&
++      manager->fullscreen_controller()->IsWindowFullscreenForTabOrPending());
++}
++
+ void WebUIBrowserWindow::DeleteBrowserWindow() {
+   delete this;
+ }
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 9eaddf0a17..9298a8a90e 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -331,6 +331,9 @@ class WebUIBrowserWindow : public BrowserWindow,
+   // DidBecomeActive/DidBecomeInactive at the right time, accounting for child
+   // widget focus (e.g., modal dialogs keeping the parent "active").
+   base::CallbackListSubscription paint_as_active_subscription_;
++  // Safarium: page (video) full screen hides the native toolbar / sidebar.
++  base::CallbackListSubscription fullscreen_state_subscription_;
++  void UpdateSafariumContentFullscreen();
+ 
+   base::CallbackListSubscription theme_changed_subscription_;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

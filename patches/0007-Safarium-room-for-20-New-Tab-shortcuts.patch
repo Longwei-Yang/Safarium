@@ -1,0 +1,88 @@
+From eedf69d83a0bf86f79cef1ce208c4bfe5812ab3a Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:44:52 -0500
+Subject: [PATCH 7/8] Safarium: room for 20 New Tab shortcuts
+
+Raise the custom link limit and the expanded shortcut count from 10 to 20
+in Safarium builds. The page still shows the first row and puts the rest
+under "Show more".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/ntp_tiles/BUILD.gn     | 1 +
+ components/ntp_tiles/constants.cc | 4 ++++
+ components/search/BUILD.gn        | 1 +
+ components/search/ntp_features.cc | 5 +++++
+ 4 files changed, 11 insertions(+)
+
+diff --git a/components/ntp_tiles/BUILD.gn b/components/ntp_tiles/BUILD.gn
+index 1d3f529d1b..eddbdb067e 100644
+--- a/components/ntp_tiles/BUILD.gn
++++ b/components/ntp_tiles/BUILD.gn
+@@ -99,6 +99,7 @@ static_library("ntp_tiles") {
+   ]
+   deps = [
+     ":custom_links_pref_names",
++    "//build:safarium_buildflags",
+     ":enterprise_shortcuts_pref_names",
+     ":mojo_bindings",
+     ":popular_sites_pref_names",
+diff --git a/components/ntp_tiles/constants.cc b/components/ntp_tiles/constants.cc
+index 8aac9f11ee..14f2294e8a 100644
+--- a/components/ntp_tiles/constants.cc
++++ b/components/ntp_tiles/constants.cc
+@@ -5,11 +5,15 @@
+ #include "components/ntp_tiles/constants.h"
+ 
+ #include "build/build_config.h"
++#include "build/safarium_buildflags.h"
+ 
+ namespace ntp_tiles {
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+ const size_t kMaxNumCustomLinks = 8;
++#elif BUILDFLAG(SAFARIUM_BRANDING)
++// Safarium: room for 20 New Tab shortcuts.
++const size_t kMaxNumCustomLinks = 20;
+ #else
+ const size_t kMaxNumCustomLinks = 10;
+ #endif
+diff --git a/components/search/BUILD.gn b/components/search/BUILD.gn
+index 93bd7260ab..eef59cade5 100644
+--- a/components/search/BUILD.gn
++++ b/components/search/BUILD.gn
+@@ -13,6 +13,7 @@ static_library("search") {
+   deps = [
+     "//base",
+     "//build:android_buildflags",
++    "//build:safarium_buildflags",
+     "//components/search_engines",
+   ]
+ }
+diff --git a/components/search/ntp_features.cc b/components/search/ntp_features.cc
+index 94f68bf996..140bac16d8 100644
+--- a/components/search/ntp_features.cc
++++ b/components/search/ntp_features.cc
+@@ -13,6 +13,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#include "build/safarium_buildflags.h"
+ 
+ namespace ntp_features {
+ 
+@@ -648,7 +649,11 @@ int GetMaxTilesInCollapsedState() {
+ 
+ int GetMaxShortcutsInExpandedState() {
+   if (!base::FeatureList::IsEnabled(kNtpShortcutsRedesign)) {
++#if BUILDFLAG(SAFARIUM_BRANDING)
++    return 20;  // Safarium: matches kMaxNumCustomLinks.
++#else
+     return 10;
++#endif
+   }
+   return kMaxShortcutsInExpandedState.Get();
+ }
+-- 
+2.54.0 (Apple Git-157)
+

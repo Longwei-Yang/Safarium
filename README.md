@@ -24,6 +24,10 @@ Safarium is a macOS web browser that pairs the Chromium engine with a native App
 
 ![Tab Overview](docs/screenshots/overview.png)
 
+**Full screen video.** When a video goes full screen, the toolbar and sidebar step aside so only the video shows.
+
+**New Tab shortcuts.** The New Tab page holds up to 20 shortcuts.
+
 **Extensions.** Install extensions from the Chrome Web Store. Their buttons can go on either toolbar, and side panel extensions such as Claude open in a panel on the right of the page.
 
 ## Install
