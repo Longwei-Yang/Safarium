@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" alt="The Safarium icon: a Safari-style compass and glass layer over the Chromium logo" width="560">
+</p>
+
 # Safarium
 
 Safarium is a macOS web browser that pairs the Chromium engine with a native AppKit interface modelled on Safari 27. The tab bar, toolbar, sidebar and tab overview are written in AppKit and use the system's Liquid Glass. Pages, extensions and settings come from Chromium, so Chrome Web Store extensions work.
