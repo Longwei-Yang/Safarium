@@ -1,0 +1,2032 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:45:52 -0500
+Subject: [PATCH 4/5] Safarium: vertical tabs sharing the Compact tab bar;
+ overview fixes
+
+Vertical tabs (Settings > Appearance > Tab position):
+- The window drops its NSToolbar and the page runs to the top edge; the
+  sidebar hosts the same AppKit tab bar view as horizontal mode, so
+  address editing, hover cards, load progress, drag/reorder and tear-off
+  are shared. Vertical rows are left-aligned (favicon where the hover
+  close button appears) with concentric capsule corners.
+- Sidebar controls are Liquid Glass buttons; downloads opens the native
+  popover. Extension side panels can dock in the sidebar's lower half.
+- Traffic lights follow AppKit's own metrics for Safarium windows; the
+  toolbarless vertical layout uses a 52pt title bar (system sidebar
+  apps' position).
+
+Tab overview animation:
+- The active card's selection ring animates in with the zoom instead of
+  showing as a thick frame at full zoom.
+- Card thumbnails no longer cross-fade, and the active card keeps the
+  page snapshot taken on entry, removing doubled text on entry/exit.
+
+Vertical-tab work is largely from the Codex thread; overview fixes were
+verified frame by frame at 60fps.
+
+Local checkpoint only; not intended for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../appearance_page/appearance_page.html.ts   |  11 +
+ .../safarium_downloads_popover.h              |   5 +-
+ .../safarium_downloads_popover.mm             |  13 +-
+ .../ui/webui_browser/safarium_root_view.cc    | 185 +++-
+ .../ui/webui_browser/safarium_root_view.h     |  31 +
+ .../safarium_tab_bar_controller.h             |   4 +
+ .../safarium_tab_bar_host_mac.mm              | 889 ++++++++++++++----
+ .../webui_browser/webui_browser_window_mac.mm |  17 +-
+ .../browser_native_widget_window_mac.h        |   2 +
+ .../browser_native_widget_window_mac.mm       |  22 +
+ 10 files changed, 964 insertions(+), 215 deletions(-)
+
+diff --git a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+index 08892e2896..bacc36d7e8 100644
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -272,6 +272,17 @@ export function getHtml(this: SettingsAppearancePageElement) {
+     </div>
+     ` : ''}
+     ${!this.showChromeOnlySettings_ ? html`
++      <div class="cr-row hr">
++        <div class="flex cr-padded-text" aria-hidden="true">
++          $i18n{tabStripPosition}
++        </div>
++        <settings-dropdown-menu id="safariumTabStripPosition"
++            label="$i18n{tabStripPosition}" pref-key="vertical_tabs.enabled"
++            .menuOptions="${this.tabStripOptions_}"
++            @settings-control-change="${
++                this.onTabStripPositionSettingsControlChange_}">
++        </settings-dropdown-menu>
++      </div>
+       <div class="cr-row hr">
+         <div class="flex cr-padded-text" aria-hidden="true">
+           $i18n{sidePanelPosition}
+diff --git a/chrome/browser/ui/webui_browser/safarium_downloads_popover.h b/chrome/browser/ui/webui_browser/safarium_downloads_popover.h
+index 5e88e7043f..fd77c3f5ac 100644
+--- a/chrome/browser/ui/webui_browser/safarium_downloads_popover.h
++++ b/chrome/browser/ui/webui_browser/safarium_downloads_popover.h
+@@ -11,8 +11,9 @@ class Profile;
+ 
+ @interface SafariumDownloadsPopover : NSObject
+ - (void)toggleForProfile:(Profile*)profile
+-               toolbarItem:(NSToolbarItem*)item
+-                    showAll:(void (^)(void))showAll;
++             toolbarItem:(NSToolbarItem*)item
++                  anchor:(NSView*)anchor
++                 showAll:(void (^)(void))showAll;
+ - (void)close;
+ @end
+ 
+diff --git a/chrome/browser/ui/webui_browser/safarium_downloads_popover.mm b/chrome/browser/ui/webui_browser/safarium_downloads_popover.mm
+index 523b406d48..3bd9df8144 100644
+--- a/chrome/browser/ui/webui_browser/safarium_downloads_popover.mm
++++ b/chrome/browser/ui/webui_browser/safarium_downloads_popover.mm
+@@ -194,8 +194,9 @@ - (instancetype)init {
+ }
+ 
+ - (void)toggleForProfile:(Profile*)profile
+-               toolbarItem:(NSToolbarItem*)item
+-                    showAll:(void (^)(void))showAll {
++             toolbarItem:(NSToolbarItem*)item
++                  anchor:(NSView*)anchor
++                 showAll:(void (^)(void))showAll {
+   if (_popover.isShown) {
+     [self close];
+     return;
+@@ -213,7 +214,13 @@ - (void)toggleForProfile:(Profile*)profile
+     _notifier =
+         std::make_unique<download::AllDownloadItemNotifier>(manager, _observer.get());
+     [self refresh];
+-    [_popover showRelativeToToolbarItem:item];
++    if (anchor) {
++      [_popover showRelativeToRect:anchor.bounds
++                            ofView:anchor
++                     preferredEdge:NSRectEdgeMaxY];
++    } else {
++      [_popover showRelativeToToolbarItem:item];
++    }
+   } else {
+     showAll();
+   }
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.cc b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+index c6280c824c..fadbbf57bf 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.cc
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+@@ -11,6 +11,12 @@
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+ #include "ui/views/background.h"
++#include "cc/paint/paint_flags.h"
++#include "ui/base/cursor/cursor.h"
++#include "ui/base/cursor/mojom/cursor_type.mojom-shared.h"
++#include "ui/events/event.h"
++#include "ui/gfx/canvas.h"
++#include "ui/color/color_provider.h"
+ #include "ui/views/controls/resize_area.h"
+ #include "ui/views/controls/webview/webview.h"
+ #include "ui/views/view_class_properties.h"
+@@ -20,6 +26,44 @@ namespace safarium {
+ namespace {
+ constexpr int kMinSidePanelWidth = 320;  // Chrome's side panel minimum.
+ constexpr int kResizeAreaWidth = 6;
++constexpr int kMinSidebarPart = 160;     // Tabs / panel parts of the sidebar.
++
++// Divider between the tab list and a side panel docked in the sidebar.
++class SidebarSplitHandle : public views::View {
++  METADATA_HEADER(SidebarSplitHandle, views::View)
++
++ public:
++  explicit SidebarSplitHandle(base::RepeatingCallback<void(int)> on_drag)
++      : on_drag_(std::move(on_drag)) {}
++
++  bool OnMousePressed(const ui::MouseEvent& event) override { return true; }
++
++  bool OnMouseDragged(const ui::MouseEvent& event) override {
++    gfx::Point p = event.location();
++    views::View::ConvertPointToTarget(this, parent(), &p);
++    on_drag_.Run(p.y());
++    return true;
++  }
++
++  ui::Cursor GetCursor(const ui::MouseEvent& event) override {
++    return ui::mojom::CursorType::kRowResize;
++  }
++
++  void OnPaint(gfx::Canvas* canvas) override {
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(GetColorProvider()->GetColor(ui::kColorSeparator));
++    const gfx::RectF grip(width() / 2.f - 18, height() / 2.f - 2, 36, 4);
++    canvas->DrawRoundRect(grip, 2, flags);
++  }
++
++ private:
++  base::RepeatingCallback<void(int)> on_drag_;
++};
++
++BEGIN_METADATA(SidebarSplitHandle)
++END_METADATA
++
+ }  // namespace
+ 
+ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+@@ -30,9 +74,9 @@ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+   web_view->SetProperty(views::kElementIdentifierKey,
+                         kContentsContainerViewElementId);
+   TabBarView* bar_view = nullptr;
+-  AddChildView(CreateTabBarHost(controller, this, &bar_view));
+-  bar_view_ = bar_view;
+   contents_web_view_ = AddChildView(std::move(web_view));
++  AddChildView(CreateTabBarHost(controller, contents_web_view_, &bar_view));
++  bar_view_ = bar_view;
+ 
+   // Side panel (hidden until an extension opens one).
+   side_panel_separator_ = AddChildView(std::make_unique<views::View>());
+@@ -61,17 +105,57 @@ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+         static_cast<views::View*>(side_panel_resize_.get())}) {
+     view->SetVisible(false);
+   }
++  // Vertical tab sidebar (hidden in horizontal mode).
++  sidebar_ = AddChildView(std::make_unique<VerticalSidebarView>());
++  sidebar_separator_ = AddChildView(std::make_unique<views::View>());
++  sidebar_separator_->SetBackground(
++      views::CreateSolidBackground(ui::kColorSeparator));
++  sidebar_split_ = AddChildView(std::make_unique<SidebarSplitHandle>(
++      base::BindRepeating(
++          [](SafariumRootView* self, int y) {
++            const gfx::Rect bounds = self->GetContentsBounds();
++            if (bounds.height() <= 0) {
++              return;
++            }
++            self->sidebar_panel_fraction_ = std::clamp(
++                1.0 - static_cast<double>(y - bounds.y()) / bounds.height(),
++                0.15, 0.85);
++            self->InvalidateLayout();
++          },
++          base::Unretained(this))));
++  sidebar_split_->SetVisible(false);
++
+   pref_change_registrar_.Init(
+       Profile::FromBrowserContext(browser_context)->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kVerticalTabsEnabled,
++      base::BindRepeating(&SafariumRootView::OnVerticalTabsPrefChanged,
++                          base::Unretained(this)));
+   pref_change_registrar_.Add(
+       prefs::kSidePanelHorizontalAlignment,
+       base::BindRepeating(&SafariumRootView::OnDockPrefChanged,
+                           base::Unretained(this)));
+   side_panel_header_->SetDockedRight(SidePanelDockedRight());
++  OnVerticalTabsPrefChanged();
+ }
+ 
+ SafariumRootView::~SafariumRootView() = default;
+ 
++bool SafariumRootView::VerticalTabs() const {
++  return Profile::FromBrowserContext(browser_context_)
++      ->GetPrefs()
++      ->GetBoolean(prefs::kVerticalTabsEnabled);
++}
++
++void SafariumRootView::OnVerticalTabsPrefChanged() {
++  const bool vertical = VerticalTabs();
++  sidebar_->SetVisible(vertical);
++  sidebar_separator_->SetVisible(vertical);
++  bar_view_->SetVerticalSidebar(vertical ? sidebar_->GetSidebarNativeView()
++                                        : gfx::NativeView());
++  InvalidateLayout();
++}
++
+ void SafariumRootView::SetActiveContents(content::WebContents* contents) {
+   contents_web_view_->SetWebContents(contents);
+ }
+@@ -166,38 +250,77 @@ void SafariumRootView::OnResize(int resize_amount, bool done_resizing) {
+ }
+ 
+ void SafariumRootView::Layout(PassKey) {
+-  const gfx::Rect bounds = GetContentsBounds();
+-  if (!IsSidePanelShowing()) {
+-    contents_web_view_->SetBoundsRect(bounds);
+-    LayoutSuperclass<views::View>(this);
+-    return;
+-  }
+-  const int max_width = std::max(kMinSidePanelWidth, bounds.width() / 2);
+-  side_panel_width_ =
+-      std::clamp(side_panel_width_, kMinSidePanelWidth, max_width);
+-  const int w = side_panel_width_;
++  gfx::Rect area = GetContentsBounds();
++  const bool vertical = VerticalTabs();
++  const bool panel = IsSidePanelShowing();
+   const bool right = SidePanelDockedRight();
+-  gfx::Rect panel(right ? bounds.right() - w : bounds.x(), bounds.y(), w,
+-                  bounds.height());
+-  gfx::Rect separator(right ? panel.x() - 1 : panel.right(), bounds.y(), 1,
+-                      bounds.height());
+-  gfx::Rect page = bounds;
+-  page.set_width(bounds.width() - w - 1);
+-  if (!right) {
+-    page.set_x(separator.right());
+-  }
+-  contents_web_view_->SetBoundsRect(page);
+-  side_panel_separator_->SetBoundsRect(separator);
+-  side_panel_header_->SetBounds(panel.x(), panel.y(), panel.width(),
+-                                SidePanelHeaderView::kHeight);
+-  if (side_panel_content_) {
+-    side_panel_content_->SetBounds(
+-        panel.x(), panel.y() + SidePanelHeaderView::kHeight, panel.width(),
+-        panel.height() - SidePanelHeaderView::kHeight);
++  // Vertical tabs + left dock: the panel takes the lower part of the
++  // sidebar column, under the tab list.
++  const bool panel_in_sidebar = vertical && panel && !right;
++  sidebar_split_->SetVisible(panel_in_sidebar);
++
++  if (vertical) {
++    const int column_width = panel_in_sidebar
++                                 ? std::max(sidebar_width_, kMinSidePanelWidth)
++                                 : sidebar_width_;
++    const gfx::Rect column(area.x(), area.y(), column_width, area.height());
++    sidebar_separator_->SetBounds(column.right(), area.y(), 1, area.height());
++    area.Inset(gfx::Insets::TLBR(0, column_width + 1, 0, 0));
++    if (panel_in_sidebar) {
++      const int panel_height = std::clamp(
++          static_cast<int>(column.height() * sidebar_panel_fraction_),
++          std::min(kMinSidebarPart, column.height() / 2),
++          std::max(column.height() - kMinSidebarPart, column.height() / 2));
++      const int tabs_height = column.height() - panel_height;
++      sidebar_->SetBounds(column.x(), column.y(), column.width(), tabs_height);
++      sidebar_split_->SetBounds(column.x(), column.y() + tabs_height - 4,
++                                column.width(), 8);
++      side_panel_header_->SetBounds(column.x(), column.y() + tabs_height,
++                                    column.width(),
++                                    SidePanelHeaderView::kHeight);
++      if (side_panel_content_) {
++        side_panel_content_->SetBounds(
++            column.x(),
++            column.y() + tabs_height + SidePanelHeaderView::kHeight,
++            column.width(),
++            panel_height - SidePanelHeaderView::kHeight);
++      }
++      side_panel_separator_->SetBoundsRect(gfx::Rect());
++      side_panel_resize_->SetBoundsRect(gfx::Rect());
++    } else {
++      sidebar_->SetBoundsRect(column);
++    }
++  }
++
++  if (panel && !panel_in_sidebar) {
++    const int max_width = std::max(kMinSidePanelWidth, area.width() / 2);
++    side_panel_width_ =
++        std::clamp(side_panel_width_, kMinSidePanelWidth, max_width);
++    const int w = side_panel_width_;
++    const gfx::Rect panel_rect(right ? area.right() - w : area.x(), area.y(),
++                               w, area.height());
++    const gfx::Rect separator(right ? panel_rect.x() - 1 : panel_rect.right(),
++                              area.y(), 1, area.height());
++    side_panel_separator_->SetBoundsRect(separator);
++    side_panel_header_->SetBounds(panel_rect.x(), panel_rect.y(),
++                                  panel_rect.width(),
++                                  SidePanelHeaderView::kHeight);
++    if (side_panel_content_) {
++      side_panel_content_->SetBounds(
++          panel_rect.x(), panel_rect.y() + SidePanelHeaderView::kHeight,
++          panel_rect.width(),
++          panel_rect.height() - SidePanelHeaderView::kHeight);
++    }
++    side_panel_resize_->SetBounds(separator.x() - kResizeAreaWidth / 2,
++                                  area.y(), kResizeAreaWidth, area.height());
++    area.set_width(area.width() - w - 1);
++    if (!right) {
++      area.set_x(separator.right());
++    }
+   }
+-  side_panel_resize_->SetBounds(separator.x() - kResizeAreaWidth / 2,
+-                                bounds.y(), kResizeAreaWidth, bounds.height());
++  contents_web_view_->SetBoundsRect(area);
+   LayoutSuperclass<views::View>(this);
++  bar_view_->UpdateViewport();
+ }
+ 
+ void SafariumRootView::FocusAddressField() {
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.h b/chrome/browser/ui/webui_browser/safarium_root_view.h
+index 57fb6c09d8..6cec453f82 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.h
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.h
+@@ -6,6 +6,7 @@
+ #include <memory>
+ 
+ #include "base/functional/callback.h"
++#include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -20,6 +21,7 @@ class WebContents;
+ }  // namespace content
+ 
+ namespace views {
++class NativeViewHost;
+ class ResizeArea;
+ class WebView;
+ }  // namespace views
+@@ -61,6 +63,28 @@ class SidePanelHeaderView : public views::View {
+   raw_ptr<views::View> host_ = nullptr;  // views::NativeViewHost.
+ };
+ 
++// Hosts the native sidebar and the tab strip while tabs are vertical.
++class VerticalSidebarView : public views::View {
++  METADATA_HEADER(VerticalSidebarView, views::View)
++
++ public:
++  VerticalSidebarView();
++  VerticalSidebarView(const VerticalSidebarView&) = delete;
++  VerticalSidebarView& operator=(const VerticalSidebarView&) = delete;
++  ~VerticalSidebarView() override;
++
++  gfx::NativeView GetSidebarNativeView() const;
++
++  // views::View:
++  void AddedToWidget() override;
++  void Layout(PassKey) override;
++
++ private:
++  struct ObjCStorage;
++  std::unique_ptr<ObjCStorage> objc_;
++  raw_ptr<views::NativeViewHost> host_ = nullptr;
++};
++
+ class SafariumRootView : public views::View,
+                          public views::ResizeAreaDelegate {
+   METADATA_HEADER(SafariumRootView, views::View)
+@@ -98,11 +122,18 @@ class SafariumRootView : public views::View,
+   void Layout(PassKey) override;
+   bool SidePanelDockedRight() const;
+   void OnDockPrefChanged();
++  bool VerticalTabs() const;
++  void OnVerticalTabsPrefChanged();
+ 
+   raw_ptr<content::BrowserContext> browser_context_;
+   raw_ptr<TabBarView> bar_view_ = nullptr;
+   raw_ptr<views::WebView> contents_web_view_ = nullptr;
+   raw_ptr<views::View> side_panel_separator_ = nullptr;
++  raw_ptr<VerticalSidebarView> sidebar_ = nullptr;
++  raw_ptr<views::View> sidebar_separator_ = nullptr;
++  raw_ptr<views::View> sidebar_split_ = nullptr;  // Tabs / panel divider.
++  int sidebar_width_ = 250;
++  double sidebar_panel_fraction_ = 0.5;  // Of the sidebar's height.
+   raw_ptr<SidePanelHeaderView> side_panel_header_ = nullptr;
+   raw_ptr<views::View> side_panel_content_ = nullptr;
+   raw_ptr<views::ResizeArea> side_panel_resize_ = nullptr;
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index 60bebe435c..eb7fa9e617 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -71,6 +71,10 @@ class TabBarView {
+   virtual ~TabBarView() = default;
+   virtual void UpdateState(const BarState& state) = 0;
+   virtual void FocusAddressField() = 0;
++  // Vertical tabs (pref vertical_tabs.enabled): the toolbar leaves the
++  // window and the page runs to the top edge.
++  virtual void SetVerticalSidebar(gfx::NativeView sidebar) {}
++  virtual void UpdateViewport() {}
+   // Tab overview thumbnails (only while SetWantsThumbnails(true)).
+   virtual void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) {}
+   // Hover card for `tab_id` (see TabBarController::SetHoverCardTab).
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 6c6a7c6264..04f3fe185b 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -21,32 +21,57 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ptr_exclusion.h"
+ #include "base/strings/sys_string_conversions.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
++#include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
+ #import "chrome/browser/ui/webui_browser/safarium_downloads_popover.h"
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+-#include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
+-#include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
++#import "components/remote_cocoa/app_shim/browser_native_widget_window_mac.h"
++#include "net/base/apple/url_conversions.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/gfx/image/image.h"
+ #include "ui/gfx/image/image_skia_util_mac.h"
+ #include "ui/gfx/mac/coordinate_conversion.h"
+ #include "ui/gfx/native_ui_types.h"
+-#include "chrome/app/chrome_command_ids.h"
+-#include "net/base/apple/url_conversions.h"
++#include "ui/views/controls/native/native_view_host.h"
++#include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_tracker.h"
+ #include "ui/views/widget/widget.h"
+-#include "ui/views/focus/focus_manager.h"
+ 
+ namespace {
+ constexpr CGFloat kControlHeight = 36;  // Round buttons and capsules.
+ constexpr CGFloat kTabHeight = 30;      // Tabs inside the capsule.
+ constexpr CGFloat kCapsuleInset = 3;
++constexpr CGFloat kTabCornerRadius = kTabHeight / 2;
++// The first and last pills share a corner center with the strip.
++constexpr CGFloat kTabStripCornerRadius = kTabCornerRadius + kCapsuleInset;
+ // Between tabs. Safari 26 tabs touch: a hovered tab's fill meets the current
+ // tab's outline (measured ~0.5pt apart).
+ constexpr CGFloat kGap = 1;
+ constexpr CGFloat kPinnedTabWidth = 40;
++constexpr CGFloat kSidebarTabGap = 4;
++constexpr CGFloat kTabCloseInset = 8;
++
++CGFloat Along(NSPoint point, bool vertical) {
++  return vertical ? point.y : point.x;
++}
++
++CGFloat Along(NSSize size, bool vertical) {
++  return vertical ? size.height : size.width;
++}
++
++CGFloat MidpointAlong(NSRect frame, bool vertical) {
++  return vertical ? NSMidY(frame) : NSMidX(frame);
++}
++
++NSPoint ScreenPointForMouseEvent(NSEvent* event) {
++  const NSPoint location = event.locationInWindow;
++  NSWindow* window = event.window;
++  return window ? [window convertPointToScreen:location] : location;
++}
+ // Below this the strip overflows and scrolls (Safari 26: ~118pt tabs,
+ // measured from a screen recording).
+ constexpr CGFloat kMinTabWidth = 118;
+@@ -229,6 +254,8 @@ - (BOOL)syncEditingState;
+ @end
+ 
+ @interface SafariumTabBarView : NSView <NSTextFieldDelegate>
++- (BOOL)isVertical;
++- (void)setVertical:(BOOL)vertical;
+ - (void)setController:(safarium::TabBarController*)controller;
+ - (void)updateState:(const safarium::BarState&)state;
+ - (void)focusAddressField;
+@@ -467,7 +494,7 @@ - (BOOL)hovered {
+ - (instancetype)initWithFrame:(NSRect)frame {
+   if ((self = [super initWithFrame:frame])) {
+     self.wantsLayer = YES;
+-    self.layer.cornerRadius = kTabHeight / 2;
++    self.layer.cornerRadius = kTabCornerRadius;
+     self.layer.masksToBounds = NO;
+     // Inactive tabs draw below the current tab's pill, so sliding titles
+     // come out from under it (as in Safari) instead of crossing over it.
+@@ -512,22 +539,20 @@ - (void)layout {
+   NSRect b = self.bounds;
+   CGFloat iconY = floor((b.size.height - kIconSize) / 2);
+   _separator.frame = NSMakeRect(-kGap / 2 - 0.5, 8, 1, b.size.height - 16);
+-  _closeButton.frame = NSMakeRect(8, iconY, kIconSize, kIconSize);
+-  if (_pinned) {
++  _closeButton.frame = NSMakeRect(kTabCloseInset, iconY, kIconSize, kIconSize);
++  const BOOL vertical = [self.bar isVertical];
++  [self updateCloseAffordanceAnimated:NO];
++  if (_pinned && !vertical) {
+     _iconView.frame = NSMakeRect(floor((b.size.width - kIconSize) / 2), iconY,
+                                  kIconSize, kIconSize);
+     _titleLabel.hidden = YES;
+     _iconView.hidden = NO;
+     return;
+   }
+-  // Center [icon + title] in the cell, truncating the title if needed.
+-  // Measure the string directly; the label's intrinsic size can lag behind
+-  // title changes.
+-  // Keep the leading slot free for the hover close button (⊗ at x=8..24),
+-  // like Safari: content is centered but never starts left of it.
+-  // Always reserved, so hovering only fades the ⊗ in; the icon and title
+-  // never move (Safari behaviour).
+-  const CGFloat leadingReserve = 8 + kIconSize + 4;
++  // In the sidebar the icon shares its slot with the hover close button.
++  // In the toolbar the centered content reserves a separate close slot.
++  const CGFloat leadingReserve =
++      vertical ? kTabCloseInset : kTabCloseInset + kIconSize + 4;
+   const CGFloat trailingReserve = 10;
+   CGFloat maxTitle = MAX(0, b.size.width - leadingReserve - trailingReserve -
+                                 kIconSize - 6);
+@@ -536,7 +561,9 @@ - (void)layout {
+                   }].width) + 4;
+   CGFloat titleW = MIN(maxTitle, textW);
+   CGFloat groupW = kIconSize + 6 + titleW;
+-  CGFloat x = MAX(leadingReserve, floor((b.size.width - groupW) / 2));
++  const CGFloat x =
++      vertical ? leadingReserve
++               : MAX(leadingReserve, floor((b.size.width - groupW) / 2));
+   _iconView.frame = NSMakeRect(x, iconY, kIconSize, kIconSize);
+   _titleLabel.frame =
+       NSMakeRect(x + kIconSize + 6, floor((b.size.height - 17) / 2), titleW, 17);
+@@ -608,19 +635,30 @@ - (void)mouseExited:(NSEvent*)event {
+ 
+ - (void)setHoveredState:(BOOL)hovered {
+   _hovered = hovered;
+-  const BOOL showClose = hovered && !_active && !_pinned;
++  [self updateCloseAffordanceAnimated:YES];
++  [self refreshColors];
++  [self.bar tabCellHoverChanged:self];
++}
++
++- (void)updateCloseAffordanceAnimated:(BOOL)animated {
++  const BOOL showClose = _hovered && !_active && !_pinned;
+   if (showClose && _closeButton.hidden) {
+     _closeButton.alphaValue = 0;
+     _closeButton.hidden = NO;
+   }
+   // Faded-out ⊗ must not take clicks (it sits over the tab).
+   static_cast<SafariumOverlayButton*>(_closeButton).shown = showClose;
++  const CGFloat closeAlpha = showClose ? 1 : 0;
++  const CGFloat iconAlpha = showClose && [self.bar isVertical] ? 0 : 1;
++  if (_closeButton.alphaValue == closeAlpha &&
++      _iconView.alphaValue == iconAlpha) {
++    return;
++  }
+   [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
+-    context.duration = 0.12;
+-    self->_closeButton.animator.alphaValue = showClose ? 1 : 0;
++    context.duration = animated ? 0.12 : 0;
++    self->_closeButton.animator.alphaValue = closeAlpha;
++    self->_iconView.animator.alphaValue = iconAlpha;
+   }];
+-  [self refreshColors];
+-  [self.bar tabCellHoverChanged:self];
+ }
+ 
+ - (void)setActive:(BOOL)active {
+@@ -684,11 +722,13 @@ - (void)closeClicked:(id)sender {
+ // NSScrollView; plain mouse wheels scroll sideways too.
+ 
+ @interface SafariumTabScrollView : NSScrollView
++@property(nonatomic) BOOL vertical;
+ @end
+ 
+ @implementation SafariumTabScrollView
++@synthesize vertical = _vertical;
+ - (void)scrollWheel:(NSEvent*)event {
+-  if (!event.hasPreciseScrollingDeltas &&
++  if (!self.vertical && !event.hasPreciseScrollingDeltas &&
+       fabs(event.scrollingDeltaY) > fabs(event.scrollingDeltaX)) {
+     NSClipView* clip = self.contentView;
+     NSPoint origin = clip.bounds.origin;
+@@ -910,8 +950,7 @@ @implementation SafariumTabBarView {
+   // Press / drag-to-reorder.
+   __weak SafariumTabCell* _pressCell;
+   BOOL _pressWasActive;
+-  CGFloat _pressStartX;   // Strip coordinates.
+-  CGFloat _pressStartY;   // Window coordinates.
++  NSPoint _pressStart;     // Window coordinates.
+   NSImage* _dragSnapshot;  // Page of the dragged tab (drag-out preview).
+   NSUInteger _dragSnapshotGeneration;
+   NSPanel* _dragPreview;   // Thumbnail following the pointer outside the bar.
+@@ -921,7 +960,7 @@ @implementation SafariumTabBarView {
+   safarium::BarState _lastState;  // Latest state from the controller.
+   __weak SafariumTabCell* _dragCell;
+   CGFloat _dragGrab;      // Press offset inside the dragged tab.
+-  CGFloat _dragX;         // Dragged tab's current x (strip).
++  CGFloat _dragPosition;  // Dragged tab's position along the strip.
+   BOOL _dragMoveOnly;     // Layout pass that only follows the pointer.
+   NSInteger _activeIndex;
+ 
+@@ -957,6 +996,9 @@ @implementation SafariumTabBarView {
+   __weak SafariumTabCell* _hoverCardCell;  // Cell the card is (to be) for.
+   NSUInteger _hoverCardGeneration;
+   BOOL _overviewMode;
++  BOOL _vertical;
++  NSLayoutConstraint* _height;
++  NSLayoutConstraint* _minWidth;
+   NSLayoutConstraint* _maxWidth;
+   NSLayoutConstraint* _preferredWidth;
+   NSLayoutConstraint* _pinnedWidth;  // Required; only while animating.
+@@ -975,13 +1017,13 @@ @implementation SafariumTabBarView {
+ - (instancetype)initWithFrame:(NSRect)frame {
+   if ((self = [super initWithFrame:frame])) {
+     self.wantsLayer = YES;
+-    self.layer.cornerRadius = kControlHeight / 2;
++    self.layer.cornerRadius = kTabStripCornerRadius;
+     self.layer.masksToBounds = YES;
+     _cells = [NSMutableArray array];
+     _cellsById = [NSMutableDictionary dictionary];
+     _activeIndex = -1;
+ 
+-    _tabsGlass = MakeGlass(kControlHeight / 2);
++    _tabsGlass = MakeGlass(kTabStripCornerRadius);
+     // Safari's tab capsule is a flat gray fill. A glass layer here adds a
+     // second refracting rim inside the toolbar's own glass, whose uneven
+     // edge highlights make the gray band look thicker in some places.
+@@ -989,7 +1031,7 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     [self addSubview:_tabsGlass];
+     _tabsTint = [[SafariumTintView alloc] initWithFrame:NSZeroRect];
+     _tabsTint.wantsLayer = YES;
+-    _tabsTint.layer.cornerRadius = kControlHeight / 2;
++    _tabsTint.layer.cornerRadius = kTabStripCornerRadius;
+     [self addSubview:_tabsTint];
+ 
+     _tabsScroll = [[SafariumTabScrollView alloc] initWithFrame:NSZeroRect];
+@@ -1001,7 +1043,7 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _tabsScroll.verticalScrollElasticity = NSScrollElasticityNone;
+     _tabsScroll.automaticallyAdjustsContentInsets = NO;
+     _tabsScroll.wantsLayer = YES;
+-    _tabsScroll.layer.cornerRadius = kControlHeight / 2;
++    _tabsScroll.layer.cornerRadius = kTabStripCornerRadius;
+     _tabsScroll.layer.masksToBounds = YES;
+     _strip = [[SafariumStripView alloc] initWithFrame:NSZeroRect];
+     _tabsScroll.documentView = _strip;
+@@ -1009,7 +1051,7 @@ - (instancetype)initWithFrame:(NSRect)frame {
+ 
+     _focusRing = [[SafariumPassiveView alloc] initWithFrame:NSZeroRect];
+     _focusRing.wantsLayer = YES;
+-    _focusRing.layer.cornerRadius = kTabHeight / 2 + 3;
++    _focusRing.layer.cornerRadius = kTabStripCornerRadius;
+     _focusRing.layer.borderWidth = 3;
+     _focusRing.alphaValue = 0;
+     [_strip addSubview:_focusRing];
+@@ -1059,14 +1101,7 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _addressField.font = [NSFont systemFontOfSize:13];
+     _addressField.alignment = NSTextAlignmentLeft;
+     _addressField.wantsLayer = YES;  // For the slide/fade on edit changes.
+-    // Safari draws the placeholder in a medium-weight gray.
+-    _addressField.placeholderAttributedString = [[NSAttributedString alloc]
+-        initWithString:@"Search or enter website name"
+-            attributes:@{
+-              NSFontAttributeName :
+-                  [NSFont systemFontOfSize:13 weight:NSFontWeightMedium],
+-              NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+-            }];
++    [self updateAddressPlaceholder];
+     _addressField.usesSingleLineMode = YES;
+     _addressField.cell.scrollable = YES;
+     _addressField.delegate = self;
+@@ -1180,21 +1215,84 @@ - (CGFloat)preferredStripWidth {
+          normal * [self maxTabWidth] + kGap * (n - 1);
+ }
+ 
++- (void)updateAddressPlaceholder {
++  NSString* text =
++      _vertical ? @"Search or enter address" : @"Search or enter website name";
++  _addressField.placeholderAttributedString = [[NSAttributedString alloc]
++      initWithString:text
++          attributes:@{
++            NSFontAttributeName : [NSFont systemFontOfSize:13
++                                                    weight:NSFontWeightMedium],
++            NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
++          }];
++}
++
++- (BOOL)isVertical {
++  return _vertical;
++}
++
++- (void)setVertical:(BOOL)vertical {
++  if (_vertical == vertical) {
++    return;
++  }
++  [self hideHoverCard];
++  if (_addressField.editing) {
++    [self.window makeFirstResponder:nil];
++  }
++  _vertical = vertical;
++  [self updateAddressPlaceholder];
++  for (SafariumTabCell* cell in _cells) {
++    cell.needsLayout = YES;
++  }
++  ++_pinGeneration;
++  _pinnedWidth.active = NO;
++  _targetWidth = 0;
++  _tabsScroll.vertical = vertical;
++  _tabsScroll.horizontalScrollElasticity =
++      vertical ? NSScrollElasticityNone : NSScrollElasticityAllowed;
++  _tabsScroll.verticalScrollElasticity =
++      vertical ? NSScrollElasticityAllowed : NSScrollElasticityNone;
++  _tabsScroll.hasVerticalScroller = vertical;
++  _tabsScroll.autohidesScrollers = YES;
++  [_tabsScroll.contentView scrollToPoint:NSZeroPoint];
++  [_tabsScroll reflectScrolledClipView:_tabsScroll.contentView];
++  if (vertical) {
++    [NSLayoutConstraint deactivateConstraints:@[
++      _height, _minWidth, _maxWidth, _preferredWidth
++    ]];
++    self.translatesAutoresizingMaskIntoConstraints = YES;
++  } else {
++    self.autoresizingMask = NSViewNotSizable;
++    self.translatesAutoresizingMaskIntoConstraints = NO;
++    [NSLayoutConstraint activateConstraints:@[
++      _height, _minWidth, _maxWidth, _preferredWidth
++    ]];
++    [self updatePreferredWidthAnimated:NO];
++  }
++  self.needsLayout = YES;
++}
++
+ - (void)updatePreferredWidthAnimated:(BOOL)animated {
++  if (_vertical) {
++    return;
++  }
+   if (!_preferredWidth) {
+     self.translatesAutoresizingMaskIntoConstraints = NO;
+-    [self.heightAnchor constraintEqualToConstant:kControlHeight].active = YES;
+-    [self.widthAnchor constraintGreaterThanOrEqualToConstant:kMaxTabWidth +
+-                                                             2 * kCapsuleInset]
+-        .active = YES;
+-    _maxWidth = [self.widthAnchor constraintLessThanOrEqualToConstant:0];
+-    _maxWidth.active = YES;
++    _height = [self.heightAnchor constraintEqualToConstant:kControlHeight];
++    _minWidth = [self.widthAnchor
++        constraintGreaterThanOrEqualToConstant:kMaxTabWidth +
++                                               2 * kCapsuleInset];
++    _maxWidth = [self.widthAnchor
++        constraintLessThanOrEqualToConstant:[self preferredStripWidth]];
+     // Below fitting-size compression: the item's fitting size stays at its
+     // minimum, so NSToolbar treats it as flexible (min…max) and grows it
+     // into the free space instead of overflowing it into the » menu.
+     _preferredWidth = [self.widthAnchor constraintEqualToConstant:0];
+     _preferredWidth.priority = NSLayoutPriorityFittingSizeCompression - 1;
+-    _preferredWidth.active = YES;
++    _preferredWidth.constant = _maxWidth.constant;
++    [NSLayoutConstraint activateConstraints:@[
++      _height, _minWidth, _maxWidth, _preferredWidth
++    ]];
+   }
+   const CGFloat width = [self preferredStripWidth];
+   if (_maxWidth.constant == width) {
+@@ -1307,30 +1405,38 @@ - (void)fade:(NSView*)view alpha:(CGFloat)alpha animated:(BOOL)animated {
+ - (void)revealActiveFrame:(NSRect)frame animated:(BOOL)animated {
+   NSClipView* clip = _tabsScroll.contentView;
+   const NSRect visible = clip.bounds;
+-  const CGFloat maxX = MAX(0, NSWidth(_strip.frame) - NSWidth(visible));
+-  CGFloat x = visible.origin.x;
++  const CGFloat length = Along(visible.size, _vertical);
++  const CGFloat current = Along(visible.origin, _vertical);
++  const CGFloat maxOffset =
++      MAX(0, Along(_strip.frame.size, _vertical) - length);
++  const CGFloat margin = _vertical ? kSidebarTabGap : kRevealMargin;
++  CGFloat offset = current;
+   if (_revealActive && !NSIsEmptyRect(frame)) {
+-    if (NSMinX(frame) - kRevealMargin < x) {
+-      x = NSMinX(frame) - kRevealMargin;
+-    } else if (NSMaxX(frame) + kRevealMargin > x + NSWidth(visible)) {
+-      x = NSMaxX(frame) + kRevealMargin - NSWidth(visible);
++    const CGFloat start = Along(frame.origin, _vertical);
++    const CGFloat end = start + Along(frame.size, _vertical);
++    if (start - margin < offset) {
++      offset = start - margin;
++    } else if (end + margin > offset + length) {
++      offset = end + margin - length;
+     }
+   }
+-  x = MAX(0, MIN(maxX, x));
+-  if (x == visible.origin.x) {
++  offset = std::clamp(offset, CGFloat{0}, maxOffset);
++  const NSPoint target =
++      _vertical ? NSMakePoint(0, offset) : NSMakePoint(offset, 0);
++  if (NSEqualPoints(target, visible.origin)) {
+     return;
+   }
+   if (animated) {
+-    [clip.animator setBoundsOrigin:NSMakePoint(x, 0)];
++    [clip.animator setBoundsOrigin:target];
+   } else {
+-    [clip scrollToPoint:NSMakePoint(x, 0)];
++    [clip scrollToPoint:target];
+   }
+   [_tabsScroll reflectScrolledClipView:clip];
+ }
+ 
+ - (void)relayoutAnimated:(BOOL)animated {
+   NSRect b = self.bounds;
+-  if (b.size.width <= 0) {
++  if (NSIsEmptyRect(b)) {
+     return;
+   }
+   // Catch editing sessions that started or ended without a notification.
+@@ -1340,8 +1446,14 @@ - (void)relayoutAnimated:(BOOL)animated {
+ 
+   // The tab capsule fills this view (it is the "Tabs" item of the window's
+   // NSToolbar; back/forward/reload/+ are separate toolbar items).
+-  NSRect capsule = NSMakeRect(0, y, b.size.width, kControlHeight);
+-  const NSRect glassFrame = capsule;
++  const NSUInteger n = _cells.count;
++  NSRect capsule =
++      _vertical ? b : NSMakeRect(0, y, b.size.width, kControlHeight);
++  const CGFloat verticalHeight =
++      2 * kCapsuleInset + n * (kTabHeight + kSidebarTabGap) - kSidebarTabGap;
++  const NSRect glassFrame =
++      _vertical ? NSMakeRect(0, 0, NSWidth(b), MIN(NSHeight(b), verticalHeight))
++                : capsule;
+   if (_targetWidth > 0) {
+     capsule.origin.x = floor((b.size.width - _targetWidth) / 2);
+     capsule.size.width = _targetWidth;
+@@ -1349,7 +1461,6 @@ - (void)relayoutAnimated:(BOOL)animated {
+ 
+   // NOTE: never hide `_addressField` "temporarily" here. Hiding a view that
+   // holds the first responder makes AppKit end the edit session.
+-  const NSUInteger n = _cells.count;
+   if (n == 0) {
+     [self place:_tabsGlass frame:glassFrame animated:animated];
+     [self place:_tabsTint frame:glassFrame animated:animated];
+@@ -1424,25 +1535,35 @@ - (void)relayoutAnimated:(BOOL)animated {
+     }
+   }
+   [self place:_tabsScroll frame:capsule animated:NO];
++  const CGFloat rowWidth =
++      MAX(0, _tabsScroll.contentSize.width - 2 * kCapsuleInset);
++  const CGFloat gap = _vertical ? kSidebarTabGap : kGap;
+ 
+-  CGFloat cx = kCapsuleInset;
++  CGFloat position = kCapsuleInset;
+   NSRect activeFrame = NSZeroRect;
+   _slotFrames.assign(n, NSZeroRect);
+   for (NSUInteger i = 0; i < n; ++i) {
+     SafariumTabCell* cell = _cells[i];
+-    const CGFloat w =
++    const CGFloat width =
+         cell.pinned ? kPinnedTabWidth : (cell.active ? activeW : unit);
+-    NSRect f = NSMakeRect(floor(cx), tabY, floor(w), kTabHeight);
++    NSRect f =
++        _vertical ? NSMakeRect(kCapsuleInset, position, rowWidth, kTabHeight)
++                  : NSMakeRect(floor(position), tabY, floor(width), kTabHeight);
++    const CGFloat advance = (_vertical ? kTabHeight : width) + gap;
+     _slotFrames[i] = f;
+     if (cell == _dragCell) {
+       // The dragged tab follows the pointer; its slot stays open for it.
+-      f.origin.x = _dragX;
++      if (_vertical) {
++        f.origin.y = _dragPosition;
++      } else {
++        f.origin.x = _dragPosition;
++      }
+       cell.frame = f;
+       cell.separator.hidden = YES;
+       if (cell.active) {
+         activeFrame = f;
+       }
+-      cx += w + kGap;
++      position += advance;
+       continue;
+     }
+     if (_dragMoveOnly) {
+@@ -1451,13 +1572,14 @@ - (void)relayoutAnimated:(BOOL)animated {
+       if (cell.active) {
+         activeFrame = f;
+       }
+-      cx += w + kGap;
++      position += advance;
+       continue;
+     }
+     const BOOL isNew = NSIsEmptyRect(cell.frame);
+     if (isNew) {
+       // New tabs grow out of their final center.
+-      cell.frame = NSMakeRect(NSMidX(f), tabY, 0, kTabHeight);
++      cell.frame = _vertical ? NSMakeRect(NSMinX(f), NSMidY(f), NSWidth(f), 0)
++                             : NSMakeRect(NSMidX(f), tabY, 0, kTabHeight);
+       cell.alphaValue = 0;
+     }
+     // Safari: the active pill jumps to the new tab immediately; only the
+@@ -1473,24 +1595,27 @@ - (void)relayoutAnimated:(BOOL)animated {
+            alpha:(editing && !cell.active) ? kDimmedAlpha : 1
+         animated:animated || isNew];
+     // Separator only between two adjacent non-active tabs.
+-    cell.separator.hidden = (i == 0) || cell.active || _cells[i - 1].active;
++    cell.separator.hidden =
++        _vertical || i == 0 || cell.active || _cells[i - 1].active;
+     if (cell.active) {
+       activeFrame = f;
+     }
+-    cx += w + kGap;
++    position += advance;
+   }
+ 
+   // Size the scrollable strip and keep the active tab in view.
+-  const CGFloat contentW = cx - kGap + kCapsuleInset;
+-  _strip.frame =
+-      NSMakeRect(0, 0, MAX(contentW, capsule.size.width), kControlHeight);
++  const CGFloat length = position - gap + kCapsuleInset;
++  _strip.frame = _vertical ? NSMakeRect(0, 0, _tabsScroll.contentSize.width,
++                                        MAX(length, NSHeight(capsule)))
++                           : NSMakeRect(0, 0, MAX(length, NSWidth(capsule)),
++                                        kControlHeight);
+   if (!_dragCell) {
+     [self revealActiveFrame:activeFrame
+                    animated:animated && !_activeChangedThisLayout];
+   }
+ 
+   // Active-tab overlay (the address field lives on top of the active tab).
+-  if (NSIsEmptyRect(activeFrame) || activeIsPinned) {
++  if (NSIsEmptyRect(activeFrame) || (activeIsPinned && !_vertical)) {
+     [self setActiveOverlayHidden:YES];
+     return;
+   }
+@@ -1506,8 +1631,8 @@ - (void)relayoutAnimated:(BOOL)animated {
+   const BOOL hasPage = _addressField.editText.length > 0;
+   const CGFloat iconY = NSMinY(activeFrame) + floor((kTabHeight - kIconSize) / 2);
+   const CGFloat textY = NSMinY(activeFrame) + floor((kTabHeight - 18) / 2);
+-  const NSRect leading =
+-      NSMakeRect(NSMinX(activeFrame) + 8, iconY, kIconSize, kIconSize);
++  const NSRect leading = NSMakeRect(NSMinX(activeFrame) + kTabCloseInset, iconY,
++                                    kIconSize, kIconSize);
+   const NSRect trailing = NSMakeRect(NSMaxX(activeFrame) - 8 - kIconSize, iconY,
+                                      kIconSize, kIconSize);
+   const NSRect beforeTrailing = NSOffsetRect(trailing, -(kIconSize + 6), 0);
+@@ -1515,7 +1640,8 @@ - (void)relayoutAnimated:(BOOL)animated {
+   // Leading slot: ⊗ while hovered (otherwise the icon lives there in edit
+   // mode).
+   [self place:_closeActiveButton frame:leading animated:overlayAnimated];
+-  [self show:_closeActiveButton visible:_activeHovered animated:animated];
++  const BOOL showClose = _activeHovered && !activeIsPinned;
++  [self show:_closeActiveButton visible:showClose animated:animated];
+ 
+   // Trailing slots.
+   //   untouched: [↻ on hover] ≡        typed: ↻ on hover, else × (clear)
+@@ -1551,11 +1677,11 @@ - (void)relayoutAnimated:(BOOL)animated {
+     [self fade:_progressLine alpha:showProgress ? 1 : 0 animated:YES];
+   }
+ 
++  const CGFloat editX = NSMaxX(leading) + 6;
+   const NSRect editField =
+-      NSMakeRect(NSMaxX(leading) + 6, textY,
+-                 MAX(0, NSMinX(trailing) - 6 - NSMaxX(leading) - 6), 18);
++      NSMakeRect(editX, textY, MAX(0, NSMinX(trailing) - 6 - editX), 18);
+ 
+-  // Idle: center [icon + text] inside the active tab.
++  // Idle: use the sidebar label column or center the group in the toolbar.
+   const BOOL showsPlaceholder = _addressField.displayText.length == 0;
+   CGFloat textW =
+       ceil(showsPlaceholder
+@@ -1569,14 +1695,16 @@ - (void)relayoutAnimated:(BOOL)animated {
+   // A blank tab has room to spare on the left too (the hover ⊗ simply
+   // overlaps the placeholder's leading space, as in Safari).
+   const CGFloat groupLeft =
+-      hasPage ? NSMaxX(leading) + 6 : NSMinX(activeFrame) + 12;
++      _vertical ? NSMinX(leading)
++                : (hasPage ? NSMaxX(leading) + 6 : NSMinX(activeFrame) + 12);
+   const CGFloat groupRight =
+       hasPage ? NSMinX(beforeTrailing) - 6 : NSMaxX(activeFrame) - 12;
+   textW = MAX(0, MIN(textW, groupRight - groupLeft - kIconSize - 6));
+   const CGFloat groupW = kIconSize + 6 + textW;
+   const CGFloat gx =
+-      MAX(groupLeft, MIN(groupRight - groupW,
+-                         floor(NSMidX(activeFrame) - groupW / 2)));
++      _vertical ? groupLeft
++                : MAX(groupLeft, MIN(groupRight - groupW,
++                                     floor(NSMidX(activeFrame) - groupW / 2)));
+   const NSRect idleIcon = NSMakeRect(gx, iconY, kIconSize, kIconSize);
+   const NSRect idleField =
+       NSMakeRect(gx + kIconSize + 6, textY, MAX(0, textW), 18);
+@@ -1595,13 +1723,13 @@ - (void)relayoutAnimated:(BOOL)animated {
+   // the pill is too narrow for the hover ⊗ to sit left of the centered
+   // [🔍 placeholder] group, the ⊗ replaces the 🔍 instead of overlapping it.
+   const BOOL closeCoversIcon =
+-      !hasPage && _activeHovered && gx < NSMaxX(leading) + 4;
++      showClose &&
++      (_vertical || editing || (!hasPage && gx < NSMaxX(leading) + 4));
+   const BOOL iconVisible =
+-      editing ? !_activeHovered
+-              : ((_addressField.displayText.length > 0 || !hasPage) &&
+-                 !closeCoversIcon);
+-  const NSRect iconFrame = editing ? leading : idleIcon;
+-  if (editing && (_activeHovered || _enteringEdit)) {
++      !closeCoversIcon &&
++      (editing || _addressField.displayText.length > 0 || !hasPage);
++  const NSRect iconFrame = editing && !_vertical ? leading : idleIcon;
++  if (editing && !_vertical && (_activeHovered || _enteringEdit)) {
+     // Entering edit mode: the icon fades out where it is (the URL prefix
+     // grows over that spot) and reappears in the leading slot.
+     _iconHiddenForHover = YES;
+@@ -1623,14 +1751,16 @@ - (void)relayoutAnimated:(BOOL)animated {
+   // slide is done on the layer, see -animateAddressTextForEditing:).
+   // Never re-parent the field here: that silently aborts an edit session.
+   const NSRect fieldFrame = editing ? editField : idleField;
+-  const CGFloat fieldShift = NSMinX(_addressField.frame) - NSMinX(fieldFrame);
++  const CGFloat fieldShift = Along(_addressField.frame.origin, _vertical) -
++                             Along(fieldFrame.origin, _vertical);
+   _addressField.frame = fieldFrame;
+   if (overlayAnimated && fabs(fieldShift) > 0.5 && _addressField.layer) {
+     // Keep the text riding with the pill while it slides (e.g. when a drag
+     // ends); the edit transition replaces this with its own slide.
+     NSAnimationContext* context = NSAnimationContext.currentContext;
+-    CABasicAnimation* slide =
+-        [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
++    CABasicAnimation* slide = [CABasicAnimation
++        animationWithKeyPath:_vertical ? @"transform.translation.y"
++                                       : @"transform.translation.x"];
+     slide.fromValue = @(fieldShift);
+     slide.toValue = @0;
+     slide.duration = context.duration;
+@@ -1668,31 +1798,34 @@ - (void)animateAddressTextForEditing:(BOOL)editing {
+   if (!layer || !_didInitialLayout || _addressField.hidden) {
+     return;
+   }
+-  NSString* display = _addressField.displayText ?: @"";
+-  NSString* edit = _addressField.editText ?: @"";
+-  CGFloat prefixW = 0;
+-  if (display.length && edit.length) {
+-    NSRange r = [edit rangeOfString:display options:NSCaseInsensitiveSearch];
+-    if (r.location != NSNotFound && r.location > 0) {
+-      prefixW = [[edit substringToIndex:r.location] sizeWithAttributes:@{
+-        NSFontAttributeName : _addressField.font
+-      }].width;
++  if (!_vertical) {
++    NSString* display = _addressField.displayText ?: @"";
++    NSString* edit = _addressField.editText ?: @"";
++    CGFloat prefixW = 0;
++    if (display.length && edit.length) {
++      NSRange r = [edit rangeOfString:display options:NSCaseInsensitiveSearch];
++      if (r.location != NSNotFound && r.location > 0) {
++        prefixW =
++            [[edit substringToIndex:r.location]
++                sizeWithAttributes:@{NSFontAttributeName : _addressField.font}]
++                .width;
++      }
+     }
+-  }
+-  // Offset of the host between the two layouts.
+-  CGFloat delta = _idleFieldX - (_editFieldX + prefixW);
+-  if (!editing) {
+-    delta = -delta;
+-  }
+-  delta = MAX(-160, MIN(160, delta));
++    // Offset of the host between the two layouts.
++    CGFloat delta = _idleFieldX - (_editFieldX + prefixW);
++    if (!editing) {
++      delta = -delta;
++    }
++    delta = MAX(-160, MIN(160, delta));
+ 
+-  CABasicAnimation* slide =
+-      [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
+-  slide.fromValue = @(delta);
+-  slide.toValue = @0;
+-  slide.duration = kEditDuration;
+-  slide.timingFunction = EditTiming();
+-  [layer addAnimation:slide forKey:@"safariumSlide"];
++    CABasicAnimation* slide =
++        [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
++    slide.fromValue = @(delta);
++    slide.toValue = @0;
++    slide.duration = kEditDuration;
++    slide.timingFunction = EditTiming();
++    [layer addAnimation:slide forKey:@"safariumSlide"];
++  }
+ 
+   CABasicAnimation* fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+   fade.fromValue = @(editing ? 0.4 : 0.0);
+@@ -1752,13 +1885,15 @@ - (void)applyState:(const safarium::BarState&)state {
+   // animation in flight), so a tab-count change can slide them from there.
+   NSMapTable<SafariumTabCell*, NSNumber*>* oldWindowX =
+       [NSMapTable weakToStrongObjectsMapTable];
+-  for (SafariumTabCell* cell in _cells) {
+-    if (cell.window && !NSIsEmptyRect(cell.frame)) {
+-      CALayer* presented = cell.layer.presentationLayer ?: cell.layer;
+-      const NSPoint origin = [cell.superview
+-          convertPoint:NSMakePoint(presented.frame.origin.x, 0)
+-                toView:nil];
+-      [oldWindowX setObject:@(origin.x) forKey:cell];
++  if (!_vertical) {
++    for (SafariumTabCell* cell in _cells) {
++      if (cell.window && !NSIsEmptyRect(cell.frame)) {
++        CALayer* presented = cell.layer.presentationLayer ?: cell.layer;
++        const NSPoint origin = [cell.superview
++            convertPoint:NSMakePoint(presented.frame.origin.x, 0)
++                  toView:nil];
++        [oldWindowX setObject:@(origin.x) forKey:cell];
++      }
+     }
+   }
+ 
+@@ -1864,7 +1999,7 @@ - (void)applyState:(const safarium::BarState&)state {
+   _didInitialLayout = YES;
+   if (animate) {
+     [self updatePreferredWidthAnimated:countChanged];
+-    if (countChanged) {
++    if (countChanged && !_vertical) {
+       // The strip is re-centred and resized while the toolbar item grows or
+       // shrinks; frame animations inside it fight that. Instead put every
+       // tab at its final place and slide it there from where it was on
+@@ -2079,7 +2214,7 @@ - (void)showHoverCardForCell:(SafariumTabCell*)cell {
+   } else {
+     [_hoverCard showRelativeToRect:rect
+                             ofView:self
+-                     preferredEdge:NSRectEdgeMinY];
++                     preferredEdge:_vertical ? NSRectEdgeMaxX : NSRectEdgeMinY];
+   }
+   _controller->SetHoverCardTab(cell.tabId);
+ }
+@@ -2185,15 +2320,20 @@ - (void)tabMouseDown:(NSEvent*)event cell:(NSView*)pressedView {
+   }
+   [self hideHoverCard];
+   _pressWasActive = cell.active;
++  _pressStart = event.locationInWindow;
++  const NSPoint point = [_strip convertPoint:_pressStart fromView:nil];
++  if (_vertical) {
++    _dragGrab = point.y - NSMinY(cell.frame);
++  }
+   if (!cell.active) {
+     // Like Safari, the tab is selected on press; a drag then moves it.
+     _controller->ActivateTab(cell.index);
+   }
+   _pressCell = cell;
+-  _pressStartX =
+-      [_strip convertPoint:event.locationInWindow fromView:nil].x;
+-  _pressStartY = event.locationInWindow.y;
+-  _dragGrab = _pressStartX - NSMinX(cell.frame);
++  if (!_vertical) {
++    const NSPoint updated = [_strip convertPoint:_pressStart fromView:nil];
++    _dragGrab = updated.x - NSMinX(cell.frame);
++  }
+   [self trackPressUntilMouseUp];
+ }
+ 
+@@ -2225,11 +2365,9 @@ - (void)tabMouseDragged:(NSEvent*)event {
+   if (!cell || !_controller) {
+     return;
+   }
+-  const CGFloat x =
+-      [_strip convertPoint:event.locationInWindow fromView:nil].x;
+   if (!_dragCell) {
+-    if ((fabs(x - _pressStartX) < kDragThreshold &&
+-         fabs(event.locationInWindow.y - _pressStartY) < kDragThreshold) ||
++    if ((fabs(event.locationInWindow.x - _pressStart.x) < kDragThreshold &&
++         fabs(event.locationInWindow.y - _pressStart.y) < kDragThreshold) ||
+         _cells.count < 2) {
+       return;
+     }
+@@ -2240,17 +2378,20 @@ - (void)tabMouseDragged:(NSEvent*)event {
+     [NSCursor.arrowCursor set];
+     [self captureDragSnapshot];
+   }
+-  const CGFloat barY = [self convertPoint:event.locationInWindow fromView:nil].y;
+-  if ((barY < -kTearOffDistance ||
+-       barY > NSHeight(self.bounds) + kTearOffDistance) &&
++  const NSPoint inBar = [self convertPoint:event.locationInWindow fromView:nil];
++  const CGFloat cross = Along(inBar, !_vertical);
++  if ((cross < -kTearOffDistance ||
++       cross > Along(self.bounds.size, !_vertical) + kTearOffDistance) &&
+       !cell.pinned && _cells.count >= 2) {
+-    [self dragTabOutsideBar];
++    [self dragTabOutsideBarFromEvent:event];
+     return;
+   }
+-  const CGFloat width = NSWidth(cell.frame);
+-  _dragX = MAX(kCapsuleInset,
+-               MIN(NSWidth(_strip.frame) - kCapsuleInset - width,
+-                   x - _dragGrab));
++  const NSPoint point = [_strip convertPoint:event.locationInWindow
++                                    fromView:nil];
++  const CGFloat length = Along(cell.frame.size, _vertical);
++  _dragPosition = MAX(kCapsuleInset, MIN(Along(_strip.frame.size, _vertical) -
++                                             kCapsuleInset - length,
++                                         Along(point, _vertical) - _dragGrab));
+ 
+   // Swap with a neighbour once the dragged tab's edge passes its middle.
+   const NSInteger i = cell.index;
+@@ -2260,10 +2401,11 @@ - (void)tabMouseDragged:(NSEvent*)event {
+   }
+   NSInteger target = i;
+   if (i > 0 && _cells[i - 1].pinned == cell.pinned &&
+-      _dragX < NSMidX(_slotFrames[i - 1])) {
++      _dragPosition < MidpointAlong(_slotFrames[i - 1], _vertical)) {
+     target = i - 1;
+   } else if (i + 1 < n && _cells[i + 1].pinned == cell.pinned &&
+-             _dragX + width > NSMidX(_slotFrames[i + 1])) {
++             _dragPosition + length >
++                 MidpointAlong(_slotFrames[i + 1], _vertical)) {
+     target = i + 1;
+   }
+   if (target != i) {
+@@ -2347,19 +2489,19 @@ - (BOOL)screenPointIsOverBar:(NSPoint)screenPoint {
+   const NSPoint p = [self convertPoint:[self.window
+                                            convertPointFromScreen:screenPoint]
+                               fromView:nil];
+-  return NSPointInRect(p, NSInsetRect(self.bounds, 0, -8));
++  return NSPointInRect(
++      p, NSInsetRect(self.bounds, _vertical ? -8 : 0, _vertical ? 0 : -8));
+ }
+ 
+-// Where a tab dropped at `screenPoint` goes: before the first tab whose
+-// middle is right of the pointer.
++// Insert before the first slot whose midpoint follows the pointer along
++// the strip.
+ - (NSInteger)insertionIndexForScreenPoint:(NSPoint)screenPoint {
+-  const CGFloat x =
++  const NSPoint point =
+       [_strip convertPoint:[self.window convertPointFromScreen:screenPoint]
+-                  fromView:nil]
+-          .x;
++                  fromView:nil];
+   NSInteger index = 0;
+   for (const NSRect& slot : _slotFrames) {
+-    if (NSMidX(slot) < x) {
++    if (MidpointAlong(slot, _vertical) < Along(point, _vertical)) {
+       ++index;
+     }
+   }
+@@ -2370,7 +2512,7 @@ - (NSInteger)insertionIndexForScreenPoint:(NSPoint)screenPoint {
+ // thumbnail follows the pointer. Dragging back over the bar puts the tab
+ // back under the pointer (the drag then continues as a reorder); releasing
+ // outside the bar opens the tab in a new window there.
+-- (void)dragTabOutsideBar {
++- (void)dragTabOutsideBarFromEvent:(NSEvent*)event {
+   SafariumTabCell* cell = _dragCell;
+   const int64_t tabId = cell.tabId;
+   const NSSize windowSize = self.window.frame.size;
+@@ -2380,7 +2522,8 @@ - (void)dragTabOutsideBar {
+   _outsideTabId = tabId;
+   [self applyVisibleState];  // The tab leaves the bar; its page stays.
+   [NSCursor.arrowCursor set];
+-  [self showDragPreviewAt:NSEvent.mouseLocation];
++  NSPoint screen = ScreenPointForMouseEvent(event);
++  [self showDragPreviewAt:screen];
+   while (YES) {
+     NSEvent* next =
+         [NSApp nextEventMatchingMask:NSEventMaskLeftMouseDragged |
+@@ -2388,7 +2531,9 @@ - (void)dragTabOutsideBar {
+                            untilDate:NSDate.distantFuture
+                               inMode:NSEventTrackingRunLoopMode
+                              dequeue:YES];
+-    const NSPoint screen = NSEvent.mouseLocation;
++    if (next) {
++      screen = ScreenPointForMouseEvent(next);
++    }
+     const NSInteger from = [self modelIndexOfTab:tabId];
+     if (!_controller || from < 0) {  // Tab closed meanwhile.
+       _outsideTabId = 0;
+@@ -2420,11 +2565,9 @@ - (void)dragTabOutsideBar {
+       _dragCell = back;
+       _pressWasActive = YES;
+       _dragGrab = back.index >= 0 && back.index < (NSInteger)_slotFrames.size()
+-                      ? NSWidth(_slotFrames[back.index]) / 2
+-                      : kMaxTabWidth / 2;
+-      const NSPoint inWindow = [self.window convertPointFromScreen:screen];
+-      _pressStartX = [_strip convertPoint:inWindow fromView:nil].x;
+-      _pressStartY = inWindow.y;
++                      ? Along(_slotFrames[back.index].size, _vertical) / 2
++                      : (_vertical ? kTabHeight : kMaxTabWidth) / 2;
++      _pressStart = [self.window convertPointFromScreen:screen];
+       [self tabMouseDragged:next];
+       return;  // -trackPressUntilMouseUp continues with _pressCell.
+     }
+@@ -2436,9 +2579,17 @@ - (void)dragTabOutsideBar {
+       if (window) {
+         // The new window's (single, centered) tab lands under the pointer.
+         const CGFloat kPointerFromTop = 26;
+-        [window setFrame:NSMakeRect(screen.x - windowSize.width / 2,
+-                                    screen.y + kPointerFromTop -
+-                                        windowSize.height,
++        const CGFloat pointerX =
++            _vertical ? NSMidX([self convertRect:self.bounds toView:nil])
++                      : windowSize.width / 2;
++        const CGFloat pointerY =
++            _vertical ? NSHeight(self.window.frame) -
++                            [self convertPoint:NSMakePoint(0, kTabHeight / 2)
++                                        toView:nil]
++                                .y
++                      : kPointerFromTop;
++        [window setFrame:NSMakeRect(screen.x - pointerX,
++                                    screen.y + pointerY - windowSize.height,
+                                     windowSize.width, windowSize.height)
+                  display:YES];
+         [window makeKeyAndOrderFront:nil];
+@@ -2740,6 +2891,7 @@ - (void)loadView {
+   _card.wantsLayer = YES;
+   _card.layer.cornerRadius = kCardCornerRadius;
+   _card.layer.masksToBounds = YES;
++  _card.layer.actions = @{@"borderWidth" : NSNull.null};
+   [root addSubview:_card];
+ 
+   // Plain layer-backed view: aspect-fill, anchored at the top of the page.
+@@ -2747,6 +2899,7 @@ - (void)loadView {
+   _thumbnail.wantsLayer = YES;
+   _thumbnail.layer.contentsGravity = kCAGravityResizeAspectFill;
+   _thumbnail.layer.masksToBounds = YES;
++  _thumbnail.layer.actions = @{@"contents" : NSNull.null};
+   [_card addSubview:_thumbnail];
+ 
+   _close = [NSButton buttonWithImage:Symbol(@"xmark", 9, NSFontWeightSemibold)
+@@ -2830,6 +2983,9 @@ - (void)setTab:(SafariumOverviewTab*)tab {
+ }
+ 
+ - (void)setThumbnail:(NSImage*)thumbnail {
++  // No implicit cross-fade (layer actions, set in -loadView): two captures
++  // with different crops blend into doubled text. Not an explicit
++  // CATransaction: committing one here would flush the half-built zoom.
+   _thumbnail.layer.contents = thumbnail;
+   _placeholder.hidden = thumbnail != nil || _tab == nil;
+ }
+@@ -2876,7 +3032,26 @@ - (void)setZoomedIn:(BOOL)zoomedIn duration:(CFTimeInterval)duration {
+       v.animator.alphaValue = zoomedIn ? 0 : 1;
+     }
+   }];
+-  _card.layer.borderWidth = (_tab.active && !zoomedIn) ? 3 : 0;
++  const CGFloat border = (_tab.active && !zoomedIn) ? 3 : 0;
++  CALayer* layer = _card.layer;
++  const CGFloat from = layer.presentationLayer
++                           ? layer.presentationLayer.borderWidth
++                           : layer.borderWidth;
++  layer.borderWidth = border;  // No implicit action (see -loadView).
++  if (duration > 0 && from != border) {
++    // Entering the overview: the selection ring appears as the page settles
++    // into its card (scaled 3x at the start, it read as a thick frame).
++    CABasicAnimation* ring =
++        [CABasicAnimation animationWithKeyPath:@"borderWidth"];
++    ring.fromValue = @(zoomedIn ? from : 0);
++    ring.toValue = @(border);
++    ring.duration = duration;
++    ring.timingFunction = [CAMediaTimingFunction
++        functionWithName:kCAMediaTimingFunctionEaseIn];
++    [layer addAnimation:ring forKey:@"safariumRing"];
++  } else {
++    [layer removeAnimationForKey:@"safariumRing"];
++  }
+ }
+ 
+ - (void)closeClicked:(id)sender {
+@@ -2925,6 +3100,7 @@ @implementation SafariumOverviewView {
+   views::ViewTracker _pageView;
+   NSView* _exitOverlay;
+   CALayer* _exitPage;
++  int64_t _snapshotTab;  // Tab whose card shows this session's page snapshot.
+ }
+ @synthesize delegate = _delegate;
+ 
+@@ -3056,6 +3232,13 @@ - (void)applyFilter {
+ }
+ 
+ - (void)setThumbnail:(NSImage*)image forTab:(int64_t)tabId {
++  // The current tab's card shows the page snapshot taken when the overview
++  // opened (full viewport, the same framing as the live page). Chromium's
++  // own thumbnails are cropped differently; letting one replace it makes the
++  // exit zoom cross-fade between two scales (doubled text).
++  if (tabId == _snapshotTab && _thumbnails[@(tabId)]) {
++    return;
++  }
+   _thumbnails[@(tabId)] = image;
+   [_grid.visibleItems enumerateObjectsUsingBlock:^(
+                           NSCollectionViewItem* item, NSUInteger, BOOL*) {
+@@ -3156,6 +3339,7 @@ - (void)zoomInFromPage:(NSImage*)snapshot
+   self.alphaValue = 1;
+   if (snapshot) {
+     _thumbnails[@(tabId)] = snapshot;
++    _snapshotTab = tabId;
+     [card setThumbnail:snapshot];
+   }
+   if (!card || !snapshot) {
+@@ -3304,6 +3488,7 @@ - (void)resetZoom {
+ 
+ - (void)prepareForPresentation {
+   [self resetZoom];
++  _snapshotTab = 0;
+   _search.stringValue = @"";
+   [_thumbnails removeAllObjects];
+   [_scroll.contentView scrollToPoint:NSZeroPoint];
+@@ -3393,6 +3578,183 @@ - (NSUInteger)glassBehavior {
+ }
+ @end
+ 
++// A sidebar uses the same tab strip as the toolbar, with room for window
++// controls and a separate set of native buttons above the scrollable tabs.
++@interface SafariumSidebarView : NSView
++@property(nonatomic, weak) SafariumTabBarView* tabView;
++@property(nonatomic, readonly) NSButton* back;
++@property(nonatomic, readonly) NSButton* forward;
++@property(nonatomic, readonly) NSButton* reload;
++@property(nonatomic, readonly) NSButton* share;
++@property(nonatomic, readonly) NSButton* home;
++@property(nonatomic, copy) NSArray<NSButton*>* extensionButtons;
++- (void)configureButtonsWithTarget:(id)target;
++@end
++
++static NSButton* SidebarGlassButton(NSImage* image,
++                                    NSString* label,
++                                    id target,
++                                    SEL action) {
++  NSButton* button = [NSButton buttonWithImage:image
++                                        target:target
++                                        action:action];
++  if (@available(macOS 26.0, *)) {
++    button.bezelStyle = NSBezelStyleGlass;
++    button.borderShape = NSControlBorderShapeCircle;
++  } else {
++    button.bezelStyle = NSBezelStyleCircular;
++  }
++  button.imageScaling = NSImageScaleProportionallyDown;
++  button.toolTip = label;
++  button.accessibilityLabel = label;
++  return button;
++}
++
++@implementation SafariumSidebarView {
++  NSVisualEffectView* _background;
++  NSView* _navigation;
++  NSButton* _downloads;
++  NSButton* _overview;
++  NSButton* _newTab;
++}
++
++@synthesize tabView = _tabView;
++@synthesize back = _back;
++@synthesize forward = _forward;
++@synthesize reload = _reload;
++@synthesize share = _share;
++@synthesize home = _home;
++@synthesize extensionButtons = _extensionButtons;
++
++- (instancetype)initWithFrame:(NSRect)frame {
++  if ((self = [super initWithFrame:frame])) {
++    _background = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
++    _background.material = NSVisualEffectMaterialSidebar;
++    _background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
++    _background.state = NSVisualEffectStateFollowsWindowActiveState;
++    _background.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++    [self addSubview:_background];
++  }
++  return self;
++}
++
++- (void)configureButtonsWithTarget:(id)target {
++  if (_navigation) {
++    return;
++  }
++  _navigation = [[NSView alloc] initWithFrame:NSZeroRect];
++  NSView* glass = MakeGlass(kControlHeight / 2);
++  glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++  [_navigation addSubview:glass];
++  _back = MakeIconButton(@"chevron.left", 14, target, @selector(sidebarBack:));
++  _forward =
++      MakeIconButton(@"chevron.right", 14, target, @selector(sidebarForward:));
++  _back.accessibilityLabel = _back.toolTip = @"Back";
++  _forward.accessibilityLabel = _forward.toolTip = @"Forward";
++  [_navigation addSubview:_back];
++  [_navigation addSubview:_forward];
++  [self addSubview:_navigation];
++
++  _reload =
++      SidebarGlassButton(Symbol(@"arrow.clockwise", 14, NSFontWeightMedium),
++                         @"Reload", target, @selector(reload:));
++  _downloads =
++      SidebarGlassButton(Symbol(@"arrow.down.circle", 14, NSFontWeightMedium),
++                         @"Downloads", target, @selector(toggleDownloads:));
++  _share =
++      SidebarGlassButton(Symbol(@"square.and.arrow.up", 14, NSFontWeightMedium),
++                         @"Share", target, @selector(sidebarShare:));
++  _overview = SidebarGlassButton(
++      Symbol(@"square.on.square", 14, NSFontWeightMedium), @"Show Tab Overview",
++      target, @selector(toggleOverview:));
++  _newTab = SidebarGlassButton(Symbol(@"plus", 14, NSFontWeightMedium),
++                               @"New Tab", target, @selector(newTab:));
++  _home = SidebarGlassButton(Symbol(@"house", 14, NSFontWeightMedium), @"Home",
++                             target, @selector(runCommand:));
++  _home.tag = IDC_HOME;
++  _home.hidden = YES;
++  for (NSButton* button in
++       @[ _reload, _downloads, _share, _overview, _newTab, _home ]) {
++    [self addSubview:button];
++  }
++  self.needsLayout = YES;
++}
++
++- (BOOL)isFlipped {
++  return YES;
++}
++
++- (void)mouseDown:(NSEvent*)event {
++  if (event.clickCount == 2) {
++    [self.window performZoom:nil];
++  } else {
++    [self.window performWindowDragWithEvent:event];
++  }
++}
++
++- (void)setExtensionButtons:(NSArray<NSButton*>*)buttons {
++  for (NSButton* button in _extensionButtons) {
++    [button removeFromSuperview];
++  }
++  _extensionButtons = [buttons copy];
++  for (NSButton* button in _extensionButtons) {
++    [self addSubview:button];
++  }
++  self.needsLayout = YES;
++}
++
++- (void)viewDidMoveToWindow {
++  [super viewDidMoveToWindow];
++  self.needsLayout = YES;
++}
++
++- (void)layout {
++  [super layout];
++  _background.frame = self.bounds;
++  // Horizontal windows can lay out the hidden host before it has buttons.
++  if (!_navigation) {
++    return;
++  }
++  const CGFloat width = NSWidth(self.bounds);
++  constexpr CGFloat inset = 10;
++  constexpr CGFloat gap = 6;
++  const CGFloat size = kControlHeight;
++  const CGFloat navWidth = 2 * size;
++  NSButton* trafficLight =
++      [self.window standardWindowButton:NSWindowCloseButton];
++  const CGFloat centerY = trafficLight.window
++                              ? NSMidY([self convertRect:trafficLight.bounds
++                                                fromView:trafficLight])
++                              : inset + size / 2;
++  const CGFloat headerY = MAX(4, floor(centerY - size / 2));
++  const CGFloat rightEdge = width - inset;
++  _navigation.frame =
++      NSMakeRect(rightEdge - size - gap - navWidth, headerY, navWidth, size);
++  _back.frame = NSMakeRect(0, 0, size, size);
++  _forward.frame = NSMakeRect(size, 0, size, size);
++  _reload.frame = NSMakeRect(rightEdge - size, headerY, size, size);
++
++  CGFloat x = inset;
++  CGFloat y = headerY + size + gap;
++  for (NSButton* button in [@[ _newTab, _downloads, _share, _overview, _home ]
++           arrayByAddingObjectsFromArray:_extensionButtons ?: @[]]) {
++    if (button.hidden) {
++      continue;
++    }
++    if (x + size > rightEdge && x > inset) {
++      x = inset;
++      y += size + gap;
++    }
++    button.frame = NSMakeRect(x, y, size, size);
++    x += size + gap;
++  }
++  const CGFloat tabsY = y + size + gap;
++  self.tabView.frame =
++      NSMakeRect(inset, tabsY, MAX(0, width - 2 * inset),
++                 MAX(0, NSHeight(self.bounds) - tabsY - inset));
++}
++@end
++
+ @interface SafariumToolbarController
+     : NSObject <NSToolbarDelegate,
+                 NSSharingServicePickerToolbarItemDelegate,
+@@ -3408,6 +3770,8 @@ - (NSToolbarItem*)extensionItem:(NSToolbarItemIdentifier)identifier
+ - (void)setController:(safarium::TabBarController*)controller;
+ - (void)installInWindow:(NSWindow*)window;
+ - (void)uninstall;
++- (void)setVerticalSidebar:(SafariumSidebarView*)sidebar;
++- (void)updateViewport;
+ - (void)updateState:(const safarium::BarState&)state;
+ @end
+ 
+@@ -3421,6 +3785,9 @@ @implementation SafariumToolbarController {
+   __weak NSWindow* _window;
+   __weak NSToolbarItemGroup* _navGroup;
+   __weak NSToolbarItem* _reloadItem;
++  __weak NSToolbarItem* _tabsItem;
++  __weak SafariumSidebarView* _sidebar;
++  NSMutableDictionary<NSString*, NSButton*>* _sidebarExtensionButtons;
+   __weak NSView* _extensionActionButton;
+   BOOL _extensionRefreshPending;
+   BOOL _canGoBack;
+@@ -3432,6 +3799,8 @@ @implementation SafariumToolbarController {
+   uint64_t _overviewTransition;
+   id _escMonitor;  // Local key monitor: Esc leaves the overview.
+   BOOL _closingOverview;  // Freeze the grid while zooming out of it.
++  BOOL _verticalTabs;
++  BOOL _showHome;
+   BOOL _homeItemSynced;   // Initial toolbar/pref reconciliation done.
+   BOOL _syncingHomeItem;  // We are adding/removing the Home item ourselves.
+ }
+@@ -3443,6 +3812,7 @@ - (instancetype)initWithTabView:(SafariumTabBarView*)tabView
+     _pageView.SetView(pageView);
+     _extensionsAnchorView.SetView(extensionsAnchorView);
+     _tabView = tabView;
++    _sidebarExtensionButtons = [NSMutableDictionary dictionary];
+     _toolbar = [[NSToolbar alloc] initWithIdentifier:kSafariumToolbarId];
+     _toolbar.delegate = self;
+     _toolbar.displayMode = NSToolbarDisplayModeIconOnly;
+@@ -3460,10 +3830,59 @@ - (void)setController:(safarium::TabBarController*)controller {
+ 
+ - (void)installInWindow:(NSWindow*)window {
+   _window = window;
++  if ([window isKindOfClass:BrowserNativeWidgetWindow.class]) {
++    ((BrowserNativeWidgetWindow*)window).usesSystemTitlebarMetrics = YES;
++  }
+   window.backgroundColor = NSColor.windowBackgroundColor;
+   window.titleVisibility = NSWindowTitleHidden;
+   window.toolbarStyle = NSWindowToolbarStyleUnified;
+-  window.toolbar = _toolbar;
++  [self applyWindowChrome];
++}
++
++// Horizontal tabs: the NSToolbar (tabs, address, buttons) on top. Vertical
++// tabs: no toolbar; the content view runs to the window's top edge (the
++// sidebar sits under the traffic lights, the page uses the full height).
++- (void)setVerticalSidebar:(SafariumSidebarView*)sidebar {
++  const BOOL vertical = sidebar != nil;
++  if (_verticalTabs == vertical) {
++    return;
++  }
++  [_downloadsPopover close];
++  if (_overview) {
++    [self setOverview:NO];
++  }
++  _sidebar.tabView = nil;
++  _sidebar = sidebar;
++  _verticalTabs = vertical;
++  [self applyWindowChrome];
++}
++
++- (void)applyWindowChrome {
++  NSWindow* window = _window;
++  if (!window) {
++    return;
++  }
++  if (_verticalTabs) {
++    window.toolbar = nil;
++    [_tabView removeFromSuperview];
++    _tabsItem.view = nil;
++    [_tabView setVertical:YES];
++    window.titlebarAppearsTransparent = YES;
++    window.styleMask |= NSWindowStyleMaskFullSizeContentView;
++    [_sidebar configureButtonsWithTarget:self];
++    _sidebar.tabView = _tabView;
++    [_sidebar addSubview:_tabView];
++    _sidebar.needsLayout = YES;
++    [self scheduleExtensionItemRefresh];
++  } else {
++    [_tabView removeFromSuperview];
++    [_tabView setVertical:NO];
++    _tabsItem.view = _tabView;
++    window.styleMask &= ~NSWindowStyleMaskFullSizeContentView;
++    window.titlebarAppearsTransparent = NO;
++    window.toolbar = _toolbar;
++  }
++  [self refreshItems];
+ }
+ 
+ - (void)uninstall {
+@@ -3561,7 +3980,10 @@ - (NSToolbarItem*)toolbar:(NSToolbar*)toolbar
+     item.label = @"Tabs";
+     item.paletteLabel = @"Tabs";
+     if (flag) {
+-      item.view = _tabView;
++      _tabsItem = item;
++      if (!_verticalTabs) {
++        item.view = _tabView;
++      }
+     } else {
+       // Palette preview: a tab-strip capsule (gray, like the real one).
+       NSView* preview = [[NSView alloc] initWithFrame:NSZeroRect];
+@@ -3799,6 +4221,7 @@ - (void)refreshExtensionItems {
+   if (!extensions) {
+     return;
+   }
++  NSMutableArray<NSButton*>* sidebarButtons = [NSMutableArray array];
+   for (NSToolbarItem* item in _toolbar.items) {
+     if (![item.itemIdentifier hasPrefix:kExtensionItemPrefix]) {
+       continue;
+@@ -3819,7 +4242,29 @@ - (void)refreshExtensionItems {
+       item.toolTip = name;
+       item.view.accessibilityLabel = name;
+       item.menuFormRepresentation.title = name;
+-      item.image = [self imageForExtension:id];
++      NSImage* image = [self imageForExtension:id];
++      item.image = image;
++      if (_verticalTabs) {
++        NSButton* button = _sidebarExtensionButtons[item.itemIdentifier];
++        if (!button) {
++          button =
++              SidebarGlassButton(image, name, self, @selector(runExtension:));
++          button.identifier = item.itemIdentifier;
++        }
++        button.image = image;
++        button.toolTip = name;
++        button.accessibilityLabel = name;
++        [sidebarButtons addObject:button];
++      }
++    }
++  }
++  if (_verticalTabs) {
++    [_sidebarExtensionButtons removeAllObjects];
++    for (NSButton* button in sidebarButtons) {
++      _sidebarExtensionButtons[button.identifier] = button;
++    }
++    if (![_sidebar.extensionButtons isEqualToArray:sidebarButtons]) {
++      _sidebar.extensionButtons = sidebarButtons;
+     }
+   }
+ }
+@@ -3830,7 +4275,8 @@ - (void)updateState:(const safarium::BarState&)state {
+   _canGoBack = state.can_go_back;
+   _canGoForward = state.can_go_forward;
+   _isLoading = state.is_loading;
+-  [self syncHomeItem:state.show_home_button];
++  _showHome = state.show_home_button;
++  [self syncHomeItem:_showHome];
+   NSMutableArray<SafariumOverviewTab*>* tabs = [NSMutableArray array];
+   for (size_t i = 0; i < state.tabs.size(); ++i) {
+     const safarium::TabItem& t = state.tabs[i];
+@@ -3868,6 +4314,21 @@ - (int64_t)activeTabId {
+   return 0;
+ }
+ 
++- (void)updateViewport {
++  NSView* content = _window.contentView;
++  if (!_overviewView.superview || !content) {
++    return;
++  }
++  if (_verticalTabs && _pageView) {
++    NSRect inWindow = [_window
++        convertRectFromScreen:gfx::ScreenRectToNSRect(
++                                  _pageView.view()->GetBoundsInScreen())];
++    _overviewView.frame = [content convertRect:inWindow fromView:nil];
++  } else {
++    _overviewView.frame = content.bounds;
++  }
++}
++
+ - (void)showOverviewView:(BOOL)show zoomToTab:(int64_t)tabId {
+   NSView* content = _window.contentView;
+   if (!content) {
+@@ -3888,6 +4349,7 @@ - (void)showOverviewView:(BOOL)show zoomToTab:(int64_t)tabId {
+     // Hidden until the page snapshot arrives, then zoom out from it.
+     _overviewView.alphaValue = 0;
+     [content addSubview:_overviewView positioned:NSWindowAbove relativeTo:nil];
++    [self updateViewport];
+     [_window makeFirstResponder:_overviewView];
+     if (!_controller) {
+       _overviewView.alphaValue = 1;
+@@ -4032,7 +4494,18 @@ - (void)applyItemState {
+   reload.image = reloadImage;
+   reload.label = reloadLabel;
+   reload.toolTip = reloadLabel;
+-
++  if (_verticalTabs) {
++    _sidebar.back.enabled = !_overview && _canGoBack;
++    _sidebar.forward.enabled = !_overview && _canGoForward;
++    _sidebar.reload.image = reloadImage;
++    _sidebar.reload.toolTip = reloadLabel;
++    _sidebar.reload.accessibilityLabel = reloadLabel;
++    _sidebar.share.enabled = !_overview;
++    if (_sidebar.home.hidden == _showHome) {
++      _sidebar.home.hidden = !_showHome;
++      _sidebar.needsLayout = YES;
++    }
++  }
+ }
+ 
+ // --- Actions ---------------------------------------------------------------
+@@ -4090,13 +4563,36 @@ - (void)setOverview:(BOOL)overview zoomToTab:(int64_t)tabId {
+   [self showOverviewView:overview zoomToTab:tabId];
+ }
+ 
+-- (void)runCommand:(NSToolbarItem*)sender {
++- (void)runCommand:(id)sender {
++  if (_controller) {
++    _controller->ExecuteCommand(static_cast<int>([sender tag]));
++  }
++}
++
++- (void)sidebarBack:(id)sender {
+   if (_controller) {
+-    _controller->ExecuteCommand(static_cast<int>(sender.tag));
++    _controller->GoBack();
++  }
++}
++
++- (void)sidebarForward:(id)sender {
++  if (_controller) {
++    _controller->GoForward();
+   }
+ }
+ 
+-- (void)toggleDownloads:(NSToolbarItem*)sender {
++- (void)sidebarShare:(NSButton*)sender {
++  NSURL* url = _controller ? net::NSURLWithGURL(_controller->ActiveURL()) : nil;
++  if (url) {
++    NSSharingServicePicker* picker =
++        [[NSSharingServicePicker alloc] initWithItems:@[ url ]];
++    [picker showRelativeToRect:sender.bounds
++                        ofView:sender
++                 preferredEdge:NSRectEdgeMaxY];
++  }
++}
++
++- (void)toggleDownloads:(id)sender {
+   if (!_controller) {
+     return;
+   }
+@@ -4104,14 +4600,17 @@ - (void)toggleDownloads:(NSToolbarItem*)sender {
+     _downloadsPopover = [[SafariumDownloadsPopover alloc] init];
+   }
+   __weak SafariumToolbarController* weakSelf = self;
+-  [_downloadsPopover toggleForProfile:_controller->GetProfile()
+-                             toolbarItem:sender
+-                                  showAll:^{
+-    SafariumToolbarController* strongSelf = weakSelf;
+-    if (strongSelf && strongSelf->_controller) {
+-      strongSelf->_controller->ExecuteCommand(IDC_SHOW_DOWNLOADS);
+-    }
+-  }];
++  NSView* anchor = [sender isKindOfClass:NSView.class] ? sender : nil;
++  [_downloadsPopover
++      toggleForProfile:_controller->GetProfile()
++           toolbarItem:anchor ? nil : sender
++                anchor:anchor
++               showAll:^{
++                 SafariumToolbarController* strongSelf = weakSelf;
++                 if (strongSelf && strongSelf->_controller) {
++                   strongSelf->_controller->ExecuteCommand(IDC_SHOW_DOWNLOADS);
++                 }
++               }];
+ }
+ 
+ - (void)runExtension:(id)sender {
+@@ -4170,6 +4669,37 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+ 
+ namespace safarium {
+ 
++struct VerticalSidebarView::ObjCStorage {
++  SafariumSidebarView* __strong view =
++      [[SafariumSidebarView alloc] initWithFrame:NSZeroRect];
++};
++
++VerticalSidebarView::VerticalSidebarView()
++    : objc_(std::make_unique<ObjCStorage>()) {
++  host_ = AddChildView(std::make_unique<views::NativeViewHost>());
++}
++
++VerticalSidebarView::~VerticalSidebarView() = default;
++
++gfx::NativeView VerticalSidebarView::GetSidebarNativeView() const {
++  return gfx::NativeView(objc_->view);
++}
++
++void VerticalSidebarView::AddedToWidget() {
++  views::View::AddedToWidget();
++  if (!host_->native_view()) {
++    host_->Attach(GetSidebarNativeView());
++  }
++}
++
++void VerticalSidebarView::Layout(PassKey) {
++  host_->SetBoundsRect(GetLocalBounds());
++  LayoutSuperclass<views::View>(this);
++}
++
++BEGIN_METADATA(VerticalSidebarView)
++END_METADATA
++
+ class ToolbarInstaller : public views::View, public TabBarView {
+   METADATA_HEADER(ToolbarInstaller, views::View)
+ 
+@@ -4248,6 +4778,13 @@ void UpdateState(const BarState& state) override {
+ 
+   void FocusAddressField() override { [tab_view_ focusAddressField]; }
+ 
++  void SetVerticalSidebar(gfx::NativeView sidebar) override {
++    [toolbar_ setVerticalSidebar:static_cast<SafariumSidebarView*>(
++                                     sidebar.GetNativeNSView())];
++  }
++
++  void UpdateViewport() override { [toolbar_ updateViewport]; }
++
+   void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) override {
+     [toolbar_ thumbnailChanged:gfx::NSImageFromImageSkia(image) forTab:tab_id];
+   }
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index 7e68c09eb0..fec6015955 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -10,13 +10,16 @@
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/apps/app_shim/app_shim_host_mac.h"
+ #include "chrome/browser/apps/app_shim/app_shim_manager_mac.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/webui_browser/safarium_features.h"
+ #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
+ #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
++#include "chrome/browser/ui/webui_browser/safarium_features.h"
++#include "chrome/common/pref_names.h"
+ #include "components/input/native_web_keyboard_event.h"
++#include "components/prefs/pref_service.h"
+ #import "components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h"
+ #include "ui/base/accelerators/global_accelerator_listener/global_accelerator_listener.h"
+ #include "ui/base/mojom/window_open_disposition.mojom-shared.h"
+@@ -181,8 +184,16 @@ void PopulateCreateWindowParams(
+ 
+   void GetWindowFrameTitlebarHeight(bool* override_titlebar_height,
+                                     float* titlebar_height) override {
+-    // Safarium: the NSToolbar defines the title bar height.
+-    *override_titlebar_height = !safarium::IsNativeUIEnabled();
++    if (safarium::IsNativeUIEnabled()) {
++      // The horizontal toolbar supplies its own height. The vertical
++      // sidebar reserves a title bar row for the native window controls.
++      *override_titlebar_height =
++          browser_->GetProfile()->GetPrefs()->GetBoolean(
++              prefs::kVerticalTabsEnabled);
++      *titlebar_height = 52;
++      return;
++    }
++    *override_titlebar_height = true;
+     *titlebar_height = 40;
+   }
+ 
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+index 48fec9db47..e71a3ed14a 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+@@ -9,6 +9,8 @@
+ 
+ REMOTE_COCOA_APP_SHIM_EXPORT
+ @interface BrowserNativeWidgetWindow : NativeWidgetMacNSWindow
++// Opts into AppKit's window corner radius and traffic light placement.
++@property(nonatomic) BOOL usesSystemTitlebarMetrics;
+ // When set to `YES`, the traffic lights will always be shown. When set to `NO`,
+ // the traffic lights follow the default AppKit behavior.
+ - (void)setAlwaysShowTrafficLights:(BOOL)alwaysShow;
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+index ae93fe9bd9..0c751944bd 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -70,6 +70,22 @@ - (CGFloat)_titlebarHeight {
+ 
+ - (CGFloat)_minXTitlebarWidgetInset {
+   if (@available(macOS 26, *)) {
++    auto* window =
++        base::apple::ObjCCast<BrowserNativeWidgetWindow>(self.window);
++    if (window.usesSystemTitlebarMetrics) {
++      if (!_inFullScreen && !window.toolbar &&
++          (window.styleMask & NSWindowStyleMaskFullSizeContentView)) {
++        // Keep the taller toolbarless title bar's controls equally inset
++        // from the leading and top edges of the window.
++        const CGFloat buttonWidth =
++            NSWidth([window standardWindowButton:NSWindowCloseButton].frame);
++        if (buttonWidth > 0) {
++          return MAX([super _minXTitlebarWidgetInset],
++                     floor(([self _titlebarHeight] - buttonWidth) / 2));
++        }
++      }
++      return [super _minXTitlebarWidgetInset];
++    }
+     // On macOS 26, position the leading window widget the same distance from
+     // the leading edge of the window as it is from the top of the window. That
+     // way the window corner can be adjusted to make the widget concentric.
+@@ -84,6 +100,11 @@ - (CGFloat)_minXTitlebarWidgetInset {
+ // _getCachedWindowCornerRadius.
+ - (CGFloat)_getCachedWindowCornerRadius {
+   if (@available(macOS 26, *)) {
++    auto* window =
++        base::apple::ObjCCast<BrowserNativeWidgetWindow>(self.window);
++    if (window.usesSystemTitlebarMetrics) {
++      return [super _getCachedWindowCornerRadius];
++    }
+     return 13.0 /* widget position from top and left */ +
+            7.0 /* widget radius */;
+   }
+@@ -147,6 +168,7 @@ - (void)maybeShowTrafficLights {
+ @implementation BrowserNativeWidgetWindow
+ 
+ @synthesize thinTitlebarViewController = _thinTitlebarViewController;
++@synthesize usesSystemTitlebarMetrics = _usesSystemTitlebarMetrics;
+ 
+ // NSWindow (PrivateAPI) overrides.
+ 

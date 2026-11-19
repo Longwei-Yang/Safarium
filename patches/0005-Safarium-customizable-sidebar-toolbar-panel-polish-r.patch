@@ -1,0 +1,2894 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:36:29 -0500
+Subject: [PATCH 5/5] Safarium: customizable sidebar toolbar, panel polish,
+ restore fix
+
+Vertical tabs:
+- Sidebar toolbar with its own layout (NSUserDefaults
+  SafariumSidebarToolbarLayout): adjacent items share a Liquid Glass
+  group, a space starts a new group, a flexible space takes the row's
+  leftover width, and a row break starts a new row. Right-click >
+  Customize Toolbar... edits it in place with an NSPopover palette.
+- The sidebar is resizable from its trailing edge (240-480 pt, saved),
+  opaque like the toolbar, with a system separator line.
+- In full screen the first row takes the traffic lights' room.
+
+Extension side panels dock on the right only, open and close with
+Chrome's side panel motion (350 ms), and use the system separator color.
+
+Tab Overview always scrolls the current card into view. The active tab
+is made visible when a restored window first shows (the page stayed
+blank until a tab switch). Settings and the New Tab page no longer link
+to Chromium's own toolbar customization.
+
+Default layouts: [back forward] [reload] ... [new tab, downloads,
+share, overview] horizontally; [back forward] [new tab, reload] /
+[overview, share, downloads] in the sidebar.
+
+Local checkpoint only; not intended for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../appearance_page/appearance_page.html.ts   |   15 +-
+ chrome/browser/ui/side_panel/BUILD.gn         |    1 -
+ .../browser/ui/side_panel/side_panel_prefs.cc |    7 -
+ chrome/browser/ui/webui/new_tab_page/BUILD.gn |    1 +
+ .../new_tab_page/core/ntp_load_time_data.cc   |    7 +
+ .../ui/webui_browser/safarium_root_view.cc    |  243 +--
+ .../ui/webui_browser/safarium_root_view.h     |   43 +-
+ .../safarium_side_panel_header_mac.mm         |   38 +-
+ .../safarium_tab_bar_host_mac.mm              | 1741 +++++++++++++++--
+ .../webui_browser_side_panel_ui.cc            |   17 +-
+ .../ui/webui_browser/webui_browser_window.cc  |   39 +-
+ .../ui/webui_browser/webui_browser_window.h   |    9 +-
+ 12 files changed, 1818 insertions(+), 343 deletions(-)
+
+diff --git a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+index bacc36d7e8..3f4a8874e8 100644
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -50,12 +50,12 @@ export function getHtml(this: SettingsAppearancePageElement) {
+ </if>
+     </div>
+     ` : ''}
++    ${this.showChromeOnlySettings_ ? html`
+     <div id="toolbarRow" class="settings-row">
+       <cr-link-row id="customizeToolbar" label="$i18n{customizeToolbar}"
+           @click="${this.onCustomizeToolbarClick_}" external>
+       </cr-link-row>
+-      ${this.showChromeOnlySettings_ &&
+-          this.showResetPinnedActionsButton_ ? html`
++      ${this.showResetPinnedActionsButton_ ? html`
+         <div class="separator"></div>
+         <cr-button id="resetPinnedToolbarActions"
+             @click="${this.onResetPinnedToolbarActionsClick_}"
+@@ -64,6 +64,7 @@ export function getHtml(this: SettingsAppearancePageElement) {
+         </cr-button>
+       ` : ''}
+     </div>
++    ` : ''}
+     <div id="colorSchemeModeRow" class="cr-row"
+         ?hidden="${!this.showColorSchemeMode_()}">
+       <div id="colorSchemeModeLabel" class="flex cr-padded-text"
+@@ -283,16 +284,6 @@ export function getHtml(this: SettingsAppearancePageElement) {
+                 this.onTabStripPositionSettingsControlChange_}">
+         </settings-dropdown-menu>
+       </div>
+-      <div class="cr-row hr">
+-        <div class="flex cr-padded-text" aria-hidden="true">
+-          $i18n{sidePanelPosition}
+-        </div>
+-        <settings-dropdown-menu id="safariumSidePanelPosition"
+-            label="$i18n{sidePanelPosition}"
+-            pref-key="side_panel.is_right_aligned"
+-            .menuOptions="${this.sidePanelAlignmentOptions_}">
+-        </settings-dropdown-menu>
+-      </div>
+     ` : ''}
+     ${!this.showHoverCardImagesOption_ ? html`
+       <div class="hr" ?hidden="${!this.pageVisibility_.hoverCard}"></div>
+diff --git a/chrome/browser/ui/side_panel/BUILD.gn b/chrome/browser/ui/side_panel/BUILD.gn
+index de0e7f7906..a65fbd8ee4 100644
+--- a/chrome/browser/ui/side_panel/BUILD.gn
++++ b/chrome/browser/ui/side_panel/BUILD.gn
+@@ -38,7 +38,6 @@ source_set("side_panel") {
+   ]
+ 
+   deps = [
+-    "//build:safarium_buildflags",
+     "//chrome/app:generated_resources",
+     "//chrome/browser:primitives",
+     "//chrome/browser/ui:ui_features",
+diff --git a/chrome/browser/ui/side_panel/side_panel_prefs.cc b/chrome/browser/ui/side_panel/side_panel_prefs.cc
+index e184056ce4..f3c693711f 100644
+--- a/chrome/browser/ui/side_panel/side_panel_prefs.cc
++++ b/chrome/browser/ui/side_panel/side_panel_prefs.cc
+@@ -2,7 +2,6 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "build/safarium_buildflags.h"
+ #include "chrome/browser/ui/side_panel/side_panel_prefs.h"
+ 
+ #include <optional>
+@@ -42,14 +41,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   // Otherwise, the side panel should default to the right side of the screen.
+   // TODO(dljames): Add enum values kAlternateSide / kDefaultSide that will
+   // replace false and true respectively.
+-#if BUILDFLAG(SAFARIUM_BRANDING)
+-  // Safarium: extension side panels dock on the left (in the sidebar) by
+-  // default; Settings > Appearance can move them to the right.
+-  registry->RegisterBooleanPref(prefs::kSidePanelHorizontalAlignment, false);
+-#else
+   registry->RegisterBooleanPref(prefs::kSidePanelHorizontalAlignment,
+                                 !base::i18n::IsRTL());
+-#endif
+   registry->RegisterBooleanPref(prefs::kGoogleSearchSidePanelEnabled, true);
+ 
+   base::DictValue alignment_overrides;
+diff --git a/chrome/browser/ui/webui/new_tab_page/BUILD.gn b/chrome/browser/ui/webui/new_tab_page/BUILD.gn
+index 6e655a95b4..91f81bd31b 100644
+--- a/chrome/browser/ui/webui/new_tab_page/BUILD.gn
++++ b/chrome/browser/ui/webui/new_tab_page/BUILD.gn
+@@ -53,6 +53,7 @@ source_set("core") {
+   public_deps = [
+     ":mojo_bindings",
+     "//base",
++    "//build:safarium_buildflags",
+     "//chrome/browser/new_tab_page",
+     "//chrome/browser/new_tab_page/modules/file_suggestion:mojo_bindings",
+     "//chrome/browser/new_tab_page/modules/v2/calendar:mojo_bindings",
+diff --git a/chrome/browser/ui/webui/new_tab_page/core/ntp_load_time_data.cc b/chrome/browser/ui/webui/new_tab_page/core/ntp_load_time_data.cc
+index 61819067c6..509308da0b 100644
+--- a/chrome/browser/ui/webui/new_tab_page/core/ntp_load_time_data.cc
++++ b/chrome/browser/ui/webui/new_tab_page/core/ntp_load_time_data.cc
+@@ -18,6 +18,7 @@
+ #include "base/values.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "build/safarium_buildflags.h"
+ #include "chrome/browser/autocomplete/aim_eligibility_service_factory.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/new_tab_page/new_tab_page_util.h"
+@@ -293,10 +294,16 @@ base::DictValue BuildLoadTimeData(Profile* profile,
+           ntp_features::kNtpMostRelevantTabResumptionModuleFallbackToHost));
+   dict.Set("footerEnabled",
+            base::FeatureList::IsEnabled(ntp_features::kNtpFooter));
++#if BUILDFLAG(SAFARIUM_BRANDING)
++  // Safarium: the "Customize Chromium" panel doesn't apply to Safarium's
++  // native UI, so the New Tab page has no customize button.
++  dict.Set("showCustomizeButton", false);
++#else
+   dict.Set(
+       "showCustomizeButton",
+       base::FeatureList::IsEnabled(ntp_features::kNtpCustomizeWebUiAndroid) ||
+           !BUILDFLAG(IS_ANDROID));
++#endif
+   dict.Set("isAndroid", static_cast<bool>(BUILDFLAG(IS_ANDROID)));
+   // On Android `webkitSpeechRecognition` is backed by `SpeechRecognitionImpl`,
+   // which owns the microphone itself. The shared composebox voice search UI
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.cc b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+index fadbbf57bf..c8652ede57 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.cc
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+@@ -1,6 +1,7 @@
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ 
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -10,13 +11,8 @@
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+-#include "ui/views/background.h"
+-#include "cc/paint/paint_flags.h"
+-#include "ui/base/cursor/cursor.h"
+-#include "ui/base/cursor/mojom/cursor_type.mojom-shared.h"
+-#include "ui/events/event.h"
+ #include "ui/gfx/canvas.h"
+-#include "ui/color/color_provider.h"
++#include "ui/views/background.h"
+ #include "ui/views/controls/resize_area.h"
+ #include "ui/views/controls/webview/webview.h"
+ #include "ui/views/view_class_properties.h"
+@@ -26,44 +22,20 @@ namespace safarium {
+ namespace {
+ constexpr int kMinSidePanelWidth = 320;  // Chrome's side panel minimum.
+ constexpr int kResizeAreaWidth = 6;
+-constexpr int kMinSidebarPart = 160;     // Tabs / panel parts of the sidebar.
+-
+-// Divider between the tab list and a side panel docked in the sidebar.
+-class SidebarSplitHandle : public views::View {
+-  METADATA_HEADER(SidebarSplitHandle, views::View)
++constexpr int kMinSidebarWidth = 240;    // Vertical tabs sidebar.
++constexpr int kMaxSidebarWidth = 480;
+ 
++// The panel's separator, in the same color as the sidebar's native edge line
++// (the system separator color for the current appearance).
++class SystemSeparatorBackground : public views::Background {
+  public:
+-  explicit SidebarSplitHandle(base::RepeatingCallback<void(int)> on_drag)
+-      : on_drag_(std::move(on_drag)) {}
+-
+-  bool OnMousePressed(const ui::MouseEvent& event) override { return true; }
+-
+-  bool OnMouseDragged(const ui::MouseEvent& event) override {
+-    gfx::Point p = event.location();
+-    views::View::ConvertPointToTarget(this, parent(), &p);
+-    on_drag_.Run(p.y());
+-    return true;
+-  }
+-
+-  ui::Cursor GetCursor(const ui::MouseEvent& event) override {
+-    return ui::mojom::CursorType::kRowResize;
++  void Paint(gfx::Canvas* canvas, views::View* view) const override {
++    SkColor line;
++    SkColor background;
++    GetSystemSeparatorColors(&line, &background);
++    canvas->FillRect(view->GetLocalBounds(), line);
+   }
+-
+-  void OnPaint(gfx::Canvas* canvas) override {
+-    cc::PaintFlags flags;
+-    flags.setAntiAlias(true);
+-    flags.setColor(GetColorProvider()->GetColor(ui::kColorSeparator));
+-    const gfx::RectF grip(width() / 2.f - 18, height() / 2.f - 2, 36, 4);
+-    canvas->DrawRoundRect(grip, 2, flags);
+-  }
+-
+- private:
+-  base::RepeatingCallback<void(int)> on_drag_;
+ };
+-
+-BEGIN_METADATA(SidebarSplitHandle)
+-END_METADATA
+-
+ }  // namespace
+ 
+ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+@@ -81,22 +53,14 @@ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+   // Side panel (hidden until an extension opens one).
+   side_panel_separator_ = AddChildView(std::make_unique<views::View>());
+   side_panel_separator_->SetBackground(
+-      views::CreateSolidBackground(ui::kColorSeparator));
+-  side_panel_header_ = AddChildView(std::make_unique<SidePanelHeaderView>(
+-      base::BindRepeating(
++      std::make_unique<SystemSeparatorBackground>());
++  side_panel_header_ = AddChildView(
++      std::make_unique<SidePanelHeaderView>(base::BindRepeating(
+           [](SafariumRootView* self) {
+             if (self->side_panel_close_callback_) {
+               self->side_panel_close_callback_.Run();
+             }
+           },
+-          base::Unretained(this)),
+-      base::BindRepeating(
+-          [](SafariumRootView* self) {
+-            Profile::FromBrowserContext(self->browser_context_)
+-                ->GetPrefs()
+-                ->SetBoolean(prefs::kSidePanelHorizontalAlignment,
+-                             !self->SidePanelDockedRight());
+-          },
+           base::Unretained(this))));
+   side_panel_resize_ = AddChildView(std::make_unique<views::ResizeArea>(this));
+   for (views::View* view :
+@@ -106,24 +70,16 @@ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+     view->SetVisible(false);
+   }
+   // Vertical tab sidebar (hidden in horizontal mode).
++  // Chrome's side panel open/close motion (SidePanelAnimations kOpen/kClose).
++  side_panel_animation_.SetSlideDuration(base::Milliseconds(350));
++  side_panel_animation_.SetTweenType(gfx::Tween::ACCEL_45_DECEL_88);
+   sidebar_ = AddChildView(std::make_unique<VerticalSidebarView>());
+-  sidebar_separator_ = AddChildView(std::make_unique<views::View>());
+-  sidebar_separator_->SetBackground(
+-      views::CreateSolidBackground(ui::kColorSeparator));
+-  sidebar_split_ = AddChildView(std::make_unique<SidebarSplitHandle>(
+-      base::BindRepeating(
+-          [](SafariumRootView* self, int y) {
+-            const gfx::Rect bounds = self->GetContentsBounds();
+-            if (bounds.height() <= 0) {
+-              return;
+-            }
+-            self->sidebar_panel_fraction_ = std::clamp(
+-                1.0 - static_cast<double>(y - bounds.y()) / bounds.height(),
+-                0.15, 0.85);
+-            self->InvalidateLayout();
+-          },
+-          base::Unretained(this))));
+-  sidebar_split_->SetVisible(false);
++  sidebar_->SetResizeCallback(base::BindRepeating(
++      &SafariumRootView::OnSidebarResize, base::Unretained(this)));
++  // Last width the user dragged the sidebar to.
++  if (const int saved = VerticalSidebarView::GetSavedWidth(); saved > 0) {
++    sidebar_width_ = std::clamp(saved, kMinSidebarWidth, kMaxSidebarWidth);
++  }
+ 
+   pref_change_registrar_.Init(
+       Profile::FromBrowserContext(browser_context)->GetPrefs());
+@@ -131,11 +87,6 @@ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+       prefs::kVerticalTabsEnabled,
+       base::BindRepeating(&SafariumRootView::OnVerticalTabsPrefChanged,
+                           base::Unretained(this)));
+-  pref_change_registrar_.Add(
+-      prefs::kSidePanelHorizontalAlignment,
+-      base::BindRepeating(&SafariumRootView::OnDockPrefChanged,
+-                          base::Unretained(this)));
+-  side_panel_header_->SetDockedRight(SidePanelDockedRight());
+   OnVerticalTabsPrefChanged();
+ }
+ 
+@@ -150,30 +101,30 @@ bool SafariumRootView::VerticalTabs() const {
+ void SafariumRootView::OnVerticalTabsPrefChanged() {
+   const bool vertical = VerticalTabs();
+   sidebar_->SetVisible(vertical);
+-  sidebar_separator_->SetVisible(vertical);
+   bar_view_->SetVerticalSidebar(vertical ? sidebar_->GetSidebarNativeView()
+                                         : gfx::NativeView());
+   InvalidateLayout();
+ }
+ 
+-void SafariumRootView::SetActiveContents(content::WebContents* contents) {
+-  contents_web_view_->SetWebContents(contents);
+-}
+-
+-bool SafariumRootView::SidePanelDockedRight() const {
+-  return Profile::FromBrowserContext(browser_context_)
+-      ->GetPrefs()
+-      ->GetBoolean(prefs::kSidePanelHorizontalAlignment);
++void SafariumRootView::OnSidebarResize(int width, bool done) {
++  // Keep the page at least as wide as the sidebar.
++  const int max_width = std::clamp(GetContentsBounds().width() / 2,
++                                   kMinSidebarWidth, kMaxSidebarWidth);
++  sidebar_width_ = std::clamp(width, kMinSidebarWidth, max_width);
++  InvalidateLayout();
++  if (done) {
++    VerticalSidebarView::SaveWidth(sidebar_width_);
++  }
+ }
+ 
+-void SafariumRootView::OnDockPrefChanged() {
+-  side_panel_header_->SetDockedRight(SidePanelDockedRight());
+-  InvalidateLayout();
++void SafariumRootView::SetActiveContents(content::WebContents* contents) {
++  contents_web_view_->SetWebContents(contents);
+ }
+ 
+ void SafariumRootView::ShowSidePanel(std::unique_ptr<views::View> content,
+                                      const std::u16string& title,
+-                                     const gfx::ImageSkia& icon) {
++                                     const gfx::ImageSkia& icon,
++                                     bool animate) {
+   if (side_panel_content_) {
+     // Not reclaimed (shouldn't happen): drop the stale view.
+     RemoveChildViewT(side_panel_content_.get());
+@@ -186,17 +137,60 @@ void SafariumRootView::ShowSidePanel(std::unique_ptr<views::View> content,
+   side_panel_content_ =
+       content ? AddChildView(std::move(content)) : nullptr;
+   side_panel_header_->SetContent(title, icon);
+-  side_panel_header_->SetDockedRight(SidePanelDockedRight());
+   for (views::View* view :
+        {side_panel_separator_.get(), static_cast<views::View*>(
+                                          side_panel_header_.get()),
+         static_cast<views::View*>(side_panel_resize_.get())}) {
+     view->SetVisible(true);
+   }
++  side_panel_hidden_callback_.Reset();  // A pending close is cancelled.
++  if (animate) {
++    side_panel_animation_.Show();
++  } else {
++    side_panel_animation_.Reset(1.0);
++  }
++  InvalidateLayout();
++}
++
++void SafariumRootView::HideSidePanel(bool animate, base::OnceClosure on_hidden) {
++  if (animate && IsSidePanelShowing() &&
++      side_panel_animation_.GetCurrentValue() > 0) {
++    side_panel_hidden_callback_ = std::move(on_hidden);
++    side_panel_animation_.Hide();  // AnimationEnded() finishes the close.
++    return;
++  }
++  side_panel_animation_.Reset(0.0);
++  side_panel_hidden_callback_.Reset();
++  FinishHidingSidePanel();
++  if (on_hidden) {
++    std::move(on_hidden).Run();
++  }
++}
++
++bool SafariumRootView::IsSidePanelClosing() const {
++  return !side_panel_hidden_callback_.is_null() &&
++         side_panel_animation_.IsClosing();
++}
++
++void SafariumRootView::ReopenSidePanel() {
++  side_panel_hidden_callback_.Reset();
++  side_panel_animation_.Show();
++}
++
++void SafariumRootView::AnimationProgressed(const gfx::Animation* animation) {
+   InvalidateLayout();
+ }
+ 
+-void SafariumRootView::HideSidePanel() {
++void SafariumRootView::AnimationEnded(const gfx::Animation* animation) {
++  InvalidateLayout();
++  if (side_panel_animation_.GetCurrentValue() == 0 &&
++      !side_panel_hidden_callback_.is_null()) {
++    FinishHidingSidePanel();
++    std::move(side_panel_hidden_callback_).Run();
++  }
++}
++
++void SafariumRootView::FinishHidingSidePanel() {
+   for (views::View* view :
+        {side_panel_separator_.get(), static_cast<views::View*>(
+                                          side_panel_header_.get()),
+@@ -215,6 +209,9 @@ std::unique_ptr<views::View> SafariumRootView::TakeSidePanelContent() {
+   }
+   views::View* content = side_panel_content_.get();
+   side_panel_content_ = nullptr;
++  if (!IsSidePanelShowing()) {
++    side_panel_animation_.Reset(0.0);
++  }
+   content->SetVisible(true);
+   views::FocusManager* focus_manager = GetFocusManager();
+   InvalidateLayout();
+@@ -239,10 +236,9 @@ void SafariumRootView::OnResize(int resize_amount, bool done_resizing) {
+   if (resize_start_width_ < 0) {
+     resize_start_width_ = side_panel_width_;
+   }
+-  // The handle sits on the panel's inner edge: dragging toward the page
+-  // widens it.
+-  side_panel_width_ = resize_start_width_ +
+-                      (SidePanelDockedRight() ? -resize_amount : resize_amount);
++  // The handle sits on the panel's inner (left) edge: dragging toward the
++  // page widens it.
++  side_panel_width_ = resize_start_width_ - resize_amount;
+   if (done_resizing) {
+     resize_start_width_ = -1;
+   }
+@@ -251,56 +247,26 @@ void SafariumRootView::OnResize(int resize_amount, bool done_resizing) {
+ 
+ void SafariumRootView::Layout(PassKey) {
+   gfx::Rect area = GetContentsBounds();
+-  const bool vertical = VerticalTabs();
+-  const bool panel = IsSidePanelShowing();
+-  const bool right = SidePanelDockedRight();
+-  // Vertical tabs + left dock: the panel takes the lower part of the
+-  // sidebar column, under the tab list.
+-  const bool panel_in_sidebar = vertical && panel && !right;
+-  sidebar_split_->SetVisible(panel_in_sidebar);
+-
+-  if (vertical) {
+-    const int column_width = panel_in_sidebar
+-                                 ? std::max(sidebar_width_, kMinSidePanelWidth)
+-                                 : sidebar_width_;
+-    const gfx::Rect column(area.x(), area.y(), column_width, area.height());
+-    sidebar_separator_->SetBounds(column.right(), area.y(), 1, area.height());
+-    area.Inset(gfx::Insets::TLBR(0, column_width + 1, 0, 0));
+-    if (panel_in_sidebar) {
+-      const int panel_height = std::clamp(
+-          static_cast<int>(column.height() * sidebar_panel_fraction_),
+-          std::min(kMinSidebarPart, column.height() / 2),
+-          std::max(column.height() - kMinSidebarPart, column.height() / 2));
+-      const int tabs_height = column.height() - panel_height;
+-      sidebar_->SetBounds(column.x(), column.y(), column.width(), tabs_height);
+-      sidebar_split_->SetBounds(column.x(), column.y() + tabs_height - 4,
+-                                column.width(), 8);
+-      side_panel_header_->SetBounds(column.x(), column.y() + tabs_height,
+-                                    column.width(),
+-                                    SidePanelHeaderView::kHeight);
+-      if (side_panel_content_) {
+-        side_panel_content_->SetBounds(
+-            column.x(),
+-            column.y() + tabs_height + SidePanelHeaderView::kHeight,
+-            column.width(),
+-            panel_height - SidePanelHeaderView::kHeight);
+-      }
+-      side_panel_separator_->SetBoundsRect(gfx::Rect());
+-      side_panel_resize_->SetBoundsRect(gfx::Rect());
+-    } else {
+-      sidebar_->SetBoundsRect(column);
+-    }
++  if (VerticalTabs()) {
++    // The sidebar width belongs to the window and is shared by its tabs.
++    // The sidebar draws its own edge line (like the toolbar's bottom line).
++    sidebar_->SetBounds(area.x(), area.y(), sidebar_width_, area.height());
++    area.Inset(gfx::Insets::TLBR(0, sidebar_width_, 0, 0));
+   }
+ 
+-  if (panel && !panel_in_sidebar) {
++  // Extension side panels dock on the right of the page, full height.
++  if (IsSidePanelShowing()) {
+     const int max_width = std::max(kMinSidePanelWidth, area.width() / 2);
+     side_panel_width_ =
+         std::clamp(side_panel_width_, kMinSidePanelWidth, max_width);
+     const int w = side_panel_width_;
+-    const gfx::Rect panel_rect(right ? area.right() - w : area.x(), area.y(),
+-                               w, area.height());
+-    const gfx::Rect separator(right ? panel_rect.x() - 1 : panel_rect.right(),
+-                              area.y(), 1, area.height());
++    // Chrome's open/close motion: the panel slides in from the window's edge
++    // while the page narrows; the panel's contents keep their full width.
++    const int shown = static_cast<int>(
++        std::lround(w * side_panel_animation_.GetCurrentValue()));
++    const gfx::Rect panel_rect(area.right() - shown, area.y(), w,
++                               area.height());
++    const gfx::Rect separator(panel_rect.x() - 1, area.y(), 1, area.height());
+     side_panel_separator_->SetBoundsRect(separator);
+     side_panel_header_->SetBounds(panel_rect.x(), panel_rect.y(),
+                                   panel_rect.width(),
+@@ -313,10 +279,7 @@ void SafariumRootView::Layout(PassKey) {
+     }
+     side_panel_resize_->SetBounds(separator.x() - kResizeAreaWidth / 2,
+                                   area.y(), kResizeAreaWidth, area.height());
+-    area.set_width(area.width() - w - 1);
+-    if (!right) {
+-      area.set_x(separator.right());
+-    }
++    area.set_width(std::max(0, area.width() - shown - 1));
+   }
+   contents_web_view_->SetBoundsRect(area);
+   LayoutSuperclass<views::View>(this);
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.h b/chrome/browser/ui/webui_browser/safarium_root_view.h
+index 6cec453f82..48b316be60 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.h
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.h
+@@ -10,6 +10,9 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "components/prefs/pref_change_registrar.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/slide_animation.h"
++#include "third_party/skia/include/core/SkColor.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/views/controls/resize_area_delegate.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+@@ -31,6 +34,11 @@ namespace safarium {
+ class TabBarController;
+ class TabBarView;
+ 
++// The system separator line color (NSColor.separatorColor over the window
++// background, for the current appearance) and that background, so Views
++// lines match the native ones (implemented in *_mac.mm).
++void GetSystemSeparatorColors(SkColor* line, SkColor* background);
++
+ // Platform factory for the native bar (implemented in *_mac.mm).
+ std::unique_ptr<views::View> CreateTabBarHost(TabBarController* controller,
+                                              views::View* page_view,
+@@ -44,14 +52,12 @@ class SidePanelHeaderView : public views::View {
+  public:
+   static constexpr int kHeight = 40;
+ 
+-  SidePanelHeaderView(base::RepeatingClosure on_close,
+-                      base::RepeatingClosure on_move);
++  explicit SidePanelHeaderView(base::RepeatingClosure on_close);
+   SidePanelHeaderView(const SidePanelHeaderView&) = delete;
+   SidePanelHeaderView& operator=(const SidePanelHeaderView&) = delete;
+   ~SidePanelHeaderView() override;
+ 
+   void SetContent(const std::u16string& title, const gfx::ImageSkia& icon);
+-  void SetDockedRight(bool docked_right);
+ 
+   // views::View:
+   void AddedToWidget() override;
+@@ -74,6 +80,11 @@ class VerticalSidebarView : public views::View {
+   ~VerticalSidebarView() override;
+ 
+   gfx::NativeView GetSidebarNativeView() const;
++  // Dragging the sidebar's trailing edge: proposed width, drag ended.
++  void SetResizeCallback(base::RepeatingCallback<void(int, bool)> callback);
++  // Width the user last dragged a sidebar to (app-wide, like Safari), or 0.
++  static int GetSavedWidth();
++  static void SaveWidth(int width);
+ 
+   // views::View:
+   void AddedToWidget() override;
+@@ -86,7 +97,8 @@ class VerticalSidebarView : public views::View {
+ };
+ 
+ class SafariumRootView : public views::View,
+-                         public views::ResizeAreaDelegate {
++                         public views::ResizeAreaDelegate,
++                         public gfx::AnimationDelegate {
+   METADATA_HEADER(SafariumRootView, views::View)
+ 
+  public:
+@@ -105,8 +117,13 @@ class SafariumRootView : public views::View,
+   // lent by WebUIBrowserSidePanelUI; TakeSidePanelContent() returns it.
+   void ShowSidePanel(std::unique_ptr<views::View> content,
+                      const std::u16string& title,
+-                     const gfx::ImageSkia& icon);
+-  void HideSidePanel();
++                     const gfx::ImageSkia& icon,
++                     bool animate = false);
++  // `animate` uses Chrome's side panel open/close motion. Hiding runs
++  // `on_hidden` once the panel is gone (after the animation).
++  void HideSidePanel(bool animate = false, base::OnceClosure on_hidden = {});
++  bool IsSidePanelClosing() const;
++  void ReopenSidePanel();
+   std::unique_ptr<views::View> TakeSidePanelContent();
+   base::WeakPtr<SafariumRootView> GetWeakPtr() {
+     return weak_factory_.GetWeakPtr();
+@@ -118,28 +135,32 @@ class SafariumRootView : public views::View,
+   // views::ResizeAreaDelegate:
+   void OnResize(int resize_amount, bool done_resizing) override;
+ 
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++
+  private:
+   void Layout(PassKey) override;
+-  bool SidePanelDockedRight() const;
+-  void OnDockPrefChanged();
++  void FinishHidingSidePanel();
+   bool VerticalTabs() const;
+   void OnVerticalTabsPrefChanged();
++  void OnSidebarResize(int width, bool done);
+ 
+   raw_ptr<content::BrowserContext> browser_context_;
+   raw_ptr<TabBarView> bar_view_ = nullptr;
+   raw_ptr<views::WebView> contents_web_view_ = nullptr;
+   raw_ptr<views::View> side_panel_separator_ = nullptr;
+   raw_ptr<VerticalSidebarView> sidebar_ = nullptr;
+-  raw_ptr<views::View> sidebar_separator_ = nullptr;
+-  raw_ptr<views::View> sidebar_split_ = nullptr;  // Tabs / panel divider.
+   int sidebar_width_ = 250;
+-  double sidebar_panel_fraction_ = 0.5;  // Of the sidebar's height.
+   raw_ptr<SidePanelHeaderView> side_panel_header_ = nullptr;
+   raw_ptr<views::View> side_panel_content_ = nullptr;
+   raw_ptr<views::ResizeArea> side_panel_resize_ = nullptr;
+   int side_panel_width_ = 360;
+   int resize_start_width_ = -1;
+   base::RepeatingClosure side_panel_close_callback_;
++  // Panel width fraction (0 hidden .. 1 shown) for Chrome's open/close motion.
++  gfx::SlideAnimation side_panel_animation_{this};
++  base::OnceClosure side_panel_hidden_callback_;  // Pending animated close.
+   PrefChangeRegistrar pref_change_registrar_;
+   base::WeakPtrFactory<SafariumRootView> weak_factory_{this};
+ };
+diff --git a/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm b/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm
+index bec92bd3f1..5c2a2a5ca1 100644
+--- a/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm
+@@ -2,8 +2,8 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-// Safarium: native header of the docked side panel (extension icon + name,
+-// "move to the other side" and close buttons).
++// Safarium: native header of the side panel (extension icon + name, close
++// button).
+ 
+ #import <AppKit/AppKit.h>
+ 
+@@ -15,20 +15,16 @@
+ 
+ @interface SafariumSidePanelHeader : NSView
+ @property(nonatomic, copy) void (^onClose)(void);
+-@property(nonatomic, copy) void (^onMove)(void);
+ - (void)setTitle:(NSString*)title icon:(NSImage*)icon;
+-- (void)setDockedRight:(BOOL)dockedRight;
+ @end
+ 
+ @implementation SafariumSidePanelHeader {
+   NSImageView* _icon;
+   NSTextField* _title;
+-  NSButton* _move;
+   NSButton* _close;
+ }
+ 
+ @synthesize onClose = _onClose;
+-@synthesize onMove = _onMove;
+ 
+ static NSButton* HeaderButton(NSString* symbol,
+                               NSString* tip,
+@@ -65,12 +61,10 @@ - (instancetype)initWithFrame:(NSRect)frame {
+                                      forOrientation:
+                                          NSLayoutConstraintOrientationHorizontal];
+ 
+-    _move = HeaderButton(@"sidebar.right", @"Move to Right", self,
+-                         @selector(moveClicked:));
+     _close = HeaderButton(@"xmark", @"Close", self, @selector(closeClicked:));
+ 
+     NSStackView* stack =
+-        [NSStackView stackViewWithViews:@[ _icon, _title, _move, _close ]];
++        [NSStackView stackViewWithViews:@[ _icon, _title, _close ]];
+     stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+     stack.alignment = NSLayoutAttributeCenterY;
+     stack.spacing = 6;
+@@ -101,21 +95,6 @@ - (void)setTitle:(NSString*)title icon:(NSImage*)icon {
+   _icon.hidden = icon == nil;
+ }
+ 
+-- (void)setDockedRight:(BOOL)dockedRight {
+-  // The button moves the panel to the other side.
+-  NSString* symbol = dockedRight ? @"sidebar.left" : @"sidebar.right";
+-  NSString* tip = dockedRight ? @"Move to Left" : @"Move to Right";
+-  _move.image = [NSImage imageWithSystemSymbolName:symbol
+-                          accessibilityDescription:tip];
+-  _move.toolTip = tip;
+-}
+-
+-- (void)moveClicked:(id)sender {
+-  if (_onMove) {
+-    _onMove();
+-  }
+-}
+-
+ - (void)closeClicked:(id)sender {
+   if (_onClose) {
+     _onClose();
+@@ -129,22 +108,17 @@ - (void)closeClicked:(id)sender {
+   SafariumSidePanelHeader* __strong header;
+ };
+ 
+-SidePanelHeaderView::SidePanelHeaderView(base::RepeatingClosure on_close,
+-                                         base::RepeatingClosure on_move)
++SidePanelHeaderView::SidePanelHeaderView(base::RepeatingClosure on_close)
+     : objc_(std::make_unique<ObjCStorage>()) {
+   objc_->header = [[SafariumSidePanelHeader alloc] initWithFrame:NSZeroRect];
+   objc_->header.onClose = ^{
+     on_close.Run();
+   };
+-  objc_->header.onMove = ^{
+-    on_move.Run();
+-  };
+   host_ = AddChildView(std::make_unique<views::NativeViewHost>());
+ }
+ 
+ SidePanelHeaderView::~SidePanelHeaderView() {
+   objc_->header.onClose = nil;
+-  objc_->header.onMove = nil;
+ }
+ 
+ void SidePanelHeaderView::SetContent(const std::u16string& title,
+@@ -153,10 +127,6 @@ - (void)closeClicked:(id)sender {
+                      icon:icon.isNull() ? nil : gfx::NSImageFromImageSkia(icon)];
+ }
+ 
+-void SidePanelHeaderView::SetDockedRight(bool docked_right) {
+-  [objc_->header setDockedRight:docked_right];
+-}
+-
+ void SidePanelHeaderView::AddedToWidget() {
+   auto* host = static_cast<views::NativeViewHost*>(host_.get());
+   if (!host->native_view()) {
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 04f3fe185b..fbe0d428e8 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -14,7 +14,9 @@
+ #import <QuartzCore/QuartzCore.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <memory>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/functional/bind.h"
+@@ -3092,6 +3094,7 @@ - (void)setThumbnail:(NSImage*)image forTab:(int64_t)tabId;
+ @implementation SafariumOverviewView {
+   __weak id<SafariumOverviewDelegate> _delegate;
+   NSScrollView* _scroll;
++  CGFloat _cardTopReserve;  // Grid area under the toolbar and search field.
+   NSCollectionView* _grid;
+   NSSearchField* _search;
+   NSArray<SafariumOverviewTab*>* _tabs;
+@@ -3171,14 +3174,20 @@ - (void)viewDidChangeEffectiveAppearance {
+ 
+ - (void)layout {
+   [super layout];
+-  const NSRect safeArea =
+-      [self convertRect:self.window.contentLayoutRect fromView:nil];
+-  const CGFloat topInset = MAX(0, NSMinY(safeArea) - NSMinY(self.bounds));
++  CGFloat topInset = 0;
++  // The horizontal overview extends behind the toolbar. In vertical mode
++  // it starts at the page's top edge, beside the window controls.
++  if (self.window.toolbar) {
++    const NSRect safeArea =
++        [self convertRect:self.window.contentLayoutRect fromView:nil];
++    topInset = MAX(0, NSMinY(safeArea) - NSMinY(self.bounds));
++  }
+   _search.frame = NSMakeRect(NSWidth(self.bounds) - 32 - 220, topInset + 14,
+                              220, 24);
+   NSCollectionViewFlowLayout* flow =
+       (NSCollectionViewFlowLayout*)_grid.collectionViewLayout;
+   NSEdgeInsets insets = flow.sectionInset;
++  _cardTopReserve = topInset + 44;
+   if (insets.top != topInset + 56) {
+     insets.top = topInset + 56;
+     flow.sectionInset = insets;
+@@ -3286,6 +3295,42 @@ - (SafariumOverviewCard*)cardForTab:(int64_t)tabId {
+   return nil;
+ }
+ 
++// Scrolls the least needed for the tab's whole card to show below the
++// search field (the grid keeps its last scroll position otherwise), then
++// returns the card.
++- (SafariumOverviewCard*)revealCardForTab:(int64_t)tabId {
++  const NSUInteger index = [_shown indexOfObjectPassingTest:^BOOL(
++      SafariumOverviewTab* tab, NSUInteger, BOOL*) {
++    return tab.tabId == tabId;
++  }];
++  if (index == NSNotFound) {
++    return [self cardForTab:tabId];
++  }
++  NSIndexPath* path = [NSIndexPath indexPathForItem:index inSection:0];
++  [_grid layoutSubtreeIfNeeded];
++  const NSRect frame = [_grid layoutAttributesForItemAtIndexPath:path].frame;
++  NSClipView* clip = _scroll.contentView;
++  const NSRect visible = clip.documentVisibleRect;
++  constexpr CGFloat kBottomMargin = 12;
++  CGFloat y = NSMinY(visible);
++  if (NSMinY(frame) < NSMinY(visible) + _cardTopReserve) {
++    y = NSMinY(frame) - _cardTopReserve;
++  } else if (NSMaxY(frame) > NSMaxY(visible) - kBottomMargin) {
++    y = NSMaxY(frame) + kBottomMargin - NSHeight(visible);
++  }
++  y = std::clamp<CGFloat>(
++      y, 0, MAX(0, NSHeight(_grid.frame) - NSHeight(visible)));
++  if (y != NSMinY(visible)) {
++    [clip scrollToPoint:NSMakePoint(NSMinX(visible), y)];
++    [_scroll reflectScrolledClipView:clip];
++    _grid.needsLayout = YES;
++    [_grid layoutSubtreeIfNeeded];
++  }
++  SafariumOverviewCard* card =
++      (SafariumOverviewCard*)[_grid itemAtIndexPath:path];
++  return card ?: [self cardForTab:tabId];
++}
++
+ - (NSRect)pageRectInView:(NSView*)view {
+   if (!_pageView || !self.window) {
+     return NSZeroRect;
+@@ -3335,7 +3380,9 @@ - (void)zoomInFromPage:(NSImage*)snapshot
+             completion:(void (^)(void))completion {
+   [self layoutSubtreeIfNeeded];
+   [_grid layoutSubtreeIfNeeded];
+-  SafariumOverviewCard* card = [self cardForTab:tabId];
++  // The collection view only creates cards near its current scroll position.
++  // Reveal the active card while the overview is still transparent.
++  SafariumOverviewCard* card = [self revealCardForTab:tabId];
+   self.alphaValue = 1;
+   if (snapshot) {
+     _thumbnails[@(tabId)] = snapshot;
+@@ -3491,8 +3538,6 @@ - (void)prepareForPresentation {
+   _snapshotTab = 0;
+   _search.stringValue = @"";
+   [_thumbnails removeAllObjects];
+-  [_scroll.contentView scrollToPoint:NSZeroPoint];
+-  [_scroll reflectScrolledClipView:_scroll.contentView];
+ }
+ 
+ - (void)controlTextDidChange:(NSNotification*)notification {
+@@ -3578,44 +3623,259 @@ - (NSUInteger)glassBehavior {
+ }
+ @end
+ 
++// Sidebar toolbar editing (vertical tabs). Items are dragged with these
++// pasteboard types: the toolbar item identifier, and for items already in
++// the sidebar their index in the sidebar configuration.
++NSPasteboardType const kSidebarItemType = @"org.safarium.sidebar-toolbar-item";
++NSPasteboardType const kSidebarIndexType =
++    @"org.safarium.sidebar-toolbar-index";
++// Starts a new row of sidebar buttons. Only in the sidebar configuration
++// (created by dropping an item below the last row), never in the palette.
++NSString* const kSidebarRowBreak = @"safarium.sidebar.rowbreak";
++
++@protocol SafariumSidebarEditing <NSObject>
++- (void)sidebarRemoveItemAtIndex:(NSInteger)index;
++// Moves (from >= 0) or adds the item at `index`, or in a new last row.
++- (void)sidebarDropItem:(NSString*)identifier
++              fromIndex:(NSInteger)from
++                atIndex:(NSInteger)index
++                 newRow:(BOOL)newRow;
++@end
++
++// A piece of a sidebar row, as in an NSToolbar: a Liquid Glass group of
++// adjacent item buttons, a space (ends a group) or a flexible space (ends a
++// group and takes the row's leftover width, so items can be aligned left and
++// right).
++enum SidebarSegmentKind : NSInteger {
++  kSidebarSegmentGroup = 0,
++  kSidebarSegmentSpace,
++  kSidebarSegmentFlexible,
++};
++
++@interface SafariumSidebarSegment : NSObject
++@property(nonatomic) NSInteger kind;
++@property(nonatomic, copy) NSArray<NSButton*>* buttons;  // Groups only.
++// Configuration index of each button of a group (Back and Forward share
++// one), or of the space.
++@property(nonatomic, copy) NSArray<NSNumber*>* indexes;
++@end
++
++@implementation SafariumSidebarSegment
++@synthesize kind = _kind;
++@synthesize buttons = _buttons;
++@synthesize indexes = _indexes;
++
++- (BOOL)isEqual:(id)object {
++  if (![object isKindOfClass:[SafariumSidebarSegment class]]) {
++    return NO;
++  }
++  SafariumSidebarSegment* other = object;
++  return other.kind == _kind &&
++         [other.buttons ?: @[] isEqualToArray:_buttons ?: @[]] &&
++         [other.indexes ?: @[] isEqualToArray:_indexes ?: @[]];
++}
++
++- (NSUInteger)hash {
++  return static_cast<NSUInteger>(_kind) ^ _indexes.hash;
++}
++@end
++
++// The customization look of a space / flexible space: a dashed capsule,
++// with arrows for the flexible one.
++static void DrawSpacer(NSRect rect, BOOL flexible) {
++  const NSRect r = NSInsetRect(rect, 1, 1);
++  const CGFloat radius = MIN(NSWidth(r), NSHeight(r)) / 2;
++  NSBezierPath* outline = [NSBezierPath bezierPathWithRoundedRect:r
++                                                          xRadius:radius
++                                                          yRadius:radius];
++  [[NSColor.controlBackgroundColor colorWithAlphaComponent:0.85] setFill];
++  [outline fill];
++  const CGFloat dash[] = {3, 2.5};
++  [outline setLineDash:dash count:2 phase:0];
++  outline.lineWidth = 1;
++  [NSColor.tertiaryLabelColor setStroke];
++  [outline stroke];
++  if (!flexible || NSWidth(r) < 22) {
++    return;
++  }
++  const CGFloat midY = NSMidY(r);
++  const CGFloat head = MIN(4, NSHeight(r) / 4);
++  const CGFloat left = NSMinX(r) + NSHeight(r) / 3;
++  const CGFloat right = NSMaxX(r) - NSHeight(r) / 3;
++  NSBezierPath* arrows = [NSBezierPath bezierPath];
++  [arrows moveToPoint:NSMakePoint(left, midY)];
++  [arrows lineToPoint:NSMakePoint(right, midY)];
++  [arrows moveToPoint:NSMakePoint(left + head, midY + head)];
++  [arrows lineToPoint:NSMakePoint(left, midY)];
++  [arrows lineToPoint:NSMakePoint(left + head, midY - head)];
++  [arrows moveToPoint:NSMakePoint(right - head, midY + head)];
++  [arrows lineToPoint:NSMakePoint(right, midY)];
++  [arrows lineToPoint:NSMakePoint(right - head, midY - head)];
++  arrows.lineWidth = 1.25;
++  arrows.lineCapStyle = NSLineCapStyleRound;
++  arrows.lineJoinStyle = NSLineJoinStyleRound;
++  [NSColor.secondaryLabelColor setStroke];
++  [arrows stroke];
++}
++
++static NSImage* SpacerPaletteImage(BOOL flexible) {
++  const NSSize size = flexible ? NSMakeSize(32, 18) : NSMakeSize(18, 18);
++  return [NSImage imageWithSize:size
++                        flipped:NO
++                 drawingHandler:^BOOL(NSRect rect) {
++                   DrawSpacer(rect, flexible);
++                   return YES;
++                 }];
++}
++
++// A space / flexible space in the sidebar; only visible while editing.
++@interface SafariumSidebarSpacer : NSView
++@property(nonatomic) BOOL flexible;
++@end
++
++@implementation SafariumSidebarSpacer
++@synthesize flexible = _flexible;
++
++- (void)drawRect:(NSRect)dirtyRect {
++  DrawSpacer(self.bounds, _flexible);
++}
++@end
++
+ // A sidebar uses the same tab strip as the toolbar, with room for window
+ // controls and a separate set of native buttons above the scrollable tabs.
+-@interface SafariumSidebarView : NSView
++@interface SafariumSidebarView : NSView <NSDraggingSource>
+ @property(nonatomic, weak) SafariumTabBarView* tabView;
+ @property(nonatomic, readonly) NSButton* back;
+ @property(nonatomic, readonly) NSButton* forward;
+ @property(nonatomic, readonly) NSButton* reload;
+ @property(nonatomic, readonly) NSButton* share;
+ @property(nonatomic, readonly) NSButton* home;
+-@property(nonatomic, copy) NSArray<NSButton*>* extensionButtons;
++@property(nonatomic, readonly) NSButton* downloads;
++@property(nonatomic, readonly) NSButton* overview;
++@property(nonatomic, readonly) NSButton* addTabButton;
++// The sidebar toolbar as rows of segments. Row 0 sits next to the traffic
++// lights; a row that doesn't fit wraps.
++@property(nonatomic, copy) NSArray<NSArray<SafariumSidebarSegment*>*>* rows;
++// Receives -customizeToolbarFromSidebar: from the context menu.
++@property(nonatomic, weak) id customizeTarget;
++@property(nonatomic, copy) NSArray<NSString*>* itemIdentifiers;
++// Edit mode: spaces become visible, "−" badges, drag to move / out to
++// remove, drops from the palette. Buttons don't perform their actions
++// meanwhile.
++@property(nonatomic) BOOL editing;
++@property(nonatomic, weak) id<SafariumSidebarEditing> editDelegate;
++// Dragging the sidebar's trailing edge: the proposed width, and whether the
++// drag ended.
++@property(nonatomic, copy) void (^onResize)(CGFloat width, BOOL done);
++// Union of the toolbar rows (anchor for the palette popover).
++- (NSRect)buttonAreaRect;
+ - (void)configureButtonsWithTarget:(id)target;
++- (void)layoutEditBadges;
+ @end
+ 
+-static NSButton* SidebarGlassButton(NSImage* image,
+-                                    NSString* label,
+-                                    id target,
+-                                    SEL action) {
+-  NSButton* button = [NSButton buttonWithImage:image
+-                                        target:target
+-                                        action:action];
+-  if (@available(macOS 26.0, *)) {
+-    button.bezelStyle = NSBezelStyleGlass;
+-    button.borderShape = NSControlBorderShapeCircle;
++// Paint the toolbar-style rollover behind one icon on the shared glass.
++@interface SafariumSidebarButton : NSButton
++@end
++
++@implementation SafariumSidebarButton {
++  NSTrackingArea* _rolloverArea;
++  BOOL _hovered;
++}
++
++- (void)updateTrackingAreas {
++  [super updateTrackingAreas];
++  if (!_rolloverArea) {
++    _rolloverArea = [[NSTrackingArea alloc]
++        initWithRect:NSZeroRect
++             options:NSTrackingMouseEnteredAndExited |
++                     NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
++               owner:self
++            userInfo:nil];
++    [self addTrackingArea:_rolloverArea];
++  }
++}
++
++- (void)mouseEntered:(NSEvent*)event {
++  if (event.trackingArea == _rolloverArea) {
++    _hovered = YES;
++    self.needsDisplay = YES;
+   } else {
+-    button.bezelStyle = NSBezelStyleCircular;
++    [super mouseEntered:event];
+   }
++}
++
++- (void)mouseExited:(NSEvent*)event {
++  if (event.trackingArea == _rolloverArea) {
++    _hovered = NO;
++    self.needsDisplay = YES;
++  } else {
++    [super mouseExited:event];
++  }
++}
++
++- (void)viewWillMoveToWindow:(NSWindow*)newWindow {
++  [super viewWillMoveToWindow:newWindow];
++  _hovered = NO;
++  self.needsDisplay = YES;
++}
++
++- (void)drawRect:(NSRect)dirtyRect {
++  if (_hovered && self.enabled && self.window.keyWindow) {
++    // Match the native toolbar's inset and light/dark appearance.
++    const NSRect highlight = NSInsetRect(self.bounds, 1, 2);
++    const CGFloat radius = NSHeight(highlight) / 2;
++    [[NSColor.labelColor colorWithAlphaComponent:0.04] setFill];
++    [[NSBezierPath bezierPathWithRoundedRect:highlight
++                                    xRadius:radius
++                                    yRadius:radius] fill];
++  }
++  [super drawRect:dirtyRect];
++}
++
++@end
++
++static NSButton* SidebarItemButton(NSImage* image,
++                                   NSString* label,
++                                   id target,
++                                   SEL action) {
++  NSButton* button = [SafariumSidebarButton buttonWithImage:image
++                                                      target:target
++                                                      action:action];
++  button.bordered = NO;
++  button.imagePosition = NSImageOnly;
+   button.imageScaling = NSImageScaleProportionallyDown;
++  button.contentTintColor = NSColor.labelColor;
+   button.toolTip = label;
+   button.accessibilityLabel = label;
+   return button;
+ }
+ 
+ @implementation SafariumSidebarView {
++  // Opaque window-background fill (like the horizontal toolbar) and a
++  // separator line on the trailing edge (like the one under the toolbar).
+   NSVisualEffectView* _background;
+-  NSView* _navigation;
+-  NSButton* _downloads;
+-  NSButton* _overview;
+-  NSButton* _newTab;
++  NSBox* _edge;
++  BOOL _configured;
++  NSMutableArray<NSView*>* _segmentViews;      // Groups and spacers.
++  NSArray<NSArray<NSView*>*>* _rowViews;       // Parallel to _rows.
++  NSMutableArray<NSButton*>* _badges;          // Edit mode "−" per item.
++  NSView* _dropIndicator;
++  NSInteger _pressIndex;                       // Edit mode press on an item.
++  NSPoint _pressPoint;
++  BOOL _draggingItem;
++  CGFloat _buttonsBottom;                      // Below the last button line.
++  std::vector<std::pair<NSRect, NSUInteger>> _lines;  // Band, row.
++  // Reserve the windowed traffic lights' space even in fullscreen, where
++  // AppKit reveals the buttons with its own title bar.
++  CGFloat _lightsRight;
++  CGFloat _lightsCenterY;
++  // Full screen (from the start of the transition): row 0 takes the traffic
++  // lights' room.
++  BOOL _fullScreenLayout;
++  NSMutableArray<id>* _windowObservers;
++  BOOL _resizing;                              // Dragging the trailing edge.
++  CGFloat _resizeStartWidth;
++  CGFloat _resizeStartX;                       // In window coordinates.
+ }
+ 
+ @synthesize tabView = _tabView;
+@@ -3624,60 +3884,457 @@ @implementation SafariumSidebarView {
+ @synthesize reload = _reload;
+ @synthesize share = _share;
+ @synthesize home = _home;
+-@synthesize extensionButtons = _extensionButtons;
++@synthesize downloads = _downloads;
++@synthesize overview = _overview;
++@synthesize addTabButton = _newTab;
++@synthesize rows = _rows;
++@synthesize customizeTarget = _customizeTarget;
++@synthesize itemIdentifiers = _itemIdentifiers;
++@synthesize editing = _editing;
++@synthesize editDelegate = _editDelegate;
++@synthesize onResize = _onResize;
++
++// The trailing edge, where the sidebar is resized (like a split view
++// divider).
++- (NSRect)resizeStrip {
++  constexpr CGFloat kStrip = 5;
++  return NSMakeRect(NSWidth(self.bounds) - kStrip, 0, kStrip,
++                    NSHeight(self.bounds));
++}
++
++- (void)resetCursorRects {
++  [super resetCursorRects];
++  if (!_onResize) {
++    return;
++  }
++  NSCursor* cursor = nil;
++  if (@available(macOS 15.0, *)) {
++    cursor = NSCursor.columnResizeCursor;
++  } else {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    cursor = NSCursor.resizeLeftRightCursor;
++#pragma clang diagnostic pop
++  }
++  [self addCursorRect:[self resizeStrip] cursor:cursor];
++}
++
++- (void)mouseUp:(NSEvent*)event {
++  if (_resizing) {
++    _resizing = NO;
++    if (_onResize) {
++      _onResize(_resizeStartWidth + event.locationInWindow.x - _resizeStartX,
++                YES);
++    }
++  }
++}
+ 
+ - (instancetype)initWithFrame:(NSRect)frame {
+   if ((self = [super initWithFrame:frame])) {
+     _background = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
+-    _background.material = NSVisualEffectMaterialSidebar;
+-    _background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+-    _background.state = NSVisualEffectStateFollowsWindowActiveState;
++    _background.material = NSVisualEffectMaterialWindowBackground;
++    _background.blendingMode = NSVisualEffectBlendingModeWithinWindow;
++    _background.state = NSVisualEffectStateActive;
+     _background.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+     [self addSubview:_background];
++    _edge = [[NSBox alloc] initWithFrame:NSMakeRect(0, 0, 1, 10)];
++    _edge.boxType = NSBoxSeparator;
++    _edge.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
++    [self addSubview:_edge];
++    _pressIndex = -1;
+   }
+   return self;
+ }
+ 
+ - (void)configureButtonsWithTarget:(id)target {
+-  if (_navigation) {
++  if (_configured) {
+     return;
+   }
+-  _navigation = [[NSView alloc] initWithFrame:NSZeroRect];
+-  NSView* glass = MakeGlass(kControlHeight / 2);
+-  glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+-  [_navigation addSubview:glass];
+-  _back = MakeIconButton(@"chevron.left", 14, target, @selector(sidebarBack:));
+-  _forward =
+-      MakeIconButton(@"chevron.right", 14, target, @selector(sidebarForward:));
+-  _back.accessibilityLabel = _back.toolTip = @"Back";
+-  _forward.accessibilityLabel = _forward.toolTip = @"Forward";
+-  [_navigation addSubview:_back];
+-  [_navigation addSubview:_forward];
+-  [self addSubview:_navigation];
+-
+-  _reload =
+-      SidebarGlassButton(Symbol(@"arrow.clockwise", 14, NSFontWeightMedium),
+-                         @"Reload", target, @selector(reload:));
+-  _downloads =
+-      SidebarGlassButton(Symbol(@"arrow.down.circle", 14, NSFontWeightMedium),
+-                         @"Downloads", target, @selector(toggleDownloads:));
+-  _share =
+-      SidebarGlassButton(Symbol(@"square.and.arrow.up", 14, NSFontWeightMedium),
+-                         @"Share", target, @selector(sidebarShare:));
+-  _overview = SidebarGlassButton(
+-      Symbol(@"square.on.square", 14, NSFontWeightMedium), @"Show Tab Overview",
+-      target, @selector(toggleOverview:));
+-  _newTab = SidebarGlassButton(Symbol(@"plus", 14, NSFontWeightMedium),
+-                               @"New Tab", target, @selector(newTab:));
+-  _home = SidebarGlassButton(Symbol(@"house", 14, NSFontWeightMedium), @"Home",
+-                             target, @selector(runCommand:));
++  _configured = YES;
++  _segmentViews = [NSMutableArray array];
++  auto icon = [](NSString* symbol) {
++    return Symbol(symbol, 14, NSFontWeightMedium);
++  };
++  _back = SidebarItemButton(icon(@"chevron.left"), @"Back", target,
++                            @selector(sidebarBack:));
++  _forward = SidebarItemButton(icon(@"chevron.right"), @"Forward", target,
++                               @selector(sidebarForward:));
++  _reload = SidebarItemButton(icon(@"arrow.clockwise"), @"Reload", target,
++                              @selector(reload:));
++  _downloads = SidebarItemButton(icon(@"arrow.down.circle"), @"Downloads",
++                                 target, @selector(toggleDownloads:));
++  _share = SidebarItemButton(icon(@"square.and.arrow.up"), @"Share", target,
++                             @selector(sidebarShare:));
++  _overview = SidebarItemButton(icon(@"square.on.square"),
++                                @"Show Tab Overview", target,
++                                @selector(toggleOverview:));
++  _newTab = SidebarItemButton(icon(@"plus"), @"New Tab", target,
++                              @selector(newTab:));
++  _home = SidebarItemButton(icon(@"house"), @"Home", target,
++                            @selector(runCommand:));
+   _home.tag = IDC_HOME;
+-  _home.hidden = YES;
+-  for (NSButton* button in
+-       @[ _reload, _downloads, _share, _overview, _newTab, _home ]) {
+-    [self addSubview:button];
++  self.needsLayout = YES;
++}
++
++- (void)setRows:(NSArray<NSArray<SafariumSidebarSegment*>*>*)rows {
++  if ([_rows isEqualToArray:rows]) {
++    return;
++  }
++  _rows = [rows copy];
++  for (NSView* view in _segmentViews) {
++    [view removeFromSuperview];
++  }
++  [_segmentViews removeAllObjects];
++  NSMutableArray<NSArray<NSView*>*>* rowViews = [NSMutableArray array];
++  for (NSArray<SafariumSidebarSegment*>* row in _rows) {
++    NSMutableArray<NSView*>* views = [NSMutableArray array];
++    for (SafariumSidebarSegment* segment in row) {
++      NSView* view = nil;
++      if (segment.kind == kSidebarSegmentGroup) {
++        // System Liquid Glass capsule behind the group's native buttons.
++        view = [[NSView alloc] initWithFrame:NSZeroRect];
++        NSView* glass = MakeGlass(kControlHeight / 2);
++        glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++        [view addSubview:glass];
++        for (NSButton* button in segment.buttons) {
++          [button removeFromSuperview];
++          [view addSubview:button];
++        }
++      } else {
++        SafariumSidebarSpacer* spacer =
++            [[SafariumSidebarSpacer alloc] initWithFrame:NSZeroRect];
++        spacer.flexible = segment.kind == kSidebarSegmentFlexible;
++        spacer.hidden = !_editing;
++        view = spacer;
++      }
++      [self addSubview:view];
++      [_segmentViews addObject:view];
++      [views addObject:view];
++    }
++    [rowViews addObject:views];
++  }
++  for (NSView* view in _segmentViews) {
++    if ([view isKindOfClass:[SafariumSidebarSpacer class]]) {
++      [self addSubview:view positioned:NSWindowAbove relativeTo:nil];
++    }
++  }
++  _rowViews = rowViews;
++  self.needsLayout = YES;
++}
++
++// --- Edit mode ---------------------------------------------------------------
++
++// Every item the user can move: one per button group item (Back/Forward is
++// one), plus the spaces while editing.
++- (void)enumerateUnits:(void (^)(NSArray<NSView*>* views,
++                                 NSInteger index,
++                                 NSUInteger row))block {
++  for (NSUInteger r = 0; r < _rows.count && r < _rowViews.count; ++r) {
++    NSArray<SafariumSidebarSegment*>* row = _rows[r];
++    for (NSUInteger s = 0; s < row.count && s < _rowViews[r].count; ++s) {
++      SafariumSidebarSegment* segment = row[s];
++      if (segment.kind != kSidebarSegmentGroup) {
++        if (_editing && segment.indexes.count) {
++          block(@[ _rowViews[r][s] ], segment.indexes[0].integerValue, r);
++        }
++        continue;
++      }
++      NSArray<NSButton*>* buttons = segment.buttons;
++      NSArray<NSNumber*>* indexes = segment.indexes;
++      // Consecutive buttons with the same index form one item.
++      NSUInteger i = 0;
++      while (i < buttons.count && i < indexes.count) {
++        NSMutableArray<NSView*>* unit = [NSMutableArray array];
++        const NSInteger index = indexes[i].integerValue;
++        while (i < buttons.count && i < indexes.count &&
++               indexes[i].integerValue == index) {
++          [unit addObject:buttons[i]];
++          ++i;
++        }
++        block(unit, index, r);
++      }
++    }
++  }
++}
++
++- (NSRect)frameOfUnit:(NSArray<NSView*>*)unit {
++  NSRect frame = NSZeroRect;
++  for (NSView* v in unit) {
++    frame = NSUnionRect(frame, [self convertRect:v.bounds fromView:v]);
++  }
++  return frame;
++}
++
++- (NSRect)buttonAreaRect {
++  NSRect area = NSZeroRect;
++  for (NSView* view in _segmentViews) {
++    if (!view.hidden) {
++      area = NSUnionRect(area, view.frame);
++    }
++  }
++  return area;
++}
++
++- (void)setEditing:(BOOL)editing {
++  if (_editing == editing) {
++    return;
++  }
++  _editing = editing;
++  if (editing) {
++    [self registerForDraggedTypes:@[ kSidebarItemType ]];
++  } else {
++    [self unregisterDraggedTypes];
++    _dropIndicator.hidden = YES;
+   }
++  // Spaces appear / disappear: lay out now (the palette anchors to it).
+   self.needsLayout = YES;
++  [self layoutSubtreeIfNeeded];
++}
++
++- (void)layoutEditBadges {
++  for (NSButton* badge in _badges) {
++    [badge removeFromSuperview];
++  }
++  [_badges removeAllObjects];
++  if (!_editing) {
++    return;
++  }
++  if (!_badges) {
++    _badges = [NSMutableArray array];
++  }
++  [self enumerateUnits:^(NSArray<NSView*>* unit, NSInteger index, NSUInteger) {
++    NSImageSymbolConfiguration* config = [NSImageSymbolConfiguration
++        configurationWithPaletteColors:@[
++          NSColor.whiteColor, NSColor.systemGrayColor
++        ]];
++    NSImage* image =
++        [[NSImage imageWithSystemSymbolName:@"minus.circle.fill"
++                   accessibilityDescription:@"Remove"]
++            imageWithSymbolConfiguration:config];
++    NSButton* badge = [NSButton buttonWithImage:image
++                                         target:self
++                                         action:@selector(badgeClicked:)];
++    badge.bordered = NO;
++    badge.imagePosition = NSImageOnly;
++    badge.tag = index;
++    badge.toolTip = @"Remove";
++    const NSRect frame = [self frameOfUnit:unit];
++    // Items: top-left corner. Spaces (narrow, next to an item's badge):
++    // bottom center.
++    badge.frame =
++        [unit.firstObject isKindOfClass:[SafariumSidebarSpacer class]]
++            ? NSMakeRect(round(NSMidX(frame) - 8), NSMaxY(frame) - 10, 16, 16)
++            : NSMakeRect(NSMinX(frame) - 3, NSMinY(frame) - 3, 16, 16);
++    [self addSubview:badge];
++    [self->_badges addObject:badge];
++  }];
++}
++
++- (void)badgeClicked:(NSButton*)badge {
++  [_editDelegate sidebarRemoveItemAtIndex:badge.tag];
++}
++
++// While editing, presses on the buttons belong to the sidebar (drag to move
++// or remove) instead of running the buttons' actions.
++- (NSView*)hitTest:(NSPoint)point {
++  NSView* hit = [super hitTest:point];
++  if (hit && _onResize &&
++      NSPointInRect([self convertPoint:point fromView:self.superview],
++                    [self resizeStrip])) {
++    return self;
++  }
++  if (!_editing || !hit || [_badges containsObject:(NSButton*)hit]) {
++    return hit;
++  }
++  const NSPoint p = [self convertPoint:point fromView:self.superview];
++  for (NSView* view in _segmentViews) {
++    if (!view.hidden && NSPointInRect(p, view.frame)) {
++      return self;
++    }
++  }
++  return hit;
++}
++
++- (NSInteger)unitIndexAtPoint:(NSPoint)p
++                        views:(NSArray<NSView*>* __strong*)outViews {
++  __block NSInteger found = -1;
++  __block NSArray<NSView*>* foundViews = nil;
++  [self enumerateUnits:^(NSArray<NSView*>* unit, NSInteger index, NSUInteger) {
++    if (found < 0 && NSPointInRect(p, [self frameOfUnit:unit])) {
++      found = index;
++      foundViews = unit;
++    }
++  }];
++  if (outViews) {
++    *outViews = foundViews;
++  }
++  return found;
++}
++
++// Where an item dropped at `p` would go, and where to draw the indicator:
++// between two items of a line (as in a toolbar, an item dropped next to a
++// group's item joins that group), or below the buttons for a new row.
++- (BOOL)dropTargetAtPoint:(NSPoint)p
++                    index:(NSInteger*)outIndex
++                   newRow:(BOOL*)outNewRow
++                indicator:(NSRect*)outIndicator {
++  constexpr CGFloat gap = 6;
++  for (const auto& [band, row] : _lines) {
++    if (p.y < NSMinY(band) - gap / 2 || p.y > NSMaxY(band) + gap / 2) {
++      continue;
++    }
++    __block NSInteger index = -1;
++    __block NSInteger lastIndex = -1;
++    __block NSRect previous = NSZeroRect;
++    __block CGFloat x = 0;
++    const NSRect lineBand = band;
++    const NSUInteger lineRow = row;
++    [self enumerateUnits:^(NSArray<NSView*>* unit, NSInteger unitIndex,
++                           NSUInteger r) {
++      if (index >= 0 || r != lineRow) {
++        return;
++      }
++      const NSRect frame = [self frameOfUnit:unit];
++      if (NSMidY(frame) < NSMinY(lineBand) || NSMidY(frame) > NSMaxY(lineBand)) {
++        return;
++      }
++      if (p.x < NSMidX(frame)) {
++        index = unitIndex;
++        x = lastIndex < 0 ? NSMinX(frame) - gap / 2
++                          : (NSMaxX(previous) + NSMinX(frame)) / 2;
++        return;
++      }
++      previous = frame;
++      lastIndex = unitIndex;
++    }];
++    if (index < 0) {
++      if (lastIndex < 0) {
++        continue;
++      }
++      index = lastIndex + 1;
++      x = NSMaxX(previous) + gap / 2;
++    }
++    *outIndex = index;
++    *outNewRow = NO;
++    *outIndicator = NSMakeRect(x - 1.5, NSMinY(band) + 4, 3, NSHeight(band) - 8);
++    return YES;
++  }
++  // Below the buttons (above the tabs): a new row.
++  const CGFloat size = kControlHeight;
++  if (p.y > _buttonsBottom && p.y < _buttonsBottom + size + 2 * gap) {
++    *outIndex = static_cast<NSInteger>(_itemIdentifiers.count);
++    *outNewRow = YES;
++    *outIndicator = NSMakeRect(10, _buttonsBottom + gap / 2 - 1.5,
++                               NSWidth(self.bounds) - 20, 3);
++    return YES;
++  }
++  return NO;
++}
++
++- (void)showDropIndicator:(NSRect)frame {
++  if (!_dropIndicator) {
++    _dropIndicator = [[NSView alloc] initWithFrame:NSZeroRect];
++    _dropIndicator.wantsLayer = YES;
++    _dropIndicator.layer.cornerRadius = 1.5;
++  }
++  // Re-adding keeps it above views added since.
++  [self addSubview:_dropIndicator positioned:NSWindowAbove relativeTo:nil];
++  _dropIndicator.layer.backgroundColor = NSColor.controlAccentColor.CGColor;
++  _dropIndicator.frame = frame;
++  _dropIndicator.hidden = NO;
++}
++
++- (NSDragOperation)updateDrag:(id<NSDraggingInfo>)info {
++  const NSPoint p = [self convertPoint:info.draggingLocation fromView:nil];
++  NSInteger index = 0;
++  BOOL newRow = NO;
++  NSRect indicator = NSZeroRect;
++  if (![self dropTargetAtPoint:p
++                         index:&index
++                        newRow:&newRow
++                     indicator:&indicator]) {
++    _dropIndicator.hidden = YES;
++    return NSDragOperationNone;
++  }
++  [self showDropIndicator:indicator];
++  return info.draggingSource == self ? NSDragOperationMove
++                                     : NSDragOperationCopy;
++}
++
++- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info {
++  return [self updateDrag:info];
++}
++
++- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info {
++  return [self updateDrag:info];
++}
++
++- (void)draggingExited:(id<NSDraggingInfo>)info {
++  _dropIndicator.hidden = YES;
++}
++
++- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
++  _dropIndicator.hidden = YES;
++  const NSPoint p = [self convertPoint:info.draggingLocation fromView:nil];
++  NSInteger index = 0;
++  BOOL newRow = NO;
++  NSRect indicator = NSZeroRect;
++  NSString* identifier =
++      [info.draggingPasteboard stringForType:kSidebarItemType];
++  if (!identifier || ![self dropTargetAtPoint:p
++                                        index:&index
++                                       newRow:&newRow
++                                    indicator:&indicator]) {
++    return NO;
++  }
++  NSString* from = [info.draggingPasteboard stringForType:kSidebarIndexType];
++  [_editDelegate sidebarDropItem:identifier
++                       fromIndex:from ? from.integerValue : -1
++                         atIndex:index
++                          newRow:newRow];
++  return YES;
++}
++
++// Dragging an item that is already in the sidebar.
++- (NSDragOperation)draggingSession:(NSDraggingSession*)session
++    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
++  return context == NSDraggingContextWithinApplication
++             ? NSDragOperationMove | NSDragOperationDelete
++             : NSDragOperationDelete;
++}
++
++- (void)draggingSession:(NSDraggingSession*)session
++           endedAtPoint:(NSPoint)screenPoint
++              operation:(NSDragOperation)operation {
++  _draggingItem = NO;
++  for (NSView* view in _segmentViews) {
++    view.alphaValue = 1;
++    for (NSView* v in view.subviews) {
++      v.alphaValue = 1;
++    }
++  }
++  // Like a toolbar: dragging an item out of the sidebar removes it.
++  const NSRect sidebarOnScreen =
++      [self.window convertRectToScreen:[self convertRect:self.bounds
++                                                  toView:nil]];
++  if (operation == NSDragOperationNone && _pressIndex >= 0 &&
++      !NSPointInRect(screenPoint, sidebarOnScreen)) {
++    [_editDelegate sidebarRemoveItemAtIndex:_pressIndex];
++  }
++  _pressIndex = -1;
++}
++
++- (NSMenu*)menuForEvent:(NSEvent*)event {
++  if (!_customizeTarget) {
++    return nil;
++  }
++  NSMenu* menu = [[NSMenu alloc] initWithTitle:@""];
++  NSMenuItem* item =
++      [menu addItemWithTitle:@"Customize Toolbar…"
++                      action:@selector(customizeToolbarFromSidebar:)
++               keyEquivalent:@""];
++  item.target = _customizeTarget;
++  return menu;
+ }
+ 
+ - (BOOL)isFlipped {
+@@ -3685,6 +4342,20 @@ - (BOOL)isFlipped {
+ }
+ 
+ - (void)mouseDown:(NSEvent*)event {
++  const NSPoint local = [self convertPoint:event.locationInWindow fromView:nil];
++  if (_onResize && NSPointInRect(local, [self resizeStrip])) {
++    _resizing = YES;
++    _resizeStartWidth = NSWidth(self.bounds);
++    _resizeStartX = event.locationInWindow.x;
++    return;
++  }
++  if (_editing) {
++    _pressPoint = [self convertPoint:event.locationInWindow fromView:nil];
++    _pressIndex = [self unitIndexAtPoint:_pressPoint views:nil];
++    if (_pressIndex >= 0) {
++      return;
++    }
++  }
+   if (event.clickCount == 2) {
+     [self.window performZoom:nil];
+   } else {
+@@ -3692,62 +4363,237 @@ - (void)mouseDown:(NSEvent*)event {
+   }
+ }
+ 
+-- (void)setExtensionButtons:(NSArray<NSButton*>*)buttons {
+-  for (NSButton* button in _extensionButtons) {
+-    [button removeFromSuperview];
++- (void)mouseDragged:(NSEvent*)event {
++  if (_resizing) {
++    if (_onResize) {
++      _onResize(_resizeStartWidth + event.locationInWindow.x - _resizeStartX,
++                NO);
++    }
++    return;
+   }
+-  _extensionButtons = [buttons copy];
+-  for (NSButton* button in _extensionButtons) {
+-    [self addSubview:button];
++  if (!_editing || _pressIndex < 0 || _draggingItem) {
++    return;
+   }
+-  self.needsLayout = YES;
++  const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
++  if (hypot(p.x - _pressPoint.x, p.y - _pressPoint.y) < 3) {
++    return;
++  }
++  NSArray<NSView*>* unit = nil;
++  [self unitIndexAtPoint:_pressPoint views:&unit];
++  if (!unit.count || _pressIndex >= (NSInteger)_itemIdentifiers.count) {
++    return;
++  }
++  _draggingItem = YES;
++  const NSRect frame = [self frameOfUnit:unit];
++  NSBitmapImageRep* rep = [self bitmapImageRepForCachingDisplayInRect:frame];
++  [self cacheDisplayInRect:frame toBitmapImageRep:rep];
++  NSImage* image = [[NSImage alloc] initWithSize:frame.size];
++  [image addRepresentation:rep];
++  NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
++  [item setString:_itemIdentifiers[_pressIndex] forType:kSidebarItemType];
++  [item setString:[@(_pressIndex) stringValue] forType:kSidebarIndexType];
++  NSDraggingItem* dragging =
++      [[NSDraggingItem alloc] initWithPasteboardWriter:item];
++  [dragging setDraggingFrame:frame contents:image];
++  for (NSView* v in unit) {
++    v.alphaValue = 0.3;
++  }
++  [self beginDraggingSessionWithItems:@[ dragging ]
++                                event:event
++                               source:self];
++}
++
++- (void)viewWillMoveToWindow:(NSWindow*)newWindow {
++  [super viewWillMoveToWindow:newWindow];
++  for (id observer in _windowObservers) {
++    [NSNotificationCenter.defaultCenter removeObserver:observer];
++  }
++  _windowObservers = nil;
+ }
+ 
+ - (void)viewDidMoveToWindow {
+   [super viewDidMoveToWindow];
+   self.needsLayout = YES;
++  NSWindow* window = self.window;
++  if (!window) {
++    return;
++  }
++  _fullScreenLayout = (window.styleMask & NSWindowStyleMaskFullScreen) != 0;
++  _windowObservers = [NSMutableArray array];
++  // Switch as the transition starts, so AppKit's full screen animation
++  // morphs into (and out of) the full-width row, with the traffic lights.
++  struct Event {
++    NSNotificationName name;
++    BOOL fullScreen;
++  };
++  const Event events[] = {
++      {NSWindowWillEnterFullScreenNotification, YES},
++      {NSWindowWillExitFullScreenNotification, NO},
++      {NSWindowDidEnterFullScreenNotification, YES},
++      {NSWindowDidExitFullScreenNotification, NO},
++  };
++  __weak SafariumSidebarView* weakSelf = self;
++  for (const Event& event : events) {
++    const BOOL fullScreen = event.fullScreen;
++    [_windowObservers
++        addObject:[NSNotificationCenter.defaultCenter
++                      addObserverForName:event.name
++                                  object:window
++                                   queue:nil
++                              usingBlock:^(NSNotification*) {
++                                [weakSelf setFullScreenLayout:fullScreen];
++                              }]];
++  }
++}
++
++- (void)setFullScreenLayout:(BOOL)fullScreen {
++  _fullScreenLayout = fullScreen;
++  self.needsLayout = YES;
++  [self layoutSubtreeIfNeeded];
+ }
+ 
+ - (void)layout {
+   [super layout];
+   _background.frame = self.bounds;
++  _edge.frame = NSMakeRect(NSWidth(self.bounds) - 1, 0, 1, NSHeight(self.bounds));
+   // Horizontal windows can lay out the hidden host before it has buttons.
+-  if (!_navigation) {
++  if (!_configured) {
+     return;
+   }
+   const CGFloat width = NSWidth(self.bounds);
+   constexpr CGFloat inset = 10;
+-  constexpr CGFloat gap = 6;
++  constexpr CGFloat gap = 6;      // Between groups and lines.
++  constexpr CGFloat padding = 2;  // Inside a group, around its buttons.
+   const CGFloat size = kControlHeight;
+-  const CGFloat navWidth = 2 * size;
+-  NSButton* trafficLight =
+-      [self.window standardWindowButton:NSWindowCloseButton];
+-  const CGFloat centerY = trafficLight.window
+-                              ? NSMidY([self convertRect:trafficLight.bounds
+-                                                fromView:trafficLight])
+-                              : inset + size / 2;
++  const CGFloat button = size - 2 * padding;
++  NSWindow* window = self.window;
++  if (window && !_fullScreenLayout &&
++      !(window.styleMask & NSWindowStyleMaskFullScreen)) {
++    NSButton* close = [window standardWindowButton:NSWindowCloseButton];
++    NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
++    if (close.window == window && zoom.window == window) {
++      _lightsCenterY = NSMidY([self convertRect:close.bounds fromView:close]);
++      _lightsRight = NSMaxX([self convertRect:zoom.bounds fromView:zoom]) + 12;
++    }
++  }
++  const CGFloat centerY = _lightsCenterY > 0 ? _lightsCenterY : 26;
++  const CGFloat lightsRight = _lightsRight > 0 ? _lightsRight : 88;
+   const CGFloat headerY = MAX(4, floor(centerY - size / 2));
+   const CGFloat rightEdge = width - inset;
+-  _navigation.frame =
+-      NSMakeRect(rightEdge - size - gap - navWidth, headerY, navWidth, size);
+-  _back.frame = NSMakeRect(0, 0, size, size);
+-  _forward.frame = NSMakeRect(size, 0, size, size);
+-  _reload.frame = NSMakeRect(rightEdge - size, headerY, size, size);
+-
+-  CGFloat x = inset;
+-  CGFloat y = headerY + size + gap;
+-  for (NSButton* button in [@[ _newTab, _downloads, _share, _overview, _home ]
+-           arrayByAddingObjectsFromArray:_extensionButtons ?: @[]]) {
+-    if (button.hidden) {
++
++  struct Element {
++    NSView* view;
++    CGFloat width;  // Groups.
++    BOOL flexible;
++    BOOL group;
++  };
++  _lines.clear();
++  CGFloat y = headerY;
++  BOOL firstLine = YES;
++  for (NSUInteger r = 0; r < _rows.count && r < _rowViews.count; ++r) {
++    std::vector<Element> elements;
++    BOOL hasGroup = NO;
++    for (NSUInteger s = 0; s < _rows[r].count && s < _rowViews[r].count; ++s) {
++      SafariumSidebarSegment* segment = _rows[r][s];
++      NSView* view = _rowViews[r][s];
++      if (segment.kind == kSidebarSegmentGroup) {
++        CGFloat bx = padding;
++        for (NSButton* b in segment.buttons) {
++          b.frame = NSMakeRect(bx, padding, button, button);
++          bx += button;
++        }
++        elements.push_back({view, bx + padding, NO, YES});
++        hasGroup = YES;
++      } else {
++        view.hidden = !_editing;
++        view.needsDisplay = YES;
++        elements.push_back(
++            {view, 0, segment.kind == kSidebarSegmentFlexible, NO});
++      }
++    }
++    if (!hasGroup) {
++      for (const Element& e : elements) {
++        e.view.hidden = YES;
++      }
+       continue;
+     }
+-    if (x + size > rightEdge && x > inset) {
+-      x = inset;
+-      y += size + gap;
++    // Lines, like a toolbar row that wraps when the next group doesn't fit.
++    // Row 0 starts next to the traffic lights (in full screen, where they
++    // only show with the menu bar, it takes the whole width). A space takes no room of its
++    // own (it's the gap between two groups); flexible spaces share the
++    // line's leftover width. Editing only draws the spaces into that room,
++    // so nothing moves when editing starts or ends.
++    size_t start = 0;
++    while (start < elements.size()) {
++      const CGFloat x0 = firstLine && !_fullScreenLayout ? lightsRight : inset;
++      if (!firstLine) {
++        y += size + gap;
++      }
++      CGFloat used = 0;
++      int groups = 0;
++      int flexibleCount = 0;
++      size_t end = start;
++      for (; end < elements.size(); ++end) {
++        const Element& e = elements[end];
++        if (e.group) {
++          const CGFloat add = e.width + (groups ? gap : 0);
++          if (groups && x0 + used + add > rightEdge) {
++            break;
++          }
++          used += add;
++          ++groups;
++        } else {
++          flexibleCount += e.flexible ? 1 : 0;
++        }
++      }
++      const CGFloat share =
++          flexibleCount ? MAX(0, rightEdge - x0 - used) / flexibleCount : 0;
++      CGFloat x = x0;
++      BOOL placed = NO;
++      for (size_t i = start; i < end; ++i) {
++        const Element& e = elements[i];
++        if (e.group) {
++          x += placed ? gap : 0;
++          e.view.frame = NSMakeRect(x, y, e.width, size);
++          x += e.width;
++          placed = YES;
++        } else {
++          x += e.flexible ? share : 0;
++        }
++      }
++      // Each run of spaces is drawn in the room between its neighbors (a
++      // narrow capsule in the gap between two groups for a space).
++      for (size_t i = start; i < end;) {
++        if (elements[i].group) {
++          ++i;
++          continue;
++        }
++        size_t j = i;
++        while (j < end && !elements[j].group) {
++          ++j;
++        }
++        const CGFloat from =
++            i > start ? NSMaxX(elements[i - 1].view.frame) : x0;
++        const CGFloat to = j < end ? NSMinX(elements[j].view.frame) : rightEdge;
++        const CGFloat slot = MAX(0, to - from) / (j - i);
++        for (size_t k = i; k < j; ++k) {
++          const Element& e = elements[k];
++          const CGFloat slotX = from + (k - i) * slot;
++          const CGFloat w = e.flexible ? MAX(slot - 4, 16)
++                                       : MIN(MAX(slot - 4, 12), 24);
++          e.view.frame = NSMakeRect(round(slotX + (slot - w) / 2), y + 4, w,
++                                    size - 8);
++        }
++        i = j;
++      }
++      _lines.push_back({NSMakeRect(0, y, width, size), r});
++      firstLine = NO;
++      start = end;
+     }
+-    button.frame = NSMakeRect(x, y, size, size);
+-    x += size + gap;
+   }
++  _buttonsBottom = y + size;
++  [self.window invalidateCursorRectsForView:self];
++  [self layoutEditBadges];
+   const CGFloat tabsY = y + size + gap;
+   self.tabView.frame =
+       NSMakeRect(inset, tabsY, MAX(0, width - 2 * inset),
+@@ -3755,10 +4601,200 @@ - (void)layout {
+ }
+ @end
+ 
++// --- Sidebar toolbar palette (vertical tabs) ----------------------------------
++// Native NSPopover next to the sidebar listing every toolbar item, like the
++// system Customize Toolbar sheet: drag items into the sidebar.
++
++@interface SafariumPaletteEntry : NSObject
++@property(nonatomic, copy) NSString* identifier;
++@property(nonatomic, copy) NSString* label;
++@property(nonatomic, strong) NSImage* image;
++@property(nonatomic) BOOL inUse;  // Already in the sidebar (dimmed).
++@end
++
++@implementation SafariumPaletteEntry
++@synthesize identifier = _identifier;
++@synthesize label = _label;
++@synthesize image = _image;
++@synthesize inUse = _inUse;
++@end
++
++@interface SafariumPaletteItem : NSCollectionViewItem
++- (void)showEntry:(SafariumPaletteEntry*)entry;
++@end
++
++@implementation SafariumPaletteItem {
++  NSImageView* _icon;
++  NSTextField* _label;
++}
++
++- (void)loadView {
++  NSView* root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 84, 64)];
++  _icon = [NSImageView imageViewWithImage:[[NSImage alloc] init]];
++  _icon.frame = NSMakeRect(26, 26, 32, 32);
++  _icon.imageScaling = NSImageScaleProportionallyDown;
++  _icon.contentTintColor = NSColor.labelColor;
++  [root addSubview:_icon];
++  _label = [NSTextField labelWithString:@""];
++  _label.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
++  _label.alignment = NSTextAlignmentCenter;
++  _label.lineBreakMode = NSLineBreakByTruncatingTail;
++  _label.frame = NSMakeRect(0, 4, 84, 16);
++  [root addSubview:_label];
++  self.view = root;
++}
++
++- (void)showEntry:(SafariumPaletteEntry*)entry {
++  [self view];
++  _icon.image = entry.image;
++  _label.stringValue = entry.label ?: @"";
++  _label.textColor = entry.inUse ? NSColor.tertiaryLabelColor
++                                 : NSColor.secondaryLabelColor;
++  _icon.alphaValue = entry.inUse ? 0.35 : 1;
++  self.view.toolTip = entry.inUse ? nil : entry.label;
++}
++@end
++
++@interface SafariumSidebarPalette
++    : NSViewController <NSCollectionViewDataSource, NSCollectionViewDelegate>
++@property(nonatomic, copy) NSArray<SafariumPaletteEntry*>* entries;
++@property(nonatomic, copy) void (^onDone)(void);
++@property(nonatomic, copy) void (^onRestoreDefaults)(void);
++@end
++
++@implementation SafariumSidebarPalette {
++  NSCollectionView* _grid;
++}
++@synthesize entries = _entries;
++@synthesize onDone = _onDone;
++@synthesize onRestoreDefaults = _onRestoreDefaults;
++
++- (void)loadView {
++  NSCollectionViewFlowLayout* layout = [[NSCollectionViewFlowLayout alloc] init];
++  layout.itemSize = NSMakeSize(84, 64);
++  layout.minimumInteritemSpacing = 4;
++  layout.minimumLineSpacing = 8;
++  _grid = [[NSCollectionView alloc] initWithFrame:NSZeroRect];
++  _grid.collectionViewLayout = layout;
++  _grid.dataSource = self;
++  _grid.delegate = self;
++  _grid.backgroundColors = @[ NSColor.clearColor ];
++  // NSCollectionView only starts item drags when it is selectable.
++  _grid.selectable = YES;
++  _grid.allowsEmptySelection = YES;
++  [_grid registerClass:[SafariumPaletteItem class]
++      forItemWithIdentifier:@"SafariumPaletteItem"];
++  [_grid setDraggingSourceOperationMask:NSDragOperationCopy forLocal:YES];
++
++  NSTextField* title = [NSTextField
++      wrappingLabelWithString:
++          @"Drag items into the sidebar. A space starts a new group; a "
++          @"flexible space pushes what follows to the right. Drop below the "
++          @"buttons for a new row. Drag an item out, or click its −, to "
++          @"remove it."];
++  title.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
++  title.textColor = NSColor.secondaryLabelColor;
++
++  NSButton* restore = [NSButton buttonWithTitle:@"Restore Defaults"
++                                         target:self
++                                         action:@selector(restoreClicked:)];
++  NSButton* done = [NSButton buttonWithTitle:@"Done"
++                                      target:self
++                                      action:@selector(doneClicked:)];
++  done.keyEquivalent = @"\r";
++  restore.refusesFirstResponder = YES;
++  NSStackView* buttons =
++      [NSStackView stackViewWithViews:@[ restore, [[NSView alloc] init], done ]];
++  buttons.distribution = NSStackViewDistributionFill;
++
++  NSStackView* stack =
++      [NSStackView stackViewWithViews:@[ title, _grid, buttons ]];
++  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
++  stack.alignment = NSLayoutAttributeLeading;
++  stack.spacing = 12;
++  stack.edgeInsets = NSEdgeInsetsMake(16, 16, 16, 16);
++  stack.translatesAutoresizingMaskIntoConstraints = NO;
++  NSView* root = [[NSView alloc] initWithFrame:NSZeroRect];
++  [root addSubview:stack];
++  const CGFloat width = 4 * 84 + 3 * 4;
++  [NSLayoutConstraint activateConstraints:@[
++    [stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
++    [stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
++    [stack.topAnchor constraintEqualToAnchor:root.topAnchor],
++    [stack.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
++    [_grid.widthAnchor constraintEqualToConstant:width],
++    [title.widthAnchor constraintEqualToConstant:width],
++    [buttons.widthAnchor constraintEqualToConstant:width],
++  ]];
++  self.view = root;
++}
++
++- (void)setEntries:(NSArray<SafariumPaletteEntry*>*)entries {
++  _entries = [entries copy];
++  [self view];
++  [_grid reloadData];
++  const NSUInteger rows = (_entries.count + 3) / 4;
++  for (NSLayoutConstraint* c in _grid.constraints) {
++    if (c.firstAttribute == NSLayoutAttributeHeight) {
++      c.active = NO;
++    }
++  }
++  [_grid.heightAnchor constraintEqualToConstant:rows * 64 + (rows - 1) * 8]
++      .active = YES;
++  self.preferredContentSize = self.view.fittingSize;
++}
++
++- (NSInteger)collectionView:(NSCollectionView*)collectionView
++     numberOfItemsInSection:(NSInteger)section {
++  return static_cast<NSInteger>(_entries.count);
++}
++
++- (NSCollectionViewItem*)collectionView:(NSCollectionView*)collectionView
++    itemForRepresentedObjectAtIndexPath:(NSIndexPath*)indexPath {
++  SafariumPaletteItem* item =
++      [collectionView makeItemWithIdentifier:@"SafariumPaletteItem"
++                                forIndexPath:indexPath];
++  [item showEntry:_entries[indexPath.item]];
++  return item;
++}
++
++- (BOOL)collectionView:(NSCollectionView*)collectionView
++    canDragItemsAtIndexPaths:(NSSet<NSIndexPath*>*)indexPaths
++                   withEvent:(NSEvent*)event {
++  for (NSIndexPath* path in indexPaths) {
++    if (_entries[path.item].inUse) {
++      return NO;
++    }
++  }
++  return YES;
++}
++
++- (id<NSPasteboardWriting>)collectionView:(NSCollectionView*)collectionView
++       pasteboardWriterForItemAtIndexPath:(NSIndexPath*)indexPath {
++  NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
++  [item setString:_entries[indexPath.item].identifier
++          forType:kSidebarItemType];
++  return item;
++}
++
++- (void)restoreClicked:(id)sender {
++  if (_onRestoreDefaults) {
++    _onRestoreDefaults();
++  }
++}
++
++- (void)doneClicked:(id)sender {
++  if (_onDone) {
++    _onDone();
++  }
++}
++@end
++
+ @interface SafariumToolbarController
+     : NSObject <NSToolbarDelegate,
+                 NSSharingServicePickerToolbarItemDelegate,
+-                SafariumOverviewDelegate>
++                SafariumOverviewDelegate,
++                SafariumSidebarEditing>
+ - (void)thumbnailChanged:(NSImage*)image forTab:(int64_t)tabId;
+ - (instancetype)initWithTabView:(SafariumTabBarView*)tabView
+                        pageView:(views::View*)pageView
+@@ -3788,6 +4824,9 @@ @implementation SafariumToolbarController {
+   __weak NSToolbarItem* _tabsItem;
+   __weak SafariumSidebarView* _sidebar;
+   NSMutableDictionary<NSString*, NSButton*>* _sidebarExtensionButtons;
++  NSMutableDictionary<NSString*, NSButton*>* _sidebarCommandButtons;
++  SafariumSidebarPalette* _sidebarPalette;  // Edit-mode item palette.
++  NSPopover* _sidebarPalettePopover;
+   __weak NSView* _extensionActionButton;
+   BOOL _extensionRefreshPending;
+   BOOL _canGoBack;
+@@ -3830,15 +4869,25 @@ - (void)setController:(safarium::TabBarController*)controller {
+ 
+ - (void)installInWindow:(NSWindow*)window {
+   _window = window;
+-  if ([window isKindOfClass:BrowserNativeWidgetWindow.class]) {
+-    ((BrowserNativeWidgetWindow*)window).usesSystemTitlebarMetrics = YES;
+-  }
+   window.backgroundColor = NSColor.windowBackgroundColor;
+   window.titleVisibility = NSWindowTitleHidden;
+   window.toolbarStyle = NSWindowToolbarStyleUnified;
++  NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
++  [center addObserver:self
++             selector:@selector(windowDidChangeFullscreen:)
++                 name:NSWindowDidEnterFullScreenNotification
++               object:window];
++  [center addObserver:self
++             selector:@selector(windowDidChangeFullscreen:)
++                 name:NSWindowDidExitFullScreenNotification
++               object:window];
+   [self applyWindowChrome];
+ }
+ 
++- (void)windowDidChangeFullscreen:(NSNotification*)notification {
++  _sidebar.needsLayout = YES;
++}
++
+ // Horizontal tabs: the NSToolbar (tabs, address, buttons) on top. Vertical
+ // tabs: no toolbar; the content view runs to the window's top edge (the
+ // sidebar sits under the traffic lights, the page uses the full height).
+@@ -3851,18 +4900,406 @@ - (void)setVerticalSidebar:(SafariumSidebarView*)sidebar {
+   if (_overview) {
+     [self setOverview:NO];
+   }
++  [self endSidebarEditing];
+   _sidebar.tabView = nil;
+   _sidebar = sidebar;
+   _verticalTabs = vertical;
+   [self applyWindowChrome];
+ }
+ 
++// --- Vertical sidebar toolbar ----------------------------------------------
++// The sidebar has its own layout, independent of the horizontal NSToolbar:
++// a list of toolbar item identifiers saved in its own defaults key, using
++// the toolbar's grammar (adjacent items share a glass group, a space ends a
++// group, a flexible space ends a group and takes the leftover width) plus
++// row breaks.
++
++NSString* const kSidebarItemsKey = @"SafariumSidebarToolbarLayout";
++// First version: a flexible space started a new row and row 0 was
++// right-aligned. Migrated on first read.
++NSString* const kLegacySidebarItemsKey = @"SafariumSidebarToolbarItems";
++
++static BOOL IsSidebarSpace(NSString* identifier) {
++  return [identifier isEqualToString:NSToolbarSpaceItemIdentifier] ||
++         [identifier isEqualToString:NSToolbarFlexibleSpaceItemIdentifier];
++}
++
++// Drops rows without items (and their spaces) and stray row breaks. Spaces
++// stay where the user put them, as in an NSToolbar.
++static NSArray<NSString*>* NormalizeSidebarItems(NSArray<NSString*>* input) {
++  NSMutableArray<NSString*>* out = [NSMutableArray array];
++  NSMutableArray<NSString*>* row = [NSMutableArray array];
++  BOOL rowHasItem = NO;
++  auto endRow = [&] {
++    if (rowHasItem) {
++      if (out.count) {
++        [out addObject:kSidebarRowBreak];
++      }
++      [out addObjectsFromArray:row];
++    }
++    [row removeAllObjects];
++    rowHasItem = NO;
++  };
++  for (NSString* identifier in input) {
++    if ([identifier isEqualToString:kTabsItem]) {
++      continue;  // The tabs are the sidebar's list, not a toolbar item here.
++    }
++    if ([identifier isEqualToString:kSidebarRowBreak]) {
++      endRow();
++      continue;
++    }
++    rowHasItem |= !IsSidebarSpace(identifier);
++    [row addObject:identifier];
++  }
++  endRow();
++  return out;
++}
++
++- (NSArray<NSString*>*)defaultSidebarItemIdentifiers {
++  // Row 0 right-aligned beside the traffic lights: [back forward]
++  // [new tab, reload]; row 1 left-aligned: [overview, share, downloads], with
++  // extensions pushed to the right.
++  NSMutableArray<NSString*>* ids = [NSMutableArray arrayWithArray:@[
++    NSToolbarFlexibleSpaceItemIdentifier, kNavItem,
++    NSToolbarSpaceItemIdentifier, kNewTabItem, kReloadItem, kSidebarRowBreak,
++    kOverviewItem, kShareItem, kDownloadsItem
++  ]];
++  // Extensions the user put on the horizontal toolbar.
++  NSDictionary* saved = [NSUserDefaults.standardUserDefaults
++      dictionaryForKey:[@"NSToolbar Configuration "
++                           stringByAppendingString:kSafariumToolbarId]];
++  NSMutableArray<NSString*>* extensions = [NSMutableArray array];
++  for (NSString* identifier in saved[@"TB Item Identifiers"]) {
++    if ([identifier isKindOfClass:[NSString class]] &&
++        [identifier hasPrefix:kExtensionItemPrefix]) {
++      [extensions addObject:identifier];
++    }
++  }
++  if (extensions.count) {
++    [ids addObject:NSToolbarFlexibleSpaceItemIdentifier];
++    [ids addObjectsFromArray:extensions];
++  }
++  return ids;
++}
++
++- (NSArray<NSString*>*)storedSidebarItemIdentifiers {
++  NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
++  NSArray* stored = [defaults stringArrayForKey:kSidebarItemsKey];
++  if (stored.count) {
++    return stored;
++  }
++  NSArray* legacy = [defaults stringArrayForKey:kLegacySidebarItemsKey];
++  if (legacy.count) {
++    NSMutableArray<NSString*>* ids = [NSMutableArray
++        arrayWithObject:NSToolbarFlexibleSpaceItemIdentifier];
++    for (NSString* identifier in legacy) {
++      [ids addObject:[identifier
++                         isEqualToString:NSToolbarFlexibleSpaceItemIdentifier]
++                         ? kSidebarRowBreak
++                         : identifier];
++    }
++    return NormalizeSidebarItems(ids);
++  }
++  return [self defaultSidebarItemIdentifiers];
++}
++
++- (NSArray<NSToolbarItemIdentifier>*)configuredItemIdentifiers {
++  NSMutableArray<NSToolbarItemIdentifier>* ids =
++      [[self storedSidebarItemIdentifiers] mutableCopy];
++  // Settings > Appearance > Show home button (shared by both layouts).
++  const NSUInteger home = [ids indexOfObject:kHomeItem];
++  if (_showHome && home == NSNotFound) {
++    const NSUInteger reload = [ids indexOfObject:kReloadItem];
++    [ids insertObject:kHomeItem
++              atIndex:reload == NSNotFound ? 0 : reload + 1];
++  } else if (!_showHome && home != NSNotFound) {
++    [ids removeObjectAtIndex:home];
++  }
++  return ids;
++}
++
++- (void)saveSidebarItemIdentifiers:(NSArray<NSString*>*)ids {
++  NSArray<NSString*>* normalized = NormalizeSidebarItems(ids);
++  NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
++  [defaults setObject:normalized forKey:kSidebarItemsKey];
++  [defaults removeObjectForKey:kLegacySidebarItemsKey];
++  const BOOL hasHome = [normalized containsObject:kHomeItem];
++  if (hasHome != _showHome) {
++    _showHome = hasHome;
++    if (_controller) {
++      _controller->SetShowHomeButton(hasHome);
++    }
++  }
++  [self scheduleExtensionItemRefresh];
++  [self refreshSidebarLayout];
++  [self refreshSidebarPalette];
++}
++
++- (NSArray<NSButton*>*)sidebarButtonsForItem:(NSToolbarItemIdentifier)identifier {
++  SafariumSidebarView* sidebar = _sidebar;
++  if ([identifier isEqualToString:kNavItem]) {
++    return @[ sidebar.back, sidebar.forward ];
++  }
++  NSDictionary<NSString*, NSButton*>* fixed = @{
++    kReloadItem : sidebar.reload,
++    kNewTabItem : sidebar.addTabButton,
++    kHomeItem : sidebar.home,
++    kDownloadsItem : sidebar.downloads,
++    kShareItem : sidebar.share,
++    kOverviewItem : sidebar.overview,
++  };
++  if (NSButton* button = fixed[identifier]) {
++    return @[ button ];
++  }
++  if ([identifier hasPrefix:kExtensionItemPrefix]) {
++    NSButton* button = _sidebarExtensionButtons[identifier];
++    return button ? @[ button ] : @[];
++  }
++  for (const CommandItemSpec& spec : kCommandItems) {
++    NSString* specId = @(spec.identifier);
++    if (![identifier isEqualToString:specId]) {
++      continue;
++    }
++    if (!_sidebarCommandButtons) {
++      _sidebarCommandButtons = [NSMutableDictionary dictionary];
++    }
++    NSButton* button = _sidebarCommandButtons[specId];
++    if (!button) {
++      button = SidebarItemButton(Symbol(@(spec.symbol), 14, NSFontWeightMedium),
++                                 @(spec.label), self,
++                                 @selector(runCommand:));
++      button.tag = spec.command;
++      _sidebarCommandButtons[specId] = button;
++    }
++    return @[ button ];
++  }
++  return @[];
++}
++
++- (void)refreshSidebarLayout {
++  SafariumSidebarView* sidebar = _sidebar;
++  if (!_verticalTabs || !sidebar || !sidebar.back) {
++    return;
++  }
++  NSArray<NSString*>* ids = [self configuredItemIdentifiers];
++  NSMutableArray<NSArray<SafariumSidebarSegment*>*>* rows =
++      [NSMutableArray array];
++  NSMutableArray<SafariumSidebarSegment*>* row = [NSMutableArray array];
++  NSMutableArray<NSButton*>* buttons = [NSMutableArray array];
++  NSMutableArray<NSNumber*>* indexes = [NSMutableArray array];
++  auto endGroup = [&] {
++    if (buttons.count) {
++      SafariumSidebarSegment* segment = [[SafariumSidebarSegment alloc] init];
++      segment.kind = kSidebarSegmentGroup;
++      segment.buttons = buttons;
++      segment.indexes = indexes;
++      [row addObject:segment];
++      [buttons removeAllObjects];
++      [indexes removeAllObjects];
++    }
++  };
++  auto endRow = [&] {
++    endGroup();
++    if (row.count) {
++      [rows addObject:[row copy]];
++      [row removeAllObjects];
++    }
++  };
++  for (NSUInteger i = 0; i < ids.count; ++i) {
++    NSString* identifier = ids[i];
++    if ([identifier isEqualToString:kSidebarRowBreak] ||
++        [identifier isEqualToString:kTabsItem]) {
++      endRow();
++    } else if (IsSidebarSpace(identifier)) {
++      endGroup();
++      SafariumSidebarSegment* segment = [[SafariumSidebarSegment alloc] init];
++      segment.kind = [identifier
++                         isEqualToString:NSToolbarFlexibleSpaceItemIdentifier]
++                         ? kSidebarSegmentFlexible
++                         : kSidebarSegmentSpace;
++      segment.indexes = @[ @(i) ];
++      [row addObject:segment];
++    } else {
++      for (NSButton* button in [self sidebarButtonsForItem:identifier]) {
++        [buttons addObject:button];
++        [indexes addObject:@(i)];
++      }
++    }
++  }
++  endRow();
++  sidebar.itemIdentifiers = ids;
++  sidebar.rows = rows;
++  [sidebar layoutEditBadges];
++}
++
++// --- Sidebar editing ------------------------------------------------------
++
++- (NSString*)labelForItem:(NSString*)identifier image:(NSImage**)image {
++  struct Fixed {
++    NSString* identifier;
++    NSString* label;
++    NSString* symbol;
++  };
++  const Fixed fixed[] = {
++      {kNavItem, @"Back/Forward", @"chevron.left.chevron.right"},
++      {kReloadItem, @"Reload", @"arrow.clockwise"},
++      {kNewTabItem, @"New Tab", @"plus"},
++      {kHomeItem, @"Home", @"house"},
++      {kDownloadsItem, @"Downloads", @"arrow.down.circle"},
++      {kShareItem, @"Share", @"square.and.arrow.up"},
++      {kOverviewItem, @"Tab Overview", @"square.on.square"},
++  };
++  for (const Fixed& f : fixed) {
++    if ([identifier isEqualToString:f.identifier]) {
++      *image = Symbol(f.symbol, 18, NSFontWeightRegular);
++      return f.label;
++    }
++  }
++  for (const CommandItemSpec& spec : kCommandItems) {
++    if ([identifier isEqualToString:@(spec.identifier)]) {
++      *image = Symbol(@(spec.symbol), 18, NSFontWeightRegular);
++      return @(spec.label);
++    }
++  }
++  if ([identifier hasPrefix:kExtensionItemPrefix]) {
++    auto* extensions =
++        _controller ? _controller->GetExtensionsContainer() : nullptr;
++    const std::string id = base::SysNSStringToUTF8(
++        [identifier substringFromIndex:kExtensionItemPrefix.length]);
++    auto* action = extensions ? extensions->GetActionForId(id) : nullptr;
++    if (!action) {
++      return nil;
++    }
++    *image = [self imageForExtension:id];
++    return base::SysUTF16ToNSString(action->GetActionName());
++  }
++  return nil;
++}
++
++- (NSArray<SafariumPaletteEntry*>*)sidebarPaletteEntries {
++  NSArray<NSString*>* current = [self configuredItemIdentifiers];
++  NSMutableArray<SafariumPaletteEntry*>* entries = [NSMutableArray array];
++  for (NSString* identifier in [self toolbarAllowedItemIdentifiers:_toolbar]) {
++    if ([identifier isEqualToString:kTabsItem] || IsSidebarSpace(identifier)) {
++      continue;  // Spaces are added last; the tabs are the sidebar's list.
++    }
++    NSImage* image = nil;
++    NSString* label = [self labelForItem:identifier image:&image];
++    if (!label) {
++      continue;
++    }
++    SafariumPaletteEntry* entry = [[SafariumPaletteEntry alloc] init];
++    entry.identifier = identifier;
++    entry.label = label;
++    entry.image = image;
++    entry.inUse = [current containsObject:identifier];
++    [entries addObject:entry];
++  }
++  // As in the system palette: spaces can be added any number of times.
++  for (NSString* identifier in @[
++         NSToolbarSpaceItemIdentifier, NSToolbarFlexibleSpaceItemIdentifier
++       ]) {
++    const BOOL flexible =
++        [identifier isEqualToString:NSToolbarFlexibleSpaceItemIdentifier];
++    SafariumPaletteEntry* entry = [[SafariumPaletteEntry alloc] init];
++    entry.identifier = identifier;
++    entry.label = flexible ? @"Flexible Space" : @"Space";
++    entry.image = SpacerPaletteImage(flexible);
++    [entries addObject:entry];
++  }
++  return entries;
++}
++
++- (void)refreshSidebarPalette {
++  if (_sidebarPalette) {
++    _sidebarPalette.entries = [self sidebarPaletteEntries];
++    _sidebarPalettePopover.contentSize = _sidebarPalette.preferredContentSize;
++  }
++}
++
++// Context menu "Customize Toolbar…": edit the sidebar in place, with the
++// item palette in a popover beside it (never covering the sidebar).
++- (void)customizeToolbarFromSidebar:(id)sender {
++  SafariumSidebarView* sidebar = _sidebar;
++  if (!_verticalTabs || !sidebar || _sidebarPalettePopover.shown) {
++    return;
++  }
++  sidebar.editDelegate = self;
++  sidebar.editing = YES;
++  if (!_sidebarPalette) {
++    _sidebarPalette = [[SafariumSidebarPalette alloc] init];
++    __weak SafariumToolbarController* weakSelf = self;
++    _sidebarPalette.onDone = ^{
++      [weakSelf endSidebarEditing];
++    };
++    _sidebarPalette.onRestoreDefaults = ^{
++      SafariumToolbarController* strongSelf = weakSelf;
++      [NSUserDefaults.standardUserDefaults
++          removeObjectForKey:kSidebarItemsKey];
++      [NSUserDefaults.standardUserDefaults
++          removeObjectForKey:kLegacySidebarItemsKey];
++      [strongSelf saveSidebarItemIdentifiers:
++                      [strongSelf defaultSidebarItemIdentifiers]];
++    };
++    _sidebarPalettePopover = [[NSPopover alloc] init];
++    _sidebarPalettePopover.behavior = NSPopoverBehaviorApplicationDefined;
++    _sidebarPalettePopover.contentViewController = _sidebarPalette;
++  }
++  [self refreshSidebarPalette];
++  NSRect anchor = [sidebar buttonAreaRect];
++  if (NSIsEmptyRect(anchor)) {
++    anchor = NSMakeRect(NSWidth(sidebar.bounds) - 20, 20, 10, 10);
++  }
++  [_sidebarPalettePopover showRelativeToRect:anchor
++                                      ofView:sidebar
++                               preferredEdge:NSRectEdgeMaxX];
++}
++
++- (void)endSidebarEditing {
++  [_sidebarPalettePopover close];
++  _sidebar.editing = NO;
++}
++
++// SafariumSidebarEditing:
++- (void)sidebarRemoveItemAtIndex:(NSInteger)index {
++  NSMutableArray<NSString*>* ids = [[self configuredItemIdentifiers] mutableCopy];
++  if (index < 0 || index >= (NSInteger)ids.count) {
++    return;
++  }
++  [ids removeObjectAtIndex:index];
++  [self saveSidebarItemIdentifiers:ids];
++}
++
++- (void)sidebarDropItem:(NSString*)identifier
++              fromIndex:(NSInteger)from
++                atIndex:(NSInteger)index
++                 newRow:(BOOL)newRow {
++  NSMutableArray<NSString*>* ids = [[self configuredItemIdentifiers] mutableCopy];
++  if (from >= 0 && from < (NSInteger)ids.count) {
++    [ids removeObjectAtIndex:from];
++    if (from < index) {
++      --index;
++    }
++  } else if (!IsSidebarSpace(identifier) && [ids containsObject:identifier]) {
++    return;  // Each item appears once (spaces any number of times).
++  }
++  if (newRow) {
++    [ids addObject:kSidebarRowBreak];
++    [ids addObject:identifier];
++  } else {
++    [ids insertObject:identifier
++              atIndex:std::clamp<NSInteger>(index, 0, ids.count)];
++  }
++  [self saveSidebarItemIdentifiers:ids];
++}
++
+ - (void)applyWindowChrome {
+   NSWindow* window = _window;
+   if (!window) {
+     return;
+   }
+   if (_verticalTabs) {
++    // AppKit supplies the title bar and standard buttons in fullscreen.
+     window.toolbar = nil;
+     [_tabView removeFromSuperview];
+     _tabsItem.view = nil;
+@@ -3870,6 +5307,8 @@ - (void)applyWindowChrome {
+     window.titlebarAppearsTransparent = YES;
+     window.styleMask |= NSWindowStyleMaskFullSizeContentView;
+     [_sidebar configureButtonsWithTarget:self];
++    _sidebar.customizeTarget = self;
++    [self refreshSidebarLayout];
+     _sidebar.tabView = _tabView;
+     [_sidebar addSubview:_tabView];
+     _sidebar.needsLayout = YES;
+@@ -3886,6 +5325,7 @@ - (void)applyWindowChrome {
+ }
+ 
+ - (void)uninstall {
++  [NSNotificationCenter.defaultCenter removeObserver:self name:nil object:_window];
+   ++_overviewTransition;
+   [_downloadsPopover close];
+   if (_window.toolbar == _toolbar) {
+@@ -3911,7 +5351,7 @@ - (void)uninstall {
+   return @[
+     kNavItem, NSToolbarSpaceItemIdentifier, kReloadItem,
+     NSToolbarFlexibleSpaceItemIdentifier, kTabsItem,
+-    NSToolbarFlexibleSpaceItemIdentifier, kDownloadsItem, kNewTabItem,
++    NSToolbarFlexibleSpaceItemIdentifier, kNewTabItem, kDownloadsItem,
+     kShareItem, kOverviewItem
+   ];
+ }
+@@ -4244,28 +5684,37 @@ - (void)refreshExtensionItems {
+       item.menuFormRepresentation.title = name;
+       NSImage* image = [self imageForExtension:id];
+       item.image = image;
+-      if (_verticalTabs) {
+-        NSButton* button = _sidebarExtensionButtons[item.itemIdentifier];
+-        if (!button) {
+-          button =
+-              SidebarGlassButton(image, name, self, @selector(runExtension:));
+-          button.identifier = item.itemIdentifier;
+-        }
+-        button.image = image;
+-        button.toolTip = name;
+-        button.accessibilityLabel = name;
+-        [sidebarButtons addObject:button];
+-      }
+     }
+   }
+   if (_verticalTabs) {
+-    [_sidebarExtensionButtons removeAllObjects];
+-    for (NSButton* button in sidebarButtons) {
+-      _sidebarExtensionButtons[button.identifier] = button;
+-    }
+-    if (![_sidebar.extensionButtons isEqualToArray:sidebarButtons]) {
+-      _sidebar.extensionButtons = sidebarButtons;
++    // The sidebar's own layout decides which extensions it shows.
++    NSMutableDictionary<NSString*, NSButton*>* buttons =
++        [NSMutableDictionary dictionary];
++    for (NSString* identifier in [self configuredItemIdentifiers]) {
++      if (![identifier hasPrefix:kExtensionItemPrefix]) {
++        continue;
++      }
++      const std::string id = base::SysNSStringToUTF8(
++          [identifier substringFromIndex:kExtensionItemPrefix.length]);
++      auto* action = extensions->GetActionForId(id);
++      if (!action) {
++        continue;
++      }
++      NSString* name = base::SysUTF16ToNSString(action->GetActionName());
++      NSImage* image = [self imageForExtension:id];
++      NSButton* button = _sidebarExtensionButtons[identifier];
++      if (!button) {
++        button = SidebarItemButton(image, name, self, @selector(runExtension:));
++        button.identifier = identifier;
++      }
++      button.image = image;
++      button.toolTip = name;
++      button.accessibilityLabel = name;
++      [sidebarButtons addObject:button];
++      buttons[identifier] = button;
+     }
++    _sidebarExtensionButtons = buttons;
++    [self refreshSidebarLayout];
+   }
+ }
+ 
+@@ -4501,10 +5950,7 @@ - (void)applyItemState {
+     _sidebar.reload.toolTip = reloadLabel;
+     _sidebar.reload.accessibilityLabel = reloadLabel;
+     _sidebar.share.enabled = !_overview;
+-    if (_sidebar.home.hidden == _showHome) {
+-      _sidebar.home.hidden = !_showHome;
+-      _sidebar.needsLayout = YES;
+-    }
++    [self refreshSidebarLayout];
+   }
+ }
+ 
+@@ -4679,12 +6125,33 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+   host_ = AddChildView(std::make_unique<views::NativeViewHost>());
+ }
+ 
+-VerticalSidebarView::~VerticalSidebarView() = default;
++VerticalSidebarView::~VerticalSidebarView() {
++  objc_->view.onResize = nil;
++}
+ 
+ gfx::NativeView VerticalSidebarView::GetSidebarNativeView() const {
+   return gfx::NativeView(objc_->view);
+ }
+ 
++// static
++int VerticalSidebarView::GetSavedWidth() {
++  return static_cast<int>([NSUserDefaults.standardUserDefaults
++      integerForKey:@"SafariumSidebarWidth"]);
++}
++
++// static
++void VerticalSidebarView::SaveWidth(int width) {
++  [NSUserDefaults.standardUserDefaults setInteger:width
++                                           forKey:@"SafariumSidebarWidth"];
++}
++
++void VerticalSidebarView::SetResizeCallback(
++    base::RepeatingCallback<void(int, bool)> callback) {
++  objc_->view.onResize = ^(CGFloat width, BOOL done) {
++    callback.Run(static_cast<int>(std::lround(width)), done);
++  };
++}
++
+ void VerticalSidebarView::AddedToWidget() {
+   views::View::AddedToWidget();
+   if (!host_->native_view()) {
+@@ -4814,6 +6281,38 @@ void HoverCardMemoryChanged(int64_t tab_id,
+ BEGIN_METADATA(ToolbarInstaller)
+ END_METADATA
+ 
++void GetSystemSeparatorColors(SkColor* line, SkColor* background) {
++  __block SkColor line_color = SkColorSetRGB(229, 229, 229);
++  __block SkColor background_color = SK_ColorWHITE;
++  NSAppearance* appearance =
++      NSApp.effectiveAppearance
++          ?: [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++  [appearance performAsCurrentDrawingAppearance:^{
++    NSColor* bg = [NSColor.windowBackgroundColor
++        colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
++    NSColor* sep = [NSColor.separatorColor
++        colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
++    if (!bg || !sep) {
++      return;
++    }
++    const CGFloat a = sep.alphaComponent;
++    // Rounded down, as AppKit's own separator lines come out.
++    auto channel = [](CGFloat v) {
++      return static_cast<U8CPU>(
++          std::floor(std::clamp<CGFloat>(v, 0, 1) * 255 + 0.001));
++    };
++    background_color = SkColorSetRGB(channel(bg.redComponent),
++                                     channel(bg.greenComponent),
++                                     channel(bg.blueComponent));
++    line_color = SkColorSetRGB(
++        channel(sep.redComponent * a + bg.redComponent * (1 - a)),
++        channel(sep.greenComponent * a + bg.greenComponent * (1 - a)),
++        channel(sep.blueComponent * a + bg.blueComponent * (1 - a)));
++  }];
++  *line = line_color;
++  *background = background_color;
++}
++
+ std::unique_ptr<views::View> CreateTabBarHost(TabBarController* controller,
+                                              views::View* page_view,
+                                              TabBarView** out_bar_view) {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+index 4f04f68572..eaa84949a8 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+@@ -71,7 +71,7 @@ void WebUIBrowserSidePanelUI::Close(SidePanelEntryHideReason reason,
+   // Asynchronously close the side panel in webshell.
+   // WebUI then notifies the browser when the side panel is actually closed
+   // via OnSidePanelClosed().
+-  GetWebUIBrowserWindow()->CloseSidePanel();
++  GetWebUIBrowserWindow()->CloseSidePanel(/*animate=*/!supress_animations);
+ }
+ 
+ void WebUIBrowserSidePanelUI::Toggle(SidePanelEntryKey key,
+@@ -126,13 +126,13 @@ void WebUIBrowserSidePanelUI::Show(
+   if (IsSidePanelShowing() && *current_key() == input) {
+     waiter()->ResetLoadingEntryIfNecessary();
+ 
+-    // TODO(webium): Implement the following:
+     // If the side panel is in the process of closing, show it instead.
+-    // if (browser_view_->contents_height_side_panel()->state() ==
+-    // SidePanel::State::kClosing) {
+-    // browser_view_->contents_height_side_panel()->Open(/*animated=*/true);
+-    // NotifyPinnedContainerOfActiveStateChange(entry->key(), true);
+-    // }
++    if (GetWebUIBrowserWindow()->IsSidePanelClosing()) {
++      GetWebUIBrowserWindow()->ReopenSidePanel();
++      if (entry) {
++        entry->OnEntryShown();
++      }
++    }
+     return;
+   }
+ 
+@@ -171,7 +171,8 @@ void WebUIBrowserSidePanelUI::PopulateSidePanel(
+       views::kDetachedViewFocusManagerKey,
+       GetWebUIBrowserWindow()->widget()->GetFocusManager());
+   SetCurrentKey(unique_key);
+-  GetWebUIBrowserWindow()->ShowSidePanel(entry->key());
++  GetWebUIBrowserWindow()->ShowSidePanel(entry->key(),
++                                         /*animate=*/!suppress_animations);
+ 
+   if (auto* contextual_registry = GetActiveContextualRegistry()) {
+     contextual_registry->ResetActiveEntry();
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 743319eea5..980b604857 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -348,6 +348,13 @@ void WebUIBrowserWindow::Show() {
+   if (safarium_root_) {
+     if (content::WebContents* active =
+             browser_->GetTabStripModel()->GetActiveWebContents()) {
++      // Session restore can leave the active tab hidden by the time the
++      // window first shows; its view never moves to another window, so
++      // nothing else would show it (the page stayed blank until a tab
++      // switch).
++      if (active->GetVisibility() != content::Visibility::VISIBLE) {
++        active->UpdateWebContentsVisibility(content::Visibility::VISIBLE);
++      }
+       active->SetInitialFocus();
+     }
+   } else {
+@@ -1443,7 +1450,8 @@ WebUIBrowserUI* WebUIBrowserWindow::GetWebUIBrowserUI() const {
+       ->GetAs<WebUIBrowserUI>();
+ }
+ 
+-void WebUIBrowserWindow::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
++void WebUIBrowserWindow::ShowSidePanel(SidePanelEntryKey side_panel_entry_key,
++                                       bool animate) {
+   if (safarium_root_) {
+     // Safarium: the side panel's contents go in the native window's own
+     // dock (left/right of the page) instead of the WebUI shell.
+@@ -1478,7 +1486,7 @@ void WebUIBrowserWindow::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
+               return root ? root->TakeSidePanelContent() : nullptr;
+             },
+             safarium_root_->GetWeakPtr())),
+-        title, icon);
++        title, icon, animate);
+     return;
+   }
+   if (GetWebUIBrowserUI()) {
+@@ -1486,12 +1494,19 @@ void WebUIBrowserWindow::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
+   }
+ }
+ 
+-void WebUIBrowserWindow::CloseSidePanel() {
++void WebUIBrowserWindow::CloseSidePanel(bool animate) {
+   if (safarium_root_) {
+-    safarium_root_->HideSidePanel();
+-    if (WebUIBrowserSidePanelUI* side_panel_ui = GetWebUIBrowserSidePanelUI()) {
+-      side_panel_ui->OnSidePanelClosed();  // The WebUI shell's async ack.
+-    }
++    // Like the WebUI shell's async ack: the side panel UI hears that the
++    // panel closed once it is gone (after the close animation).
++    safarium_root_->HideSidePanel(
++        animate, base::BindOnce(
++                     [](WebUIBrowserWindow* window) {
++                       if (WebUIBrowserSidePanelUI* side_panel_ui =
++                               window->GetWebUIBrowserSidePanelUI()) {
++                         side_panel_ui->OnSidePanelClosed();
++                       }
++                     },
++                     base::Unretained(this)));
+     return;
+   }
+   if (GetWebUIBrowserUI()) {
+@@ -1499,6 +1514,16 @@ void WebUIBrowserWindow::CloseSidePanel() {
+   }
+ }
+ 
++bool WebUIBrowserWindow::IsSidePanelClosing() const {
++  return safarium_root_ && safarium_root_->IsSidePanelClosing();
++}
++
++void WebUIBrowserWindow::ReopenSidePanel() {
++  if (safarium_root_) {
++    safarium_root_->ReopenSidePanel();
++  }
++}
++
+ WebUIBrowserSidePanelUI* WebUIBrowserWindow::GetWebUIBrowserSidePanelUI() {
+   return static_cast<WebUIBrowserSidePanelUI*>(SidePanelUI::From(browser_));
+ }
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index a763e473c9..9eaddf0a17 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -224,8 +224,13 @@ class WebUIBrowserWindow : public BrowserWindow,
+   void OnWidgetBoundsChanged(views::Widget* widget,
+                              const gfx::Rect& new_bounds) override;
+ 
+-  void ShowSidePanel(SidePanelEntryKey side_panel_entry_key);
+-  void CloseSidePanel();
++  // `animate`: Chrome's side panel open/close motion (not for tab switches).
++  void ShowSidePanel(SidePanelEntryKey side_panel_entry_key,
++                     bool animate = false);
++  void CloseSidePanel(bool animate = false);
++  // The side panel is animating closed (it can still be reopened).
++  bool IsSidePanelClosing() const;
++  void ReopenSidePanel();
+ 
+   WebUIBrowserUI* GetWebUIBrowserUI() const;
+   WebUIBrowserSidePanelUI* GetWebUIBrowserSidePanelUI();

@@ -1,0 +1,834 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:37:43 -0500
+Subject: [PATCH 3/5] Safarium: native extension side panels (left/right dock)
+
+Extension side panels (e.g. Claude) were dropped in the native UI. Now
+SafariumRootView docks the side panel entry's own view left (Safarium
+default) or right of the page, with a native AppKit header (icon, name,
+move to other side, close) and a resizable edge. The side panel UI lends
+its current view to the window and reclaims it before caching/dropping
+it; the detached-focus-manager property is cleared while the view is in
+the widget. GetContainingWebContents no longer CHECKs on non-WebUI side
+panels. Settings > Appearance shows "Side panel position" again.
+
+Local checkpoint only; not intended for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../appearance_page/appearance_page.html.ts   |  12 ++
+ chrome/browser/ui/side_panel/BUILD.gn         |   1 +
+ .../browser/ui/side_panel/side_panel_prefs.cc |   7 +
+ chrome/browser/ui/webui_browser/BUILD.gn      |   1 +
+ .../ui/webui_browser/safarium_root_view.cc    | 170 ++++++++++++++++-
+ .../ui/webui_browser/safarium_root_view.h     |  67 ++++++-
+ .../safarium_side_panel_header_mac.mm         | 174 ++++++++++++++++++
+ .../webui_browser_side_panel_ui.cc            |  56 +++++-
+ .../webui_browser_side_panel_ui.h             |  15 ++
+ .../ui/webui_browser/webui_browser_window.cc  |  57 ++++++
+ 10 files changed, 552 insertions(+), 8 deletions(-)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm
+
+diff --git a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+index dee32a6f2c..08892e2896 100644
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -271,6 +271,18 @@ export function getHtml(this: SettingsAppearancePageElement) {
+       </div>
+     </div>
+     ` : ''}
++    ${!this.showChromeOnlySettings_ ? html`
++      <div class="cr-row hr">
++        <div class="flex cr-padded-text" aria-hidden="true">
++          $i18n{sidePanelPosition}
++        </div>
++        <settings-dropdown-menu id="safariumSidePanelPosition"
++            label="$i18n{sidePanelPosition}"
++            pref-key="side_panel.is_right_aligned"
++            .menuOptions="${this.sidePanelAlignmentOptions_}">
++        </settings-dropdown-menu>
++      </div>
++    ` : ''}
+     ${!this.showHoverCardImagesOption_ ? html`
+       <div class="hr" ?hidden="${!this.pageVisibility_.hoverCard}"></div>
+       <settings-toggle-button id="hoverCardMemoryUsageToggle"
+diff --git a/chrome/browser/ui/side_panel/BUILD.gn b/chrome/browser/ui/side_panel/BUILD.gn
+index a65fbd8ee4..de0e7f7906 100644
+--- a/chrome/browser/ui/side_panel/BUILD.gn
++++ b/chrome/browser/ui/side_panel/BUILD.gn
+@@ -38,6 +38,7 @@ source_set("side_panel") {
+   ]
+ 
+   deps = [
++    "//build:safarium_buildflags",
+     "//chrome/app:generated_resources",
+     "//chrome/browser:primitives",
+     "//chrome/browser/ui:ui_features",
+diff --git a/chrome/browser/ui/side_panel/side_panel_prefs.cc b/chrome/browser/ui/side_panel/side_panel_prefs.cc
+index f3c693711f..e184056ce4 100644
+--- a/chrome/browser/ui/side_panel/side_panel_prefs.cc
++++ b/chrome/browser/ui/side_panel/side_panel_prefs.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "build/safarium_buildflags.h"
+ #include "chrome/browser/ui/side_panel/side_panel_prefs.h"
+ 
+ #include <optional>
+@@ -41,8 +42,14 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   // Otherwise, the side panel should default to the right side of the screen.
+   // TODO(dljames): Add enum values kAlternateSide / kDefaultSide that will
+   // replace false and true respectively.
++#if BUILDFLAG(SAFARIUM_BRANDING)
++  // Safarium: extension side panels dock on the left (in the sidebar) by
++  // default; Settings > Appearance can move them to the right.
++  registry->RegisterBooleanPref(prefs::kSidePanelHorizontalAlignment, false);
++#else
+   registry->RegisterBooleanPref(prefs::kSidePanelHorizontalAlignment,
+                                 !base::i18n::IsRTL());
++#endif
+   registry->RegisterBooleanPref(prefs::kGoogleSearchSidePanelEnabled, true);
+ 
+   base::DictValue alignment_overrides;
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index f4dacf075a..03ab2dbf79 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -93,6 +93,7 @@ source_set("impl") {
+       "safarium_downloads_popover.mm",
+       "safarium_root_view.cc",
+       "safarium_root_view.h",
++      "safarium_side_panel_header_mac.mm",
+       "safarium_tab_bar_host_mac.mm",
+       "webui_browser_window_mac.mm",
+     ]
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.cc b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+index 6817fb31f4..c6280c824c 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.cc
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+@@ -1,18 +1,30 @@
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ 
++#include <algorithm>
++
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+ #include "ui/views/background.h"
++#include "ui/views/controls/resize_area.h"
+ #include "ui/views/controls/webview/webview.h"
+ #include "ui/views/view_class_properties.h"
+ 
+ namespace safarium {
+ 
++namespace {
++constexpr int kMinSidePanelWidth = 320;  // Chrome's side panel minimum.
++constexpr int kResizeAreaWidth = 6;
++}  // namespace
++
+ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+-                                   TabBarController* controller) {
++                                   TabBarController* controller)
++    : browser_context_(browser_context) {
+   SetBackground(views::CreateSolidBackground(ui::kColorWindowBackground));
+   auto web_view = std::make_unique<views::WebView>(browser_context);
+   web_view->SetProperty(views::kElementIdentifierKey,
+@@ -21,6 +33,41 @@ SafariumRootView::SafariumRootView(content::BrowserContext* browser_context,
+   AddChildView(CreateTabBarHost(controller, this, &bar_view));
+   bar_view_ = bar_view;
+   contents_web_view_ = AddChildView(std::move(web_view));
++
++  // Side panel (hidden until an extension opens one).
++  side_panel_separator_ = AddChildView(std::make_unique<views::View>());
++  side_panel_separator_->SetBackground(
++      views::CreateSolidBackground(ui::kColorSeparator));
++  side_panel_header_ = AddChildView(std::make_unique<SidePanelHeaderView>(
++      base::BindRepeating(
++          [](SafariumRootView* self) {
++            if (self->side_panel_close_callback_) {
++              self->side_panel_close_callback_.Run();
++            }
++          },
++          base::Unretained(this)),
++      base::BindRepeating(
++          [](SafariumRootView* self) {
++            Profile::FromBrowserContext(self->browser_context_)
++                ->GetPrefs()
++                ->SetBoolean(prefs::kSidePanelHorizontalAlignment,
++                             !self->SidePanelDockedRight());
++          },
++          base::Unretained(this))));
++  side_panel_resize_ = AddChildView(std::make_unique<views::ResizeArea>(this));
++  for (views::View* view :
++       {side_panel_separator_.get(), static_cast<views::View*>(
++                                         side_panel_header_.get()),
++        static_cast<views::View*>(side_panel_resize_.get())}) {
++    view->SetVisible(false);
++  }
++  pref_change_registrar_.Init(
++      Profile::FromBrowserContext(browser_context)->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kSidePanelHorizontalAlignment,
++      base::BindRepeating(&SafariumRootView::OnDockPrefChanged,
++                          base::Unretained(this)));
++  side_panel_header_->SetDockedRight(SidePanelDockedRight());
+ }
+ 
+ SafariumRootView::~SafariumRootView() = default;
+@@ -29,8 +76,127 @@ void SafariumRootView::SetActiveContents(content::WebContents* contents) {
+   contents_web_view_->SetWebContents(contents);
+ }
+ 
++bool SafariumRootView::SidePanelDockedRight() const {
++  return Profile::FromBrowserContext(browser_context_)
++      ->GetPrefs()
++      ->GetBoolean(prefs::kSidePanelHorizontalAlignment);
++}
++
++void SafariumRootView::OnDockPrefChanged() {
++  side_panel_header_->SetDockedRight(SidePanelDockedRight());
++  InvalidateLayout();
++}
++
++void SafariumRootView::ShowSidePanel(std::unique_ptr<views::View> content,
++                                     const std::u16string& title,
++                                     const gfx::ImageSkia& icon) {
++  if (side_panel_content_) {
++    // Not reclaimed (shouldn't happen): drop the stale view.
++    RemoveChildViewT(side_panel_content_.get());
++  }
++  if (content) {
++    // Webium gives never-attached side panel views a detached focus
++    // manager; a view in a widget must not have one (View CHECKs).
++    content->ClearProperty(views::kDetachedViewFocusManagerKey);
++  }
++  side_panel_content_ =
++      content ? AddChildView(std::move(content)) : nullptr;
++  side_panel_header_->SetContent(title, icon);
++  side_panel_header_->SetDockedRight(SidePanelDockedRight());
++  for (views::View* view :
++       {side_panel_separator_.get(), static_cast<views::View*>(
++                                         side_panel_header_.get()),
++        static_cast<views::View*>(side_panel_resize_.get())}) {
++    view->SetVisible(true);
++  }
++  InvalidateLayout();
++}
++
++void SafariumRootView::HideSidePanel() {
++  for (views::View* view :
++       {side_panel_separator_.get(), static_cast<views::View*>(
++                                         side_panel_header_.get()),
++        static_cast<views::View*>(side_panel_resize_.get())}) {
++    view->SetVisible(false);
++  }
++  if (side_panel_content_) {
++    side_panel_content_->SetVisible(false);
++  }
++  InvalidateLayout();
++}
++
++std::unique_ptr<views::View> SafariumRootView::TakeSidePanelContent() {
++  if (!side_panel_content_) {
++    return nullptr;
++  }
++  views::View* content = side_panel_content_.get();
++  side_panel_content_ = nullptr;
++  content->SetVisible(true);
++  views::FocusManager* focus_manager = GetFocusManager();
++  InvalidateLayout();
++  std::unique_ptr<views::View> view = RemoveChildViewT(content);
++  if (focus_manager) {
++    // Detached again (cached by the side panel): restore what Webium set.
++    view->SetProperty(views::kDetachedViewFocusManagerKey, focus_manager);
++  }
++  return view;
++}
++
++bool SafariumRootView::IsSidePanelShowing() const {
++  return side_panel_header_->GetVisible();
++}
++
++void SafariumRootView::SetSidePanelCloseCallback(
++    base::RepeatingClosure callback) {
++  side_panel_close_callback_ = std::move(callback);
++}
++
++void SafariumRootView::OnResize(int resize_amount, bool done_resizing) {
++  if (resize_start_width_ < 0) {
++    resize_start_width_ = side_panel_width_;
++  }
++  // The handle sits on the panel's inner edge: dragging toward the page
++  // widens it.
++  side_panel_width_ = resize_start_width_ +
++                      (SidePanelDockedRight() ? -resize_amount : resize_amount);
++  if (done_resizing) {
++    resize_start_width_ = -1;
++  }
++  InvalidateLayout();
++}
++
+ void SafariumRootView::Layout(PassKey) {
+-  contents_web_view_->SetBoundsRect(GetContentsBounds());
++  const gfx::Rect bounds = GetContentsBounds();
++  if (!IsSidePanelShowing()) {
++    contents_web_view_->SetBoundsRect(bounds);
++    LayoutSuperclass<views::View>(this);
++    return;
++  }
++  const int max_width = std::max(kMinSidePanelWidth, bounds.width() / 2);
++  side_panel_width_ =
++      std::clamp(side_panel_width_, kMinSidePanelWidth, max_width);
++  const int w = side_panel_width_;
++  const bool right = SidePanelDockedRight();
++  gfx::Rect panel(right ? bounds.right() - w : bounds.x(), bounds.y(), w,
++                  bounds.height());
++  gfx::Rect separator(right ? panel.x() - 1 : panel.right(), bounds.y(), 1,
++                      bounds.height());
++  gfx::Rect page = bounds;
++  page.set_width(bounds.width() - w - 1);
++  if (!right) {
++    page.set_x(separator.right());
++  }
++  contents_web_view_->SetBoundsRect(page);
++  side_panel_separator_->SetBoundsRect(separator);
++  side_panel_header_->SetBounds(panel.x(), panel.y(), panel.width(),
++                                SidePanelHeaderView::kHeight);
++  if (side_panel_content_) {
++    side_panel_content_->SetBounds(
++        panel.x(), panel.y() + SidePanelHeaderView::kHeight, panel.width(),
++        panel.height() - SidePanelHeaderView::kHeight);
++  }
++  side_panel_resize_->SetBounds(separator.x() - kResizeAreaWidth / 2,
++                                bounds.y(), kResizeAreaWidth, bounds.height());
+   LayoutSuperclass<views::View>(this);
+ }
+ 
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.h b/chrome/browser/ui/webui_browser/safarium_root_view.h
+index 50eeb066ae..57fb6c09d8 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.h
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.h
+@@ -5,7 +5,12 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/views/controls/resize_area_delegate.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/view.h"
+ 
+@@ -15,6 +20,7 @@ class WebContents;
+ }  // namespace content
+ 
+ namespace views {
++class ResizeArea;
+ class WebView;
+ }  // namespace views
+ 
+@@ -28,7 +34,35 @@ std::unique_ptr<views::View> CreateTabBarHost(TabBarController* controller,
+                                              views::View* page_view,
+                                              TabBarView** out_bar_view);
+ 
+-class SafariumRootView : public views::View {
++// Header of the extension side panel (native AppKit controls hosted in a
++// views::NativeViewHost; implemented in safarium_side_panel_header_mac.mm).
++class SidePanelHeaderView : public views::View {
++  METADATA_HEADER(SidePanelHeaderView, views::View)
++
++ public:
++  static constexpr int kHeight = 40;
++
++  SidePanelHeaderView(base::RepeatingClosure on_close,
++                      base::RepeatingClosure on_move);
++  SidePanelHeaderView(const SidePanelHeaderView&) = delete;
++  SidePanelHeaderView& operator=(const SidePanelHeaderView&) = delete;
++  ~SidePanelHeaderView() override;
++
++  void SetContent(const std::u16string& title, const gfx::ImageSkia& icon);
++  void SetDockedRight(bool docked_right);
++
++  // views::View:
++  void AddedToWidget() override;
++  void Layout(PassKey) override;
++
++ private:
++  struct ObjCStorage;
++  std::unique_ptr<ObjCStorage> objc_;
++  raw_ptr<views::View> host_ = nullptr;  // views::NativeViewHost.
++};
++
++class SafariumRootView : public views::View,
++                         public views::ResizeAreaDelegate {
+   METADATA_HEADER(SafariumRootView, views::View)
+ 
+  public:
+@@ -41,11 +75,42 @@ class SafariumRootView : public views::View {
+   void SetActiveContents(content::WebContents* contents);
+   void FocusAddressField();
+ 
++  // Extension (or other) side panel, docked left or right of the page
++  // (pref side_panel.is_right_aligned).
++  // `content` is the side panel entry's own view (e.g. ExtensionViewViews),
++  // lent by WebUIBrowserSidePanelUI; TakeSidePanelContent() returns it.
++  void ShowSidePanel(std::unique_ptr<views::View> content,
++                     const std::u16string& title,
++                     const gfx::ImageSkia& icon);
++  void HideSidePanel();
++  std::unique_ptr<views::View> TakeSidePanelContent();
++  base::WeakPtr<SafariumRootView> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++  bool IsSidePanelShowing() const;
++  // Called when the user closes the panel from its header.
++  void SetSidePanelCloseCallback(base::RepeatingClosure callback);
++
++  // views::ResizeAreaDelegate:
++  void OnResize(int resize_amount, bool done_resizing) override;
++
+  private:
+   void Layout(PassKey) override;
++  bool SidePanelDockedRight() const;
++  void OnDockPrefChanged();
+ 
++  raw_ptr<content::BrowserContext> browser_context_;
+   raw_ptr<TabBarView> bar_view_ = nullptr;
+   raw_ptr<views::WebView> contents_web_view_ = nullptr;
++  raw_ptr<views::View> side_panel_separator_ = nullptr;
++  raw_ptr<SidePanelHeaderView> side_panel_header_ = nullptr;
++  raw_ptr<views::View> side_panel_content_ = nullptr;
++  raw_ptr<views::ResizeArea> side_panel_resize_ = nullptr;
++  int side_panel_width_ = 360;
++  int resize_start_width_ = -1;
++  base::RepeatingClosure side_panel_close_callback_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::WeakPtrFactory<SafariumRootView> weak_factory_{this};
+ };
+ 
+ }  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm b/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm
+new file mode 100644
+index 0000000000..bec92bd3f1
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_side_panel_header_mac.mm
+@@ -0,0 +1,174 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Safarium: native header of the docked side panel (extension icon + name,
++// "move to the other side" and close buttons).
++
++#import <AppKit/AppKit.h>
++
++#include "base/strings/sys_string_conversions.h"
++#include "chrome/browser/ui/webui_browser/safarium_root_view.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/gfx/image/image_skia_util_mac.h"
++#include "ui/views/controls/native/native_view_host.h"
++
++@interface SafariumSidePanelHeader : NSView
++@property(nonatomic, copy) void (^onClose)(void);
++@property(nonatomic, copy) void (^onMove)(void);
++- (void)setTitle:(NSString*)title icon:(NSImage*)icon;
++- (void)setDockedRight:(BOOL)dockedRight;
++@end
++
++@implementation SafariumSidePanelHeader {
++  NSImageView* _icon;
++  NSTextField* _title;
++  NSButton* _move;
++  NSButton* _close;
++}
++
++@synthesize onClose = _onClose;
++@synthesize onMove = _onMove;
++
++static NSButton* HeaderButton(NSString* symbol,
++                              NSString* tip,
++                              id target,
++                              SEL action) {
++  NSImage* image = [NSImage imageWithSystemSymbolName:symbol
++                             accessibilityDescription:tip];
++  NSButton* button = [NSButton buttonWithImage:image
++                                        target:target
++                                        action:action];
++  button.bordered = NO;
++  button.imagePosition = NSImageOnly;
++  button.contentTintColor = NSColor.secondaryLabelColor;
++  button.toolTip = tip;
++  button.translatesAutoresizingMaskIntoConstraints = NO;
++  [button.widthAnchor constraintEqualToConstant:24].active = YES;
++  [button.heightAnchor constraintEqualToConstant:24].active = YES;
++  return button;
++}
++
++- (instancetype)initWithFrame:(NSRect)frame {
++  if ((self = [super initWithFrame:frame])) {
++    _icon = [NSImageView imageViewWithImage:[[NSImage alloc] init]];
++    _icon.imageScaling = NSImageScaleProportionallyUpOrDown;
++    _icon.translatesAutoresizingMaskIntoConstraints = NO;
++    [_icon.widthAnchor constraintEqualToConstant:16].active = YES;
++    [_icon.heightAnchor constraintEqualToConstant:16].active = YES;
++
++    _title = [NSTextField labelWithString:@""];
++    _title.font = [NSFont systemFontOfSize:NSFont.systemFontSize
++                                    weight:NSFontWeightSemibold];
++    _title.lineBreakMode = NSLineBreakByTruncatingTail;
++    [_title setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
++                                     forOrientation:
++                                         NSLayoutConstraintOrientationHorizontal];
++
++    _move = HeaderButton(@"sidebar.right", @"Move to Right", self,
++                         @selector(moveClicked:));
++    _close = HeaderButton(@"xmark", @"Close", self, @selector(closeClicked:));
++
++    NSStackView* stack =
++        [NSStackView stackViewWithViews:@[ _icon, _title, _move, _close ]];
++    stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
++    stack.alignment = NSLayoutAttributeCenterY;
++    stack.spacing = 6;
++    [stack setCustomSpacing:8 afterView:_icon];
++    [stack setHuggingPriority:NSLayoutPriorityDefaultLow
++               forOrientation:NSLayoutConstraintOrientationHorizontal];
++    stack.translatesAutoresizingMaskIntoConstraints = NO;
++    [self addSubview:stack];
++    [NSLayoutConstraint activateConstraints:@[
++      [stack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor
++                                          constant:12],
++      [stack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor
++                                           constant:-8],
++      [stack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
++    ]];
++  }
++  return self;
++}
++
++// The header is part of the panel, not the window's drag area.
++- (BOOL)mouseDownCanMoveWindow {
++  return NO;
++}
++
++- (void)setTitle:(NSString*)title icon:(NSImage*)icon {
++  _title.stringValue = title ?: @"";
++  _icon.image = icon;
++  _icon.hidden = icon == nil;
++}
++
++- (void)setDockedRight:(BOOL)dockedRight {
++  // The button moves the panel to the other side.
++  NSString* symbol = dockedRight ? @"sidebar.left" : @"sidebar.right";
++  NSString* tip = dockedRight ? @"Move to Left" : @"Move to Right";
++  _move.image = [NSImage imageWithSystemSymbolName:symbol
++                          accessibilityDescription:tip];
++  _move.toolTip = tip;
++}
++
++- (void)moveClicked:(id)sender {
++  if (_onMove) {
++    _onMove();
++  }
++}
++
++- (void)closeClicked:(id)sender {
++  if (_onClose) {
++    _onClose();
++  }
++}
++@end
++
++namespace safarium {
++
++struct SidePanelHeaderView::ObjCStorage {
++  SafariumSidePanelHeader* __strong header;
++};
++
++SidePanelHeaderView::SidePanelHeaderView(base::RepeatingClosure on_close,
++                                         base::RepeatingClosure on_move)
++    : objc_(std::make_unique<ObjCStorage>()) {
++  objc_->header = [[SafariumSidePanelHeader alloc] initWithFrame:NSZeroRect];
++  objc_->header.onClose = ^{
++    on_close.Run();
++  };
++  objc_->header.onMove = ^{
++    on_move.Run();
++  };
++  host_ = AddChildView(std::make_unique<views::NativeViewHost>());
++}
++
++SidePanelHeaderView::~SidePanelHeaderView() {
++  objc_->header.onClose = nil;
++  objc_->header.onMove = nil;
++}
++
++void SidePanelHeaderView::SetContent(const std::u16string& title,
++                                     const gfx::ImageSkia& icon) {
++  [objc_->header setTitle:base::SysUTF16ToNSString(title)
++                     icon:icon.isNull() ? nil : gfx::NSImageFromImageSkia(icon)];
++}
++
++void SidePanelHeaderView::SetDockedRight(bool docked_right) {
++  [objc_->header setDockedRight:docked_right];
++}
++
++void SidePanelHeaderView::AddedToWidget() {
++  auto* host = static_cast<views::NativeViewHost*>(host_.get());
++  if (!host->native_view()) {
++    host->Attach(gfx::NativeView(objc_->header));
++  }
++}
++
++void SidePanelHeaderView::Layout(PassKey) {
++  host_->SetBoundsRect(GetLocalBounds());
++}
++
++BEGIN_METADATA(SidePanelHeaderView)
++END_METADATA
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+index 51a9db5ad9..4f04f68572 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+@@ -21,10 +21,30 @@
+ 
+ namespace {
+ 
++views::WebView* FindWebView(views::View* view) {
++  if (auto* web_view = views::AsViewClass<views::WebView>(view)) {
++    return web_view;
++  }
++  for (views::View* child : view->children()) {
++    if (auto* web_view = FindWebView(child)) {
++      return web_view;
++    }
++  }
++  return nullptr;
++}
++
+ content::WebContents* GetContainingWebContents(views::View* view) {
+-  auto* web_view = view->GetViewByID(SidePanelWebUIView::kSidePanelWebViewId);
+-  CHECK(web_view);
+-  return views::AsViewClass<views::WebView>(web_view)->web_contents();
++  if (!view) {
++    return nullptr;
++  }
++  if (auto* web_view =
++          view->GetViewByID(SidePanelWebUIView::kSidePanelWebViewId)) {
++    return views::AsViewClass<views::WebView>(web_view)->web_contents();
++  }
++  // Extension side panels (ExtensionViewViews) and other entries don't use
++  // the WebUI side panel's view ID; take the first web view in the entry.
++  views::WebView* web_view = FindWebView(view);
++  return web_view ? web_view->web_contents() : nullptr;
+ }
+ 
+ }  // namespace
+@@ -33,7 +53,11 @@ WebUIBrowserSidePanelUI::WebUIBrowserSidePanelUI(
+     BrowserWindowInterface* browser)
+     : SidePanelUIBase(browser) {}
+ 
+-WebUIBrowserSidePanelUI::~WebUIBrowserSidePanelUI() = default;
++WebUIBrowserSidePanelUI::~WebUIBrowserSidePanelUI() {
++  // Take a lent view back so it is destroyed with its entry, not later by
++  // the window.
++  ReclaimLentView();
++}
+ 
+ void WebUIBrowserSidePanelUI::Close(SidePanelEntryHideReason reason,
+                                     bool supress_animations) {
+@@ -83,7 +107,10 @@ content::WebContents* WebUIBrowserSidePanelUI::GetWebContentsForId(
+     SidePanelEntryId entry_id) const {
+   // Current assumes one and only one side panel is showing.
+   // TODO(webium): find web contents for entry_id.
+-  return GetContainingWebContents(current_side_panel_view_.get());
++  return GetContainingWebContents(current_side_panel_view_
++                                      ? current_side_panel_view_.get()
++                                      : const_cast<views::View*>(
++                                            lent_view_.view()));
+ }
+ 
+ void WebUIBrowserSidePanelUI::Show(
+@@ -122,6 +149,7 @@ void WebUIBrowserSidePanelUI::PopulateSidePanel(
+     SidePanelEntry* entry,
+     std::optional<std::unique_ptr<views::View>> content_view) {
+   if (IsSidePanelShowing()) {
++    ReclaimLentView();
+     SidePanelEntry* previous_entry = GetEntryForUniqueKey(*current_key());
+     if (previous_entry) {
+       previous_entry->OnEntryWillHide(SidePanelEntryHideReason::kReplaced);
+@@ -185,6 +213,7 @@ void WebUIBrowserSidePanelUI::MaybeShowEntryOnTabStripModelChanged(
+           current_key()->key &&
+       current_key()->tab_handle) {
+     auto* active_entry = old_contextual_registry->GetActiveEntry().value();
++    ReclaimLentView();
+     active_entry->CacheView(std::move(current_side_panel_view_));
+     current_side_panel_view_.reset();
+   }
+@@ -213,11 +242,28 @@ void WebUIBrowserSidePanelUI::OnSidePanelClosed() {
+ 
+   SidePanelRegistry::From(browser())->ResetActiveEntry();
+ 
++  ReclaimLentView();
+   current_side_panel_view_.reset();
+   // TODO(webium): Clear cached views for registry entries for global and
+   // contextual registries.
+ }
+ 
++std::unique_ptr<views::View> WebUIBrowserSidePanelUI::LendCurrentView(
++    LentViewReclaimer reclaimer) {
++  lent_view_.SetView(current_side_panel_view_.get());
++  lent_view_reclaimer_ = std::move(reclaimer);
++  return std::move(current_side_panel_view_);
++}
++
++void WebUIBrowserSidePanelUI::ReclaimLentView() {
++  if (current_side_panel_view_ || !lent_view_.view() ||
++      !lent_view_reclaimer_) {
++    return;
++  }
++  current_side_panel_view_ = lent_view_reclaimer_.Run();
++  lent_view_.SetView(nullptr);
++}
++
+ WebUIBrowserWindow* WebUIBrowserSidePanelUI::GetWebUIBrowserWindow() {
+   return WebUIBrowserWindow::FromBrowser(browser());
+ }
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.h b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.h
+index a1ba3daed5..c402771a0d 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.h
+@@ -5,6 +5,9 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_SIDE_PANEL_UI_H_
+ #define CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_SIDE_PANEL_UI_H_
+ 
++#include "base/functional/callback.h"
++#include "ui/views/view_tracker.h"
++
+ #include <optional>
+ 
+ #include "chrome/browser/ui/side_panel/side_panel_entry.h"
+@@ -39,7 +42,17 @@ class WebUIBrowserSidePanelUI : public SidePanelUIBase {
+ 
+   void OnSidePanelClosed();
+ 
++  // Safarium native UI: the window hosts the current entry's view itself
++  // (extension side panels only load once their view is in a widget). The
++  // view is lent out and taken back via `reclaimer` whenever this class needs
++  // to cache or drop it.
++  using LentViewReclaimer =
++      base::RepeatingCallback<std::unique_ptr<views::View>()>;
++  std::unique_ptr<views::View> LendCurrentView(LentViewReclaimer reclaimer);
++
+  private:
++  void ReclaimLentView();
++
+   // SidePanelUIBase:
+   void Show(const UniqueKey& entry,
+             std::optional<SidePanelOpenTrigger> open_trigger,
+@@ -60,6 +73,8 @@ class WebUIBrowserSidePanelUI : public SidePanelUIBase {
+   // Instead, WebViews containing WebContents will be hosted by Webium in a
+   // guest contents.
+   std::unique_ptr<views::View> current_side_panel_view_;
++  views::ViewTracker lent_view_;
++  LentViewReclaimer lent_view_reclaimer_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_SIDE_PANEL_UI_H_
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index b6891a3572..743319eea5 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -40,6 +40,10 @@
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
+ #include "chrome/browser/ui/webui_browser/browser_elements_webui_browser.h"
+ #include "chrome/browser/ui/webui_browser/safarium_features.h"
++#include "extensions/browser/extension_registry.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/side_panel/side_panel_enums.h"
++#include "extensions/common/extension.h"
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_client_view.h"
+@@ -209,6 +213,15 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+     safarium_root_ =
+         widget_->SetClientContentsView(std::make_unique<safarium::SafariumRootView>(
+             browser_->GetProfile(), safarium_controller_.get()));
++    safarium_root_->SetSidePanelCloseCallback(base::BindRepeating(
++        [](WebUIBrowserWindow* window) {
++          if (WebUIBrowserSidePanelUI* side_panel_ui =
++                  window->GetWebUIBrowserSidePanelUI()) {
++            side_panel_ui->Close(SidePanelEntryHideReason::kSidePanelClosed,
++                                 /*supress_animations=*/false);
++          }
++        },
++        base::Unretained(this)));
+   } else {
+     web_view->LoadInitialURL(GURL(chrome::kChromeUIWebuiBrowserURL));
+     web_view_ = widget_->SetClientContentsView(std::move(web_view));
+@@ -1431,12 +1444,56 @@ WebUIBrowserUI* WebUIBrowserWindow::GetWebUIBrowserUI() const {
+ }
+ 
+ void WebUIBrowserWindow::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
++  if (safarium_root_) {
++    // Safarium: the side panel's contents go in the native window's own
++    // dock (left/right of the page) instead of the WebUI shell.
++    WebUIBrowserSidePanelUI* side_panel_ui = GetWebUIBrowserSidePanelUI();
++    content::WebContents* contents =
++        side_panel_ui
++            ? side_panel_ui->GetWebContentsForId(side_panel_entry_key.id())
++            : nullptr;
++    if (!contents) {
++      return;
++    }
++    contents->SetColorProviderSource(this);
++    std::u16string title;
++    gfx::ImageSkia icon;
++    if (std::optional<extensions::ExtensionId> extension_id =
++            side_panel_entry_key.extension_id()) {
++      if (const extensions::Extension* extension =
++              extensions::ExtensionRegistry::Get(browser_->GetProfile())
++                  ->enabled_extensions()
++                  .GetByID(*extension_id)) {
++        title = base::UTF8ToUTF16(extension->name());
++      }
++      icon = extensions_container_->GetNativeToolbarActionIcon(*extension_id);
++    }
++    if (title.empty()) {
++      title = contents->GetTitle();
++    }
++    safarium_root_->ShowSidePanel(
++        side_panel_ui->LendCurrentView(base::BindRepeating(
++            [](base::WeakPtr<safarium::SafariumRootView> root)
++                -> std::unique_ptr<views::View> {
++              return root ? root->TakeSidePanelContent() : nullptr;
++            },
++            safarium_root_->GetWeakPtr())),
++        title, icon);
++    return;
++  }
+   if (GetWebUIBrowserUI()) {
+     GetWebUIBrowserUI()->ShowSidePanel(side_panel_entry_key);
+   }
+ }
+ 
+ void WebUIBrowserWindow::CloseSidePanel() {
++  if (safarium_root_) {
++    safarium_root_->HideSidePanel();
++    if (WebUIBrowserSidePanelUI* side_panel_ui = GetWebUIBrowserSidePanelUI()) {
++      side_panel_ui->OnSidePanelClosed();  // The WebUI shell's async ack.
++    }
++    return;
++  }
+   if (GetWebUIBrowserUI()) {
+     GetWebUIBrowserUI()->CloseSidePanel();
+   }

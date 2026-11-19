@@ -1,0 +1,1730 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:17:59 -0500
+Subject: [PATCH 2/5] Safarium: Safari-style tab bar, hover cards, tab
+ tear-off, settings cleanup
+
+Work from 2026-11-18 on top of the first checkpoint:
+
+- Settings > Appearance shows only options Safarium honors. Mode now
+  drives the native window appearance; "Show home button" adds/removes
+  the toolbar Home item (and follows Customize Toolbar); "Customize your
+  toolbar" opens AppKit's customization palette. Theme, bookmarks bar,
+  tab styling/position, tab search, side panel, split view are hidden.
+- Tab capsule matches Safari 26: no nested glass (Tabs toolbar item
+  opts out of the Liquid Glass platter), flat gray band, hairline active
+  pill, tabs touching (1pt gap), max tab width 24% of the window, equal
+  widths while tabs stay >= 260pt.
+- Native hover cards (NSPopover): title, origin, page preview, optional
+  memory usage; follow the pointer across tabs; correct in full screen.
+  Hover card settings re-enabled.
+- Tab dragging tracks the whole press itself (reorder works after the
+  pressed tab activates). Click edits the address, press-and-move drags
+  the tab; arrow cursor unless editing. Dragging a tab out of the bar
+  hides it there and shows a page thumbnail; dropping outside the bar
+  moves it to a new window, dragging back reinserts it.
+- Blank tab: hover close button replaces the magnifier when they would
+  overlap.
+
+Local checkpoint only; not intended for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../appearance_page/appearance_page.html.ts   |  11 +-
+ .../appearance_page/appearance_page.ts        |   9 +
+ .../ui/webui/settings/appearance_handler.cc   |   7 +
+ .../settings_localized_strings_provider.cc    |   5 +
+ .../ui/webui/settings/settings_utils.h        |   5 +
+ .../ui/webui/settings/settings_utils_mac.mm   |  13 +
+ chrome/browser/ui/webui_browser/BUILD.gn      |   1 +
+ .../safarium_tab_bar_controller.cc            | 176 +++-
+ .../safarium_tab_bar_controller.h             |  50 +-
+ .../safarium_tab_bar_host_mac.mm              | 786 +++++++++++++++++-
+ .../ui/webui_browser/webui_browser_window.cc  |  20 +
+ .../ui/webui_browser/webui_browser_window.h   |   3 +
+ 12 files changed, 1056 insertions(+), 30 deletions(-)
+
+diff --git a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+index 8755288ddf..dee32a6f2c 100644
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -10,6 +10,7 @@ export function getHtml(this: SettingsAppearancePageElement) {
+   return html`<!--_html_template_start_-->
+ <settings-section page-title="$i18n{appearancePageTitle}">
+   <div route-path="default">
++    ${this.showChromeOnlySettings_ ? html`
+     <div class="settings-row first" id="themeRow"
+         ?hidden="${!this.pageVisibility_.setTheme}">
+       <cr-link-row id="openTheme" class="first"
+@@ -48,11 +49,13 @@ export function getHtml(this: SettingsAppearancePageElement) {
+       </div>
+ </if>
+     </div>
++    ` : ''}
+     <div id="toolbarRow" class="settings-row">
+       <cr-link-row id="customizeToolbar" label="$i18n{customizeToolbar}"
+           @click="${this.onCustomizeToolbarClick_}" external>
+       </cr-link-row>
+-      ${this.showResetPinnedActionsButton_ ? html`
++      ${this.showChromeOnlySettings_ &&
++          this.showResetPinnedActionsButton_ ? html`
+         <div class="separator"></div>
+         <cr-button id="resetPinnedToolbarActions"
+             @click="${this.onResetPinnedToolbarActionsClick_}"
+@@ -117,6 +120,7 @@ export function getHtml(this: SettingsAppearancePageElement) {
+         </settings-radio-group>
+       </div>
+     ` : ''}
++    ${this.showChromeOnlySettings_ ? html`
+     <div class="hr"
+         ?hidden="${!this.showHr_(
+             this.pageVisibility_.homeButton,
+@@ -224,12 +228,14 @@ export function getHtml(this: SettingsAppearancePageElement) {
+         ?hidden="${this.showOrganizerPanelEnabled_}">
+     </settings-toggle-button>
+ 
++    ` : ''}
+     ${this.showCtrlTabMru_ ? html`
+       <settings-toggle-button class="hr" id="ctrlTabMru"
+           pref-key="browser.ctrl_tab_mru" label="$i18n{ctrlTabMru}">
+       </settings-toggle-button>
+     ` : ''}
+ 
++    ${this.showChromeOnlySettings_ ? html`
+     <div class="cr-row">$i18n{sidePanelPosition}</div>
+     <div class="list-frame indented-rows">
+       ${this.configurableSidePanels_.map(item => html`
+@@ -264,6 +270,7 @@ export function getHtml(this: SettingsAppearancePageElement) {
+         </settings-dropdown-menu>
+       </div>
+     </div>
++    ` : ''}
+     ${!this.showHoverCardImagesOption_ ? html`
+       <div class="hr" ?hidden="${!this.pageVisibility_.hoverCard}"></div>
+       <settings-toggle-button id="hoverCardMemoryUsageToggle"
+@@ -337,10 +344,12 @@ export function getHtml(this: SettingsAppearancePageElement) {
+     </settings-toggle-button>
+ </if>
+   </div>
++    ${this.showChromeOnlySettings_ ? html`
+   <settings-toggle-button class="hr" id="splitViewDragAndDrop"
+       pref-key="browser.split_view_drag_and_drop_enabled"
+       label="$i18n{allowSplitViewDragAndDrop}">
+   </settings-toggle-button>
++    ` : ''}
+ </settings-section>
+ ${this.showManagedThemeDialog_ ? html`
+   <managed-dialog @close="${this.onManagedDialogClose_}"
+diff --git a/chrome/browser/resources/settings/appearance_page/appearance_page.ts b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
+index 775ff04ac2..447a5d0ba5 100644
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
+@@ -209,6 +209,15 @@ export class SettingsAppearancePageElement extends
+       undefined;
+   private accessor showForwardButtonPref_: PrefObject<boolean>|undefined =
+       undefined;
++  // Safarium's native AppKit UI has no Chrome themes, bookmarks bar, tab
++  // strip options, side panel, hover cards or split view, so those settings
++  // would do nothing there.
++  // <if expr="pp_if('is_safarium_branded')">
++  protected readonly showChromeOnlySettings_: boolean = false;
++  // </if>
++  // <if expr="not pp_if('is_safarium_branded')">
++  protected readonly showChromeOnlySettings_: boolean = true;
++  // </if>
+   protected accessor showHomeButtonPref_: PrefObject<boolean>|undefined =
+       undefined;
+   private accessor sidePanelAlignmentOverridesPref_:
+diff --git a/chrome/browser/ui/webui/settings/appearance_handler.cc b/chrome/browser/ui/webui/settings/appearance_handler.cc
+index ab26700958..66feb8eb8a 100644
+--- a/chrome/browser/ui/webui/settings/appearance_handler.cc
++++ b/chrome/browser/ui/webui/settings/appearance_handler.cc
+@@ -94,6 +94,13 @@ void AppearanceHandler::OpenCustomizeChrome(const base::ListValue& args) {
+ 
+ void AppearanceHandler::OpenCustomizeChromeToolbarSection(
+     const base::ListValue& args) {
++#if BUILDFLAG(IS_MAC)
++  // Safarium's toolbar is a native NSToolbar: use AppKit's Customize Toolbar.
++  if (settings_utils::RunNativeToolbarCustomization(
++          web_ui()->GetWebContents())) {
++    return;
++  }
++#endif
+   BrowserWindowInterface* browser =
+       GlobalBrowserCollection::GetInstance()->GetLastActiveBrowser();
+   CHECK(browser);
+diff --git a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+index 6060ccd8e4..f5a305d793 100644
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -685,7 +685,12 @@ void AddAppearanceStrings(content::WebUIDataSource* html_source,
+                          zoom::GetPresetZoomFactorsAsJSON());
+   html_source->AddBoolean(
+       "showHoverCardImagesOption",
++#if BUILDFLAG(SAFARIUM_BRANDING)
++      // Safarium's native hover cards always support page previews.
++      true);
++#else
+       base::FeatureList::IsEnabled(features::kTabHoverCardImages));
++#endif
+   html_source->AddBoolean("showGlassEffectEnabled",
+                           features::IsGlassFrameEnabled());
+   html_source->AddBoolean("showOrganizerPanelEnabled",
+diff --git a/chrome/browser/ui/webui/settings/settings_utils.h b/chrome/browser/ui/webui/settings/settings_utils.h
+index 9c9fba4b2e..c625e2c715 100644
+--- a/chrome/browser/ui/webui/settings/settings_utils.h
++++ b/chrome/browser/ui/webui/settings/settings_utils.h
+@@ -58,6 +58,11 @@ void MaybeNotifySettingsCustomEvent(content::WebUI* web_ui,
+ 
+ #if BUILDFLAG(IS_MAC)
+ void ValidateSavedFonts(PrefService* prefs);
++
++// Opens the macOS Customize Toolbar sheet of the window showing
++// `web_contents`, if that window has a user-customizable NSToolbar (the
++// Safarium native UI). Returns false when there is none.
++bool RunNativeToolbarCustomization(content::WebContents* web_contents);
+ #endif
+ 
+ }  // namespace settings_utils
+diff --git a/chrome/browser/ui/webui/settings/settings_utils_mac.mm b/chrome/browser/ui/webui/settings/settings_utils_mac.mm
+index 5dec27a944..3464f73473 100644
+--- a/chrome/browser/ui/webui/settings/settings_utils_mac.mm
++++ b/chrome/browser/ui/webui/settings/settings_utils_mac.mm
+@@ -17,6 +17,8 @@
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/gfx/native_ui_types.h"
+ 
+ namespace {
+ void ValidateFontFamily(PrefService* prefs, const char* family_pref_name) {
+@@ -38,6 +40,17 @@ void ValidateFontFamily(PrefService* prefs, const char* family_pref_name) {
+ 
+ namespace settings_utils {
+ 
++bool RunNativeToolbarCustomization(content::WebContents* web_contents) {
++  NSWindow* window =
++      web_contents ? web_contents->GetTopLevelNativeWindow().GetNativeNSWindow()
++                   : nil;
++  if (!window.toolbar.allowsUserCustomization) {
++    return false;
++  }
++  [window runToolbarCustomizationPalette:nil];
++  return true;
++}
++
+ void ShowNetworkProxySettings(content::WebContents* web_contents) {
+   base::mac::OpenSystemSettingsPane(
+       base::mac::SystemSettingsPane::kNetwork_Proxies);
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index 03cf3a886b..f4dacf075a 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -110,6 +110,7 @@ source_set("impl") {
+     ":webui_browser",
+     "//base",
+     "//build:safarium_buildflags",
++    "//components/prefs",
+     "//cc",
+     "//chrome/browser/app_mode",
+     "//chrome/browser/autocomplete",
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index df9cc24f10..75b55840d2 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -10,13 +10,22 @@
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "ui/base/base_window.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/ui/performance_controls/tab_resource_usage_tab_helper.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/text/bytes_formatting.h"
+ #include "chrome/common/webui_url_constants.h"
++#include "components/prefs/pref_service.h"
+ #include "chrome/common/chrome_isolated_world_ids.h"
+ #include "components/omnibox/browser/autocomplete_classifier.h"
+ #include "components/favicon/content/content_favicon_driver.h"
+@@ -40,6 +49,31 @@ namespace safarium {
+ 
+ namespace {
+ 
++// Same rules as Chrome's hover card (HoverCardAnchorTarget).
++std::u16string HoverCardDomain(content::WebContents* contents) {
++  const GURL& committed = contents->GetLastCommittedURL();
++  const GURL url = committed.is_valid() ? committed : contents->GetVisibleURL();
++  if (url.SchemeIsFile()) {
++    return l10n_util::GetStringUTF16(IDS_HOVER_CARD_FILE_URL_SOURCE);
++  }
++  if (url.SchemeIsBlob()) {
++    return l10n_util::GetStringUTF16(IDS_HOVER_CARD_BLOB_URL_SOURCE);
++  }
++  if (url.SchemeIs(url::kViewSourceScheme)) {
++    return l10n_util::GetStringUTF16(IDS_HOVER_CARD_VIEW_SOURCE_URL_SOURCE);
++  }
++  if (url.IsAboutBlank()) {
++    return url::kAboutBlankURL16;
++  }
++  return url_formatter::FormatUrl(
++      url,
++      url_formatter::kFormatUrlOmitDefaults |
++          url_formatter::kFormatUrlOmitHTTPS |
++          url_formatter::kFormatUrlOmitTrivialSubdomains |
++          url_formatter::kFormatUrlTrimAfterHost,
++      base::UnescapeRule::NORMAL, nullptr, nullptr, nullptr);
++}
++
+ bool IsNewTabPage(const GURL& url) {
+   return url.SchemeIs(content::kChromeUIScheme) &&
+          (url.host() == chrome::kChromeUINewTabHost ||
+@@ -179,6 +213,11 @@ TabBarController::TabBarController(
+     base::WeakPtr<WebUIToolbarExtensionsContainer> extensions)
+     : browser_(browser), extensions_(std::move(extensions)) {
+   browser_->GetTabStripModel()->AddObserver(this);
++  pref_change_registrar_.Init(browser_->GetProfile()->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kShowHomeButton,
++      base::BindRepeating(&TabBarController::PushState,
++                          base::Unretained(this)));
+ }
+ 
+ TabBarController::~TabBarController() = default;
+@@ -190,6 +229,8 @@ void TabBarController::SetView(TabBarView* view) {
+ 
+ BarState TabBarController::BuildState() const {
+   BarState state;
++  state.show_home_button =
++      browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kShowHomeButton);
+   TabStripModel* model = browser_->GetTabStripModel();
+   state.active_index = model->active_index();
+   for (int i = 0; i < model->count(); ++i) {
+@@ -220,6 +261,7 @@ BarState TabBarController::BuildState() const {
+         item.title = item.display_url;
+       }
+     }
++    item.domain = HoverCardDomain(contents);
+     item.pinned = model->IsTabPinned(i);
+     item.id = model->GetTabAtIndex(i)->GetHandle().raw_value();
+     if (auto* favicon_driver =
+@@ -287,8 +329,6 @@ void TabBarController::UpdateThumbnailSubscriptions() {
+     return;
+   }
+   TabStripModel* model = browser_->GetTabStripModel();
+-  content::WebContents* active = model->GetActiveWebContents();
+-  const gfx::Size viewport = active ? active->GetSize() : gfx::Size();
+   std::map<int64_t, std::unique_ptr<ThumbnailImage::Subscription>> kept;
+   for (int i = 0; i < model->count(); ++i) {
+     tabs::TabInterface* tab = model->GetTabAtIndex(i);
+@@ -302,14 +342,7 @@ void TabBarController::UpdateThumbnailSubscriptions() {
+     if (!helper || !helper->thumbnail()) {
+       continue;
+     }
+-    // The native window only attaches the active tab to its WebView. Give
+-    // never-attached tabs a viewport so Chromium's background thumbnail
+-    // capturer can start without selecting the tab.
+-    content::WebContents* contents = tab->GetContents();
+-    if (contents != active && !contents->WasDiscarded() &&
+-        contents->GetSize().IsEmpty() && !viewport.IsEmpty()) {
+-      contents->Resize(gfx::Rect(viewport));
+-    }
++    PrepareForThumbnail(tab);
+     scoped_refptr<ThumbnailImage> thumbnail = helper->thumbnail();
+     std::unique_ptr<ThumbnailImage::Subscription> subscription =
+         thumbnail->Subscribe();
+@@ -322,6 +355,110 @@ void TabBarController::UpdateThumbnailSubscriptions() {
+   thumbnail_subscriptions_ = std::move(kept);
+ }
+ 
++void TabBarController::PrepareForThumbnail(tabs::TabInterface* tab) const {
++  // The native window only attaches the active tab to its WebView. Give
++  // never-attached tabs a viewport so Chromium's background thumbnail
++  // capturer can start without selecting the tab.
++  content::WebContents* active =
++      browser_->GetTabStripModel()->GetActiveWebContents();
++  const gfx::Size viewport = active ? active->GetSize() : gfx::Size();
++  content::WebContents* contents = tab->GetContents();
++  if (contents != active && !contents->WasDiscarded() &&
++      contents->GetSize().IsEmpty() && !viewport.IsEmpty()) {
++    contents->Resize(gfx::Rect(viewport));
++  }
++}
++
++tabs::TabInterface* TabBarController::FindTab(int64_t tab_id) const {
++  TabStripModel* model = browser_->GetTabStripModel();
++  for (int i = 0; i < model->count(); ++i) {
++    tabs::TabInterface* tab = model->GetTabAtIndex(i);
++    if (tab->GetHandle().raw_value() == tab_id) {
++      return tab;
++    }
++  }
++  return nullptr;
++}
++
++bool TabBarController::HoverCardImagesEnabled() const {
++  PrefService* local_state = g_browser_process->local_state();
++  return local_state && local_state->GetBoolean(prefs::kHoverCardImagesEnabled);
++}
++
++gfx::Size TabBarController::ActivePageSize() const {
++  content::WebContents* active =
++      browser_->GetTabStripModel()->GetActiveWebContents();
++  return active ? active->GetSize() : gfx::Size();
++}
++
++bool TabBarController::HoverCardMemoryUsageEnabled() const {
++  PrefService* local_state = g_browser_process->local_state();
++  return local_state &&
++         local_state->GetBoolean(prefs::kHoverCardMemoryUsageEnabled);
++}
++
++void TabBarController::SetHoverCardTab(int64_t tab_id) {
++  if (tab_id == hover_card_tab_) {
++    return;
++  }
++  hover_card_tab_ = tab_id;
++  hover_card_thumbnail_.reset();
++  resource_usage_observation_.Reset();
++  tabs::TabInterface* tab = tab_id ? FindTab(tab_id) : nullptr;
++  if (!tab) {
++    return;
++  }
++  // Like Chrome: no preview for the tab already on screen.
++  if (HoverCardImagesEnabled() && !tab->IsActivated()) {
++    if (ThumbnailTabHelper* helper = ThumbnailTabHelper::From(tab);
++        helper && helper->thumbnail()) {
++      PrepareForThumbnail(tab);
++      scoped_refptr<ThumbnailImage> thumbnail = helper->thumbnail();
++      hover_card_thumbnail_ = thumbnail->Subscribe();
++      hover_card_thumbnail_->SetUncompressedImageCallback(base::BindRepeating(
++          [](base::WeakPtr<TabBarController> self, int64_t id,
++             gfx::ImageSkia image) {
++            if (self && self->view_ && self->hover_card_tab_ == id) {
++              self->view_->HoverCardThumbnailChanged(id, image);
++            }
++          },
++          weak_factory_.GetWeakPtr(), tab_id));
++      thumbnail->RequestThumbnailImage();
++    }
++  }
++  if (HoverCardMemoryUsageEnabled()) {
++    PushHoverCardMemory();  // Last known value right away.
++    if (auto* collector = TabResourceUsageCollector::Get()) {
++      resource_usage_observation_.Observe(collector);
++      collector->ImmediatelyRefreshMetrics(tab->GetContents());
++    }
++  }
++}
++
++void TabBarController::OnTabResourceMetricsRefreshed() {
++  PushHoverCardMemory();
++}
++
++void TabBarController::PushHoverCardMemory() {
++  tabs::TabInterface* tab = hover_card_tab_ ? FindTab(hover_card_tab_) : nullptr;
++  TabResourceUsageTabHelper* helper =
++      tab ? TabResourceUsageTabHelper::From(tab) : nullptr;
++  if (!helper || !view_) {
++    return;
++  }
++  scoped_refptr<const TabResourceUsage> usage = helper->resource_usage();
++  if (!usage || !usage->memory_usage().is_positive()) {
++    return;
++  }
++  const bool high = usage->is_high_memory_usage();
++  view_->HoverCardMemoryChanged(
++      hover_card_tab_,
++      l10n_util::GetStringFUTF16(high ? IDS_HOVERCARD_TAB_HIGH_MEMORY_USAGE
++                                      : IDS_HOVERCARD_TAB_MEMORY_USAGE,
++                                 ui::FormatBytes(usage->memory_usage())),
++      high);
++}
++
+ void TabBarController::OnThumbnail(int64_t tab_id, gfx::ImageSkia image) {
+   if (view_) {
+     view_->ThumbnailChanged(tab_id, image);
+@@ -368,6 +505,21 @@ void TabBarController::MoveTab(int from, int to) {
+   }
+ }
+ 
++gfx::NativeWindow TabBarController::MoveTabToNewWindow(int index) {
++  TabStripModel* model = browser_->GetTabStripModel();
++  if (!model->ContainsIndex(index) || model->count() < 2) {
++    return gfx::NativeWindow();
++  }
++  content::WebContents* contents = model->GetWebContentsAt(index);
++  chrome::MoveTabsToNewWindow(browser_, {index});
++  BrowserWindowInterface* moved =
++      GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(contents);
++  if (!moved || moved == browser_ || !moved->GetWindow()) {
++    return gfx::NativeWindow();
++  }
++  return moved->GetWindow()->GetNativeWindow();
++}
++
+ void TabBarController::ExecuteCommand(int command_id) {
+   chrome::ExecuteCommand(browser_, command_id);
+ }
+@@ -381,6 +533,10 @@ bool TabBarController::IsCommandEnabled(int command_id) const {
+   return chrome::IsCommandEnabled(browser_, command_id);
+ }
+ 
++void TabBarController::SetShowHomeButton(bool show) {
++  browser_->GetProfile()->GetPrefs()->SetBoolean(prefs::kShowHomeButton, show);
++}
++
+ Profile* TabBarController::GetProfile() const {
+   return browser_->GetProfile();
+ }
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index ca295bc13a..60bebe435c 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -12,17 +12,25 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/performance_controls/tab_resource_usage_collector.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "url/gurl.h"
+ #include "ui/gfx/image/image.h"
++#include "ui/gfx/native_ui_types.h"
+ 
+ class BrowserWindowInterface;
+ class Profile;
+ class WebUIToolbarExtensionsContainer;
+ 
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
+ namespace safarium {
+ 
+ struct TabItem {
+@@ -40,6 +48,8 @@ struct TabItem {
+   bool pinned = false;
+   // True when `display_url` holds search terms (search results page).
+   bool is_search = false;
++  // Origin shown in the hover card (Chrome's hover-card formatting).
++  std::u16string domain;
+ };
+ 
+ struct BarState {
+@@ -51,6 +61,8 @@ struct BarState {
+   bool is_loading = false;
+   // Active tab load progress in [0, 1] (Safari's blue line in the pill).
+   double load_progress = 0;
++  // Settings > Appearance > Show home button (the toolbar's Home item).
++  bool show_home_button = false;
+ };
+ 
+ // Implemented by the platform view (AppKit on Mac).
+@@ -61,10 +73,17 @@ class TabBarView {
+   virtual void FocusAddressField() = 0;
+   // Tab overview thumbnails (only while SetWantsThumbnails(true)).
+   virtual void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) {}
++  // Hover card for `tab_id` (see TabBarController::SetHoverCardTab).
++  virtual void HoverCardThumbnailChanged(int64_t tab_id,
++                                         const gfx::ImageSkia& image) {}
++  virtual void HoverCardMemoryChanged(int64_t tab_id,
++                                      const std::u16string& text,
++                                      bool high_usage) {}
+ };
+ 
+ class TabBarController : public TabStripModelObserver,
+-                         public content::WebContentsObserver {
++                         public content::WebContentsObserver,
++                         public TabResourceUsageCollector::Observer {
+  public:
+   TabBarController(BrowserWindowInterface* browser,
+                    base::WeakPtr<WebUIToolbarExtensionsContainer> extensions);
+@@ -79,9 +98,21 @@ class TabBarController : public TabStripModelObserver,
+   void ActivateTab(int index);
+   void CloseTab(int index);
+   void MoveTab(int from, int to);
++  // Moves the tab into a new browser window (tab tear-off) and returns that
++  // window, or a null window if the tab can't be moved (e.g. the last tab).
++  gfx::NativeWindow MoveTabToNewWindow(int index);
++
+   // Subscribes to Chromium's tab thumbnails (the hover-card capture
+   // service) for every tab while the tab overview is shown.
+   void SetWantsThumbnails(bool wants);
++  // Tab whose hover card is shown (0: none). Feeds the view its preview
++  // image and memory usage, as enabled in Settings > Appearance.
++  void SetHoverCardTab(int64_t tab_id);
++  bool HoverCardImagesEnabled() const;
++  bool HoverCardMemoryUsageEnabled() const;
++  // Size of the active tab's page (the preview aspect ratio). Not the
++  // NSWindow: in full screen the toolbar lives in its own window.
++  gfx::Size ActivePageSize() const;
+   // Snapshot of the active tab's page (for the overview zoom animation).
+   // Calls back with an empty image if none is available.
+   void CaptureActiveTab(base::OnceCallback<void(gfx::ImageSkia)> callback);
+@@ -105,6 +136,9 @@ class TabBarController : public TabStripModelObserver,
+   void Stop();
+   // Gives keyboard focus back to the active tab's page.
+   void FocusActiveTab();
++  // Mirrors the toolbar's Home item into the show-home-button pref (the user
++  // added or removed it with Customize Toolbar).
++  void SetShowHomeButton(bool show);
+ 
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(TabStripModel* tab_strip_model,
+@@ -113,6 +147,9 @@ class TabBarController : public TabStripModelObserver,
+   void OnTabChangedAt(tabs::TabInterface* tab,
+                       TabChangeType change_type) override;
+ 
++  // TabResourceUsageCollector::Observer:
++  void OnTabResourceMetricsRefreshed() override;
++
+   // content::WebContentsObserver (observes the active tab):
+   void LoadProgressChanged(double progress) override;
+   void DidStopLoading() override;
+@@ -121,11 +158,22 @@ class TabBarController : public TabStripModelObserver,
+   BarState BuildState() const;
+   void UpdateThumbnailSubscriptions();
+   void OnThumbnail(int64_t tab_id, gfx::ImageSkia image);
++  tabs::TabInterface* FindTab(int64_t tab_id) const;
++  // Gives a never-attached background tab a viewport so Chromium's
++  // background thumbnail capturer can run.
++  void PrepareForThumbnail(tabs::TabInterface* tab) const;
++  void PushHoverCardMemory();
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const base::WeakPtr<WebUIToolbarExtensionsContainer> extensions_;
+   raw_ptr<TabBarView> view_ = nullptr;
+   bool wants_thumbnails_ = false;
++  PrefChangeRegistrar pref_change_registrar_;
++  int64_t hover_card_tab_ = 0;
++  std::unique_ptr<ThumbnailImage::Subscription> hover_card_thumbnail_;
++  base::ScopedObservation<TabResourceUsageCollector,
++                          TabResourceUsageCollector::Observer>
++      resource_usage_observation_{this};
+   std::map<int64_t, std::unique_ptr<ThumbnailImage::Subscription>>
+       thumbnail_subscriptions_;
+   base::WeakPtrFactory<TabBarController> weak_factory_{this};
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index cf0e2567ad..6c6a7c6264 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -43,17 +43,26 @@
+ constexpr CGFloat kControlHeight = 36;  // Round buttons and capsules.
+ constexpr CGFloat kTabHeight = 30;      // Tabs inside the capsule.
+ constexpr CGFloat kCapsuleInset = 3;
+-constexpr CGFloat kGap = 8;
++// Between tabs. Safari 26 tabs touch: a hovered tab's fill meets the current
++// tab's outline (measured ~0.5pt apart).
++constexpr CGFloat kGap = 1;
+ constexpr CGFloat kPinnedTabWidth = 40;
+ // Below this the strip overflows and scrolls (Safari 26: ~118pt tabs,
+ // measured from a screen recording).
+ constexpr CGFloat kMinTabWidth = 118;
+ constexpr CGFloat kRevealMargin = 24;
+ constexpr CGFloat kDragThreshold = 4;
++// Dragging a tab this far above/below the tab bar tears it off into a new
++// window (Safari).
++constexpr CGFloat kTearOffDistance = 30;
+ constexpr CGFloat kMinActiveTabWidth = 260;
+ // With few tabs Safari gives every tab the same width, at most this, and
+ // centers the strip (measured from Safari 26 screenshots: ~240pt).
+-constexpr CGFloat kMaxTabWidth = 240;
++constexpr CGFloat kMaxTabWidth = 240;  // Fallback / minimum item width.
++// Safari 26: with few tabs every tab gets the same width, at most ~24% of
++// the window width (measured: ~355pt in a ~1470pt-wide window, ~240pt in a
++// ~1000pt one). With more tabs the strip fills the free toolbar space.
++constexpr CGFloat kMaxTabWidthFraction = 0.24;
+ constexpr CGFloat kIconSize = 16;
+ constexpr CGFloat kDimmedAlpha = 0.35;
+ // Measured from a Safari 26 recording: tabs reflow with a fast-start,
+@@ -230,6 +239,9 @@ - (void)addressFieldTextChanged;
+ - (void)tabMouseDown:(NSEvent*)event cell:(NSView*)cell;
+ // Tab overview: the current tab's pill becomes an empty search field.
+ - (void)setOverviewMode:(BOOL)overview;
++- (void)hideHoverCard;
++- (void)hoverCardThumbnail:(NSImage*)image forTab:(int64_t)tabId;
++- (void)hoverCardMemory:(NSString*)text high:(BOOL)high forTab:(int64_t)tabId;
+ - (void)updatePreferredWidthAnimated:(BOOL)animated;
+ - (void)tabMouseDragged:(NSEvent*)event;
+ - (void)tabMouseUp:(NSEvent*)event;
+@@ -266,7 +278,7 @@ - (void)textDidChange:(NSNotification*)notification {
+ // editing, clicks place the caret as usual.
+ - (void)mouseDown:(NSEvent*)event {
+   if (!self.editing) {
+-    _pressForwarded = YES;
++    // The bar tracks the whole press (drag and release) itself.
+     [self.bar tabMouseDown:event cell:nil];
+     return;
+   }
+@@ -311,6 +323,33 @@ - (BOOL)editing {
+   return self.window && self.currentEditor != nil;
+ }
+ 
++// Idle, the field is part of the tab: arrow cursor like Safari (the field
++// editor shows the I-beam once editing).
++- (void)resetCursorRects {
++  if (self.editing) {
++    [super resetCursorRects];
++  }
++}
++
++- (void)cursorUpdate:(NSEvent*)event {
++  if (self.editing) {
++    [super cursorUpdate:event];
++  } else {
++    [NSCursor.arrowCursor set];
++  }
++}
++
++// Like Safari, a press on the idle field belongs to the tab: press-and-move
++// drags the tab, and editing starts on release (-tabMouseUp:). NSWindow
++// would otherwise make the field first responder on mouse down, starting
++// an edit session before we know whether this is a click or a drag.
++- (BOOL)acceptsFirstResponder {
++  if (!self.editing && NSApp.currentEvent.type == NSEventTypeLeftMouseDown) {
++    return NO;
++  }
++  return [super acceptsFirstResponder];
++}
++
+ - (BOOL)becomeFirstResponder {
+   BOOL ok = [super becomeFirstResponder];
+   if (ok && [self syncEditingState]) {
+@@ -321,6 +360,9 @@ - (BOOL)becomeFirstResponder {
+ 
+ - (BOOL)syncEditingState {
+   const BOOL live = self.editing;
++  if (live != _editing) {
++    [self.window invalidateCursorRectsForView:self];
++  }
+   if (live && !_editing) {
+     _editing = YES;
+     _userModified = NO;
+@@ -369,6 +411,9 @@ @interface SafariumTabCell : NSView
+ @property(nonatomic, strong) NSButton* closeButton;
+ @property(nonatomic, strong) NSView* separator;  // At the cell's left edge.
+ @property(nonatomic, readonly) BOOL hovered;
++// Tab identity and hover-card origin text (from TabItem).
++@property(nonatomic) int64_t tabId;
++@property(nonatomic, copy) NSString* domain;
+ - (void)setIcon:(NSImage*)icon;
+ // Where the [icon + title] group was last drawn, in cell coordinates. The
+ // bar sets this for the tab that was just deactivated (its content was drawn
+@@ -412,6 +457,8 @@ - (void)animateContentOnNextLayout {
+ @synthesize titleLabel = _titleLabel;
+ @synthesize closeButton = _closeButton;
+ @synthesize separator = _separator;
++@synthesize tabId = _tabId;
++@synthesize domain = _domain;
+ 
+ - (BOOL)hovered {
+   return _hovered;
+@@ -598,10 +645,12 @@ - (void)refreshColors {
+       fill = [NSColor.labelColor colorWithAlphaComponent:0.07];
+     }
+     self.layer.backgroundColor = fill.CGColor;
+-    self.layer.shadowColor = NSColor.blackColor.CGColor;
+-    self.layer.shadowOpacity = self->_active ? 0.10 : 0;
+-    self.layer.shadowRadius = 2;
+-    self.layer.shadowOffset = CGSizeMake(0, -0.5);
++    // Safari outlines the active pill with an even hairline instead of a
++    // drop shadow (an offset shadow makes the gray band look uneven).
++    self.layer.shadowOpacity = 0;
++    self.layer.borderWidth = self->_active ? 0.5 : 0;
++    self.layer.borderColor =
++        [NSColor.labelColor colorWithAlphaComponent:0.14].CGColor;
+     self->_separator.layer.backgroundColor =
+         [NSColor.labelColor colorWithAlphaComponent:0.12].CGColor;
+   }];
+@@ -669,6 +718,180 @@ - (BOOL)mouseDownCanMoveWindow {
+ // ---------------------------------------------------------------------------
+ // The bar.
+ 
++// --- Hover card -------------------------------------------------------------
++// Chrome's tab hover card (title, origin, optional page preview and memory
++// usage), shown as a native NSPopover under the hovered tab.
++
++namespace {
++constexpr CGFloat kHoverCardWidth = 240;
++constexpr CGFloat kHoverCardPadding = 12;
++// Like Chrome: a short wait before the first card, then cards follow the
++// pointer from tab to tab without delay while one is shown.
++constexpr NSTimeInterval kHoverCardShowDelay = 0.5;
++constexpr NSTimeInterval kHoverCardHideDelay = 0.15;
++}  // namespace
++
++@interface SafariumHoverCardController : NSViewController
++@property(nonatomic, readonly) int64_t tabId;
++- (void)setTabId:(int64_t)tabId
++           title:(NSString*)title
++          domain:(NSString*)domain
++         favicon:(NSImage*)favicon
++    previewSlot:(BOOL)previewSlot
++     aspectRatio:(CGFloat)aspectRatio;
++- (void)setPreview:(NSImage*)image;
++- (void)setMemoryText:(NSString*)text high:(BOOL)high;
++@end
++
++@implementation SafariumHoverCardController {
++  int64_t _tabId;
++  NSStackView* _stack;
++  NSView* _preview;              // Page thumbnail (layer contents).
++  NSImageView* _previewIcon;     // Favicon placeholder until it arrives.
++  NSLayoutConstraint* _previewHeight;
++  NSTextField* _title;
++  NSTextField* _domain;
++  NSTextField* _memory;
++}
++
++- (int64_t)tabId {
++  return _tabId;
++}
++
++- (void)loadView {
++  NSView* root = [[NSView alloc] initWithFrame:NSZeroRect];
++
++  _preview = [[NSView alloc] initWithFrame:NSZeroRect];
++  _preview.wantsLayer = YES;
++  _preview.layer.cornerRadius = 8;
++  _preview.layer.masksToBounds = YES;
++  _preview.layer.contentsGravity = kCAGravityResizeAspectFill;
++  _preview.translatesAutoresizingMaskIntoConstraints = NO;
++  _previewIcon = [NSImageView imageViewWithImage:[[NSImage alloc] init]];
++  _previewIcon.translatesAutoresizingMaskIntoConstraints = NO;
++  _previewIcon.imageScaling = NSImageScaleProportionallyUpOrDown;
++  [_preview addSubview:_previewIcon];
++  [NSLayoutConstraint activateConstraints:@[
++    [_previewIcon.centerXAnchor constraintEqualToAnchor:_preview.centerXAnchor],
++    [_previewIcon.centerYAnchor constraintEqualToAnchor:_preview.centerYAnchor],
++    [_previewIcon.widthAnchor constraintEqualToConstant:24],
++    [_previewIcon.heightAnchor constraintEqualToConstant:24],
++  ]];
++  _previewHeight = [_preview.heightAnchor constraintEqualToConstant:0];
++  _previewHeight.active = YES;
++
++  _title = [NSTextField wrappingLabelWithString:@""];
++  _title.font = [NSFont systemFontOfSize:NSFont.systemFontSize
++                                  weight:NSFontWeightSemibold];
++  _title.maximumNumberOfLines = 2;
++  _title.lineBreakMode = NSLineBreakByTruncatingTail;
++  _title.preferredMaxLayoutWidth = kHoverCardWidth - 2 * kHoverCardPadding;
++
++  _domain = [NSTextField labelWithString:@""];
++  _domain.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
++  _domain.textColor = NSColor.secondaryLabelColor;
++  _domain.lineBreakMode = NSLineBreakByTruncatingHead;
++
++  _memory = [NSTextField labelWithString:@""];
++  _memory.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
++  _memory.textColor = NSColor.secondaryLabelColor;
++  _memory.hidden = YES;
++
++  _stack = [NSStackView stackViewWithViews:@[ _preview, _title, _domain, _memory ]];
++  _stack.orientation = NSUserInterfaceLayoutOrientationVertical;
++  _stack.alignment = NSLayoutAttributeLeading;
++  _stack.spacing = 2;
++  [_stack setCustomSpacing:8 afterView:_preview];
++  [_stack setCustomSpacing:6 afterView:_domain];
++  _stack.detachesHiddenViews = YES;
++  _stack.edgeInsets = NSEdgeInsetsMake(kHoverCardPadding, kHoverCardPadding,
++                                       kHoverCardPadding, kHoverCardPadding);
++  _stack.translatesAutoresizingMaskIntoConstraints = NO;
++  [root addSubview:_stack];
++  const CGFloat inner = kHoverCardWidth - 2 * kHoverCardPadding;
++  [NSLayoutConstraint activateConstraints:@[
++    [_stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
++    [_stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
++    [_stack.topAnchor constraintEqualToAnchor:root.topAnchor],
++    [_stack.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
++    [root.widthAnchor constraintEqualToConstant:kHoverCardWidth],
++    [_preview.widthAnchor constraintEqualToConstant:inner],
++    [_title.widthAnchor constraintEqualToConstant:inner],
++    [_domain.widthAnchor constraintEqualToConstant:inner],
++    [_memory.widthAnchor constraintEqualToConstant:inner],
++  ]];
++  self.view = root;
++}
++
++- (void)setTabId:(int64_t)tabId
++           title:(NSString*)title
++          domain:(NSString*)domain
++         favicon:(NSImage*)favicon
++    previewSlot:(BOOL)previewSlot
++     aspectRatio:(CGFloat)aspectRatio {
++  [self view];
++  const BOOL sameTab = _tabId == tabId;
++  _tabId = tabId;
++  _title.stringValue = title ?: @"";
++  _domain.stringValue = domain ?: @"";
++  _domain.hidden = domain.length == 0;
++  _preview.hidden = !previewSlot;
++  const CGFloat inner = kHoverCardWidth - 2 * kHoverCardPadding;
++  _previewHeight.constant =
++      previewSlot ? round(inner / MAX(aspectRatio, 0.5)) : 0;
++  if (!sameTab) {
++    [self setPreview:nil];
++    _previewIcon.image = favicon;
++    _memory.hidden = YES;
++  }
++  [self updateSize];
++}
++
++- (void)updateSize {
++  // Computed from the visible rows: the view's fittingSize follows the size
++  // NSPopover last gave it, so a card never shrank after one with a preview.
++  CGFloat height = 2 * kHoverCardPadding;
++  if (!_preview.hidden) {
++    height += _previewHeight.constant + [_stack customSpacingAfterView:_preview];
++  }
++  height += _title.fittingSize.height;
++  NSTextField* last = _title;
++  if (!_domain.hidden) {
++    height += _stack.spacing + _domain.fittingSize.height;
++    last = _domain;
++  }
++  if (!_memory.hidden) {
++    height += (last == _domain ? [_stack customSpacingAfterView:_domain]
++                               : _stack.spacing) +
++              _memory.fittingSize.height;
++  }
++  self.preferredContentSize = NSMakeSize(kHoverCardWidth, ceil(height));
++}
++
++- (void)setPreview:(NSImage*)image {
++  [self view];
++  [self.view.effectiveAppearance performAsCurrentDrawingAppearance:^{
++    self->_preview.layer.backgroundColor =
++        image ? nil
++              : [NSColor.labelColor colorWithAlphaComponent:0.06].CGColor;
++  }];
++  _preview.layer.contents = image;
++  _previewIcon.hidden = image != nil;
++}
++
++- (void)setMemoryText:(NSString*)text high:(BOOL)high {
++  [self view];
++  _memory.stringValue = text ?: @"";
++  _memory.textColor =
++      high ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
++  const BOOL wasHidden = _memory.hidden;
++  _memory.hidden = text.length == 0;
++  if (wasHidden != _memory.hidden) {
++    [self updateSize];
++  }
++}
++@end
++
+ @implementation SafariumTabBarView {
+   // Weak; cleared by the host before the controller goes away.
+   RAW_PTR_EXCLUSION safarium::TabBarController* _controller;
+@@ -688,6 +911,14 @@ @implementation SafariumTabBarView {
+   __weak SafariumTabCell* _pressCell;
+   BOOL _pressWasActive;
+   CGFloat _pressStartX;   // Strip coordinates.
++  CGFloat _pressStartY;   // Window coordinates.
++  NSImage* _dragSnapshot;  // Page of the dragged tab (drag-out preview).
++  NSUInteger _dragSnapshotGeneration;
++  NSPanel* _dragPreview;   // Thumbnail following the pointer outside the bar.
++  // While a tab is dragged outside the bar it stays in the window (its page
++  // remains on screen, like Safari) but the bar doesn't show it.
++  int64_t _outsideTabId;
++  safarium::BarState _lastState;  // Latest state from the controller.
+   __weak SafariumTabCell* _dragCell;
+   CGFloat _dragGrab;      // Press offset inside the dragged tab.
+   CGFloat _dragX;         // Dragged tab's current x (strip).
+@@ -720,6 +951,11 @@ @implementation SafariumTabBarView {
+   BOOL _didInitialLayout;
+   BOOL _activeHovered;
+   BOOL _activeChangedThisLayout;
++  // Hover card.
++  NSPopover* _hoverCard;
++  SafariumHoverCardController* _hoverCardContent;
++  __weak SafariumTabCell* _hoverCardCell;  // Cell the card is (to be) for.
++  NSUInteger _hoverCardGeneration;
+   BOOL _overviewMode;
+   NSLayoutConstraint* _maxWidth;
+   NSLayoutConstraint* _preferredWidth;
+@@ -746,6 +982,10 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _activeIndex = -1;
+ 
+     _tabsGlass = MakeGlass(kControlHeight / 2);
++    // Safari's tab capsule is a flat gray fill. A glass layer here adds a
++    // second refracting rim inside the toolbar's own glass, whose uneven
++    // edge highlights make the gray band look thicker in some places.
++    _tabsGlass.hidden = YES;
+     [self addSubview:_tabsGlass];
+     _tabsTint = [[SafariumTintView alloc] initWithFrame:NSZeroRect];
+     _tabsTint.wantsLayer = YES;
+@@ -857,8 +1097,9 @@ - (void)refreshColors {
+   [self.effectiveAppearance performAsCurrentDrawingAppearance:^{
+     self->_progressLine.layer.backgroundColor =
+         NSColor.controlAccentColor.CGColor;
++    // Safari 26 (light): capsule #E8E8E8, pill hairline #DBDBDB.
+     self->_tabsTint.layer.backgroundColor =
+-        [NSColor.labelColor colorWithAlphaComponent:0.10].CGColor;
++        [NSColor.labelColor colorWithAlphaComponent:0.09].CGColor;
+     self->_focusRing.layer.borderColor =
+         [NSColor.controlAccentColor colorWithAlphaComponent:0.55].CGColor;
+   }];
+@@ -894,7 +1135,36 @@ - (void)layout {
+   [self relayoutAnimated:NO];
+ }
+ 
+-// Width this view would like: every tab at kMaxTabWidth. The toolbar
++- (CGFloat)maxTabWidth {
++  if (!self.window) {
++    return kMaxTabWidth;
++  }
++  return MAX(kMinTabWidth,
++             floor(NSWidth(self.window.frame) * kMaxTabWidthFraction));
++}
++
++// The max tab width follows the window width.
++- (void)viewDidMoveToWindow {
++  [super viewDidMoveToWindow];
++  [NSNotificationCenter.defaultCenter
++      removeObserver:self
++                name:NSWindowDidResizeNotification
++              object:nil];
++  if (self.window) {
++    [NSNotificationCenter.defaultCenter
++        addObserver:self
++           selector:@selector(windowDidResize:)
++               name:NSWindowDidResizeNotification
++             object:self.window];
++    [self updatePreferredWidthAnimated:NO];
++  }
++}
++
++- (void)windowDidResize:(NSNotification*)notification {
++  [self updatePreferredWidthAnimated:NO];
++}
++
++// Width this view would like: every tab at -maxTabWidth. The toolbar
+ // centers the item (centeredItemIdentifiers) and gives it at most what is
+ // free; when it gets less, tabs shrink (current tab stays wider) and then
+ // the strip scrolls.
+@@ -907,7 +1177,7 @@ - (CGFloat)preferredStripWidth {
+   // With no tabs yet, size for one.
+   const NSUInteger normal = _cells.count ? _cells.count - pinned : 1;
+   return 2 * kCapsuleInset + pinned * kPinnedTabWidth +
+-         normal * kMaxTabWidth + kGap * (n - 1);
++         normal * [self maxTabWidth] + kGap * (n - 1);
+ }
+ 
+ - (void)updatePreferredWidthAnimated:(BOOL)animated {
+@@ -1102,12 +1372,19 @@ - (void)relayoutAnimated:(BOOL)animated {
+                               _cells[_activeIndex].pinned;
+   CGFloat activeW = 0;
+   CGFloat unit = 0;
++  const CGFloat maxTabWidth = [self maxTabWidth];
+   const BOOL fitsAtMax =
+-      normalCount > 0 && available >= normalCount * kMaxTabWidth;
++      normalCount > 0 && available >= normalCount * maxTabWidth;
+   if (fitsAtMax) {
+     // Few tabs: all the same width; the strip shrinks and is centered.
+-    unit = kMaxTabWidth;
+-    activeW = kMaxTabWidth;
++    unit = maxTabWidth;
++    activeW = maxTabWidth;
++  } else if (normalCount > 0 && !activeIsPinned &&
++             available / normalCount >= kMinActiveTabWidth) {
++    // Safari: while tabs can stay at least kMinActiveTabWidth wide they all
++    // share the space equally (the current tab is not wider yet).
++    unit = floor(available / normalCount);
++    activeW = unit;
+   } else if (normalCount > 0) {
+     if (activeIsPinned) {
+       unit = MAX(kMinTabWidth, available / normalCount);
+@@ -1314,10 +1591,15 @@ - (void)relayoutAnimated:(BOOL)animated {
+   _activeIcon.image =
+       magnifier ? Symbol(@"magnifyingglass", 12, NSFontWeightMedium)
+                 : _activeIdleImage;
+-  // Blank tab: 🔍 next to the placeholder even when idle.
++  // Blank tab: 🔍 next to the placeholder even when idle. Like Safari, when
++  // the pill is too narrow for the hover ⊗ to sit left of the centered
++  // [🔍 placeholder] group, the ⊗ replaces the 🔍 instead of overlapping it.
++  const BOOL closeCoversIcon =
++      !hasPage && _activeHovered && gx < NSMaxX(leading) + 4;
+   const BOOL iconVisible =
+       editing ? !_activeHovered
+-              : (_addressField.displayText.length > 0 || !hasPage);
++              : ((_addressField.displayText.length > 0 || !hasPage) &&
++                 !closeCoversIcon);
+   const NSRect iconFrame = editing ? leading : idleIcon;
+   if (editing && (_activeHovered || _enteringEdit)) {
+     // Entering edit mode: the icon fades out where it is (the URL prefix
+@@ -1423,6 +1705,41 @@ - (void)animateAddressTextForEditing:(BOOL)editing {
+ // State
+ 
+ - (void)updateState:(const safarium::BarState&)state {
++  _lastState = state;
++  [self applyVisibleState];
++}
++
++// `_lastState` minus the tab being dragged outside the bar.
++- (void)applyVisibleState {
++  if (!_outsideTabId) {
++    [self applyState:_lastState];
++    return;
++  }
++  safarium::BarState visible = _lastState;
++  visible.tabs.clear();
++  visible.active_index = -1;
++  for (size_t i = 0; i < _lastState.tabs.size(); ++i) {
++    if (_lastState.tabs[i].id == _outsideTabId) {
++      continue;
++    }
++    if (static_cast<int>(i) == _lastState.active_index) {
++      visible.active_index = static_cast<int>(visible.tabs.size());
++    }
++    visible.tabs.push_back(_lastState.tabs[i]);
++  }
++  [self applyState:visible];
++}
++
++- (NSInteger)modelIndexOfTab:(int64_t)tabId {
++  for (size_t i = 0; i < _lastState.tabs.size(); ++i) {
++    if (_lastState.tabs[i].id == tabId) {
++      return static_cast<NSInteger>(i);
++    }
++  }
++  return -1;
++}
++
++- (void)applyState:(const safarium::BarState&)state {
+   const BOOL navChanged = _canGoBack != state.can_go_back ||
+                           _canGoForward != state.can_go_forward;
+   _canGoBack = state.can_go_back;
+@@ -1475,6 +1792,9 @@ - (void)updateState:(const safarium::BarState&)state {
+     if (gone == _pressCell) {
+       _pressCell = nil;
+     }
++    if (gone == _hoverCardCell) {
++      [self hideHoverCard];
++    }
+     [NSAnimationContext
+         runAnimationGroup:^(NSAnimationContext* context) {
+           context.duration = kAnimationDuration;
+@@ -1512,7 +1832,8 @@ - (void)updateState:(const safarium::BarState&)state {
+     cell.pinned = t.pinned;
+     cell.active = t.active;
+     cell.titleLabel.stringValue = title;
+-    cell.toolTip = title;
++    cell.tabId = t.id;
++    cell.domain = base::SysUTF16ToNSString(t.domain);
+     [cell setIcon:favicon];
+     cell.needsLayout = YES;
+     if (t.active) {
+@@ -1624,6 +1945,7 @@ - (void)setOverviewMode:(BOOL)overview {
+     return;
+   }
+   _overviewMode = overview;
++  [self hideHoverCard];
+   if (_addressField.editing) {
+     [self.window makeFirstResponder:nil];
+   }
+@@ -1662,6 +1984,7 @@ - (void)setOverviewMode:(BOOL)overview {
+ }
+ 
+ - (void)tabCellHoverChanged:(SafariumTabCell*)cell {
++  [self hoverCardCellHoverChanged:cell];
+   if (!cell.active || _activeHovered == cell.hovered) {
+     return;
+   }
+@@ -1672,8 +1995,124 @@ - (void)tabCellHoverChanged:(SafariumTabCell*)cell {
+   }];
+ }
+ 
++// --- Hover card ---
++
++- (BOOL)hoverCardAllowed {
++  // No cards while a button is held (e.g. a torn-off window following the
++  // pointer: the popover would stay where the window was).
++  return _controller && NSApp.isActive && self.window.isVisible &&
++         NSEvent.pressedMouseButtons == 0 && !_overviewMode &&
++         !_addressField.editing && !_dragCell && !_pressCell;
++}
++
++- (void)hoverCardCellHoverChanged:(SafariumTabCell*)cell {
++  if (cell.hovered) {
++    if (![self hoverCardAllowed]) {
++      return;
++    }
++    _hoverCardCell = cell;
++    const NSUInteger generation = ++_hoverCardGeneration;
++    if (_hoverCard.shown) {
++      [self showHoverCardForCell:cell];  // Follow the pointer at once.
++      return;
++    }
++    __weak SafariumTabBarView* weakSelf = self;
++    __weak SafariumTabCell* weakCell = cell;
++    dispatch_after(
++        dispatch_time(DISPATCH_TIME_NOW,
++                      (int64_t)(kHoverCardShowDelay * NSEC_PER_SEC)),
++        dispatch_get_main_queue(), ^{
++          SafariumTabBarView* strongSelf = weakSelf;
++          SafariumTabCell* strongCell = weakCell;
++          if (strongSelf && strongCell && strongCell.hovered &&
++              strongSelf->_hoverCardGeneration == generation &&
++              [strongSelf hoverCardAllowed]) {
++            [strongSelf showHoverCardForCell:strongCell];
++          }
++        });
++    return;
++  }
++  if (cell != _hoverCardCell) {
++    return;
++  }
++  // Grace period: moving onto the neighbouring tab keeps the card up.
++  const NSUInteger generation = ++_hoverCardGeneration;
++  __weak SafariumTabBarView* weakSelf = self;
++  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
++                               (int64_t)(kHoverCardHideDelay * NSEC_PER_SEC)),
++                 dispatch_get_main_queue(), ^{
++                   SafariumTabBarView* strongSelf = weakSelf;
++                   if (strongSelf &&
++                       strongSelf->_hoverCardGeneration == generation) {
++                     [strongSelf hideHoverCard];
++                   }
++                 });
++}
++
++- (void)showHoverCardForCell:(SafariumTabCell*)cell {
++  if (!cell.window || cell.tabId == 0) {
++    return;
++  }
++  if (!_hoverCard) {
++    _hoverCardContent = [[SafariumHoverCardController alloc] init];
++    _hoverCard = [[NSPopover alloc] init];
++    _hoverCard.behavior = NSPopoverBehaviorApplicationDefined;
++    _hoverCard.animates = YES;
++    _hoverCard.contentViewController = _hoverCardContent;
++  }
++  const BOOL wantsPreview = !cell.active && _controller->HoverCardImagesEnabled();
++  const gfx::Size page = _controller->ActivePageSize();
++  [_hoverCardContent setTabId:cell.tabId
++                        title:cell.titleLabel.stringValue
++                       domain:cell.domain
++                      favicon:cell.iconView.image
++                  previewSlot:wantsPreview
++                  aspectRatio:page.height() > 0
++                                  ? CGFloat(page.width()) / page.height()
++                                  : 16.0 / 10.0];
++  _hoverCard.contentSize = _hoverCardContent.preferredContentSize;
++  // Anchored to the bar (not the cell) so moving to another tab only moves
++  // the popover instead of closing and reopening it.
++  const NSRect rect = [self convertRect:cell.bounds fromView:cell];
++  if (_hoverCard.shown) {
++    _hoverCard.positioningRect = rect;
++  } else {
++    [_hoverCard showRelativeToRect:rect
++                            ofView:self
++                     preferredEdge:NSRectEdgeMinY];
++  }
++  _controller->SetHoverCardTab(cell.tabId);
++}
++
++- (void)hideHoverCard {
++  ++_hoverCardGeneration;
++  _hoverCardCell = nil;
++  if (_hoverCard.shown) {
++    [_hoverCard close];
++  }
++  if (_controller) {
++    _controller->SetHoverCardTab(0);
++  }
++}
++
++- (void)hoverCardThumbnail:(NSImage*)image forTab:(int64_t)tabId {
++  if (_hoverCard.shown && _hoverCardContent.tabId == tabId) {
++    [_hoverCardContent setPreview:image];
++  }
++}
++
++- (void)hoverCardMemory:(NSString*)text high:(BOOL)high forTab:(int64_t)tabId {
++  if (_hoverCard.shown && _hoverCardContent.tabId == tabId) {
++    [_hoverCardContent setMemoryText:text high:high];
++    _hoverCard.contentSize = _hoverCardContent.preferredContentSize;
++  }
++}
++
+ - (void)addressFieldEditingChanged {
+   const BOOL editing = _addressField.editing;
++  if (editing) {
++    [self hideHoverCard];
++  }
+   _revealActive = editing;
+   _enteringEdit = editing;
+   [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
+@@ -1744,6 +2183,7 @@ - (void)tabMouseDown:(NSEvent*)event cell:(NSView*)pressedView {
+   for (SafariumTabCell* c in _cells) {
+     [c refreshHoverFromPointer];
+   }
++  [self hideHoverCard];
+   _pressWasActive = cell.active;
+   if (!cell.active) {
+     // Like Safari, the tab is selected on press; a drag then moves it.
+@@ -1752,7 +2192,32 @@ - (void)tabMouseDown:(NSEvent*)event cell:(NSView*)pressedView {
+   _pressCell = cell;
+   _pressStartX =
+       [_strip convertPoint:event.locationInWindow fromView:nil].x;
++  _pressStartY = event.locationInWindow.y;
+   _dragGrab = _pressStartX - NSMinX(cell.frame);
++  [self trackPressUntilMouseUp];
++}
++
++// Follows this press until the button is released. Activating the pressed
++// tab swaps the page view under the window, after which AppKit no longer
++// delivers the press's drag/up events to the cell, so read them here
++// (the standard AppKit mouse-tracking loop).
++- (void)trackPressUntilMouseUp {
++  while (_pressCell) {
++    NSEvent* next =
++        [NSApp nextEventMatchingMask:NSEventMaskLeftMouseDragged |
++                                     NSEventMaskLeftMouseUp
++                           untilDate:NSDate.distantFuture
++                              inMode:NSEventTrackingRunLoopMode
++                             dequeue:YES];
++    if (!next) {
++      break;
++    }
++    if (next.type == NSEventTypeLeftMouseUp) {
++      [self tabMouseUp:next];
++      break;
++    }
++    [self tabMouseDragged:next];  // May tear the tab off (own loop).
++  }
+ }
+ 
+ - (void)tabMouseDragged:(NSEvent*)event {
+@@ -1763,13 +2228,24 @@ - (void)tabMouseDragged:(NSEvent*)event {
+   const CGFloat x =
+       [_strip convertPoint:event.locationInWindow fromView:nil].x;
+   if (!_dragCell) {
+-    if (fabs(x - _pressStartX) < kDragThreshold || _cells.count < 2) {
++    if ((fabs(x - _pressStartX) < kDragThreshold &&
++         fabs(event.locationInWindow.y - _pressStartY) < kDragThreshold) ||
++        _cells.count < 2) {
+       return;
+     }
+     if (_addressField.editing) {
+       [self.window makeFirstResponder:nil];
+     }
+     _dragCell = cell;
++    [NSCursor.arrowCursor set];
++    [self captureDragSnapshot];
++  }
++  const CGFloat barY = [self convertPoint:event.locationInWindow fromView:nil].y;
++  if ((barY < -kTearOffDistance ||
++       barY > NSHeight(self.bounds) + kTearOffDistance) &&
++      !cell.pinned && _cells.count >= 2) {
++    [self dragTabOutsideBar];
++    return;
+   }
+   const CGFloat width = NSWidth(cell.frame);
+   _dragX = MAX(kCapsuleInset,
+@@ -1799,6 +2275,180 @@ - (void)tabMouseDragged:(NSEvent*)event {
+   }
+ }
+ 
++// The dragged tab's page, for the preview shown outside the bar (the dragged
++// tab is the active one: pressing a tab selects it).
++- (void)captureDragSnapshot {
++  _dragSnapshot = nil;
++  const NSUInteger generation = ++_dragSnapshotGeneration;
++  __weak SafariumTabBarView* weakSelf = self;
++  _controller->CaptureActiveTab(base::BindOnce(
++      [](__weak SafariumTabBarView* weak_self, NSUInteger generation,
++         gfx::ImageSkia image) {
++        SafariumTabBarView* strongSelf = weak_self;
++        if (strongSelf && !image.isNull() &&
++            strongSelf->_dragSnapshotGeneration == generation) {
++          strongSelf->_dragSnapshot = gfx::NSImageFromImageSkia(image);
++          [strongSelf updateDragPreviewImage];
++        }
++      },
++      weakSelf, generation));
++}
++
++- (void)updateDragPreviewImage {
++  if (!_dragPreview) {
++    return;
++  }
++  CALayer* layer = _dragPreview.contentView.layer;
++  layer.contents = _dragSnapshot;
++  layer.backgroundColor =
++      _dragSnapshot ? nil : NSColor.windowBackgroundColor.CGColor;
++}
++
++- (void)showDragPreviewAt:(NSPoint)screenPoint {
++  if (!_dragPreview) {
++    // Safari 26: a ~115pt-wide page thumbnail follows the pointer.
++    _dragPreview = [[NSPanel alloc]
++        initWithContentRect:NSMakeRect(0, 0, 120, 75)
++                  styleMask:NSWindowStyleMaskBorderless |
++                            NSWindowStyleMaskNonactivatingPanel
++                    backing:NSBackingStoreBuffered
++                      defer:NO];
++    _dragPreview.opaque = NO;
++    _dragPreview.backgroundColor = NSColor.clearColor;
++    _dragPreview.hasShadow = YES;
++    _dragPreview.ignoresMouseEvents = YES;
++    _dragPreview.level = NSPopUpMenuWindowLevel;
++    _dragPreview.releasedWhenClosed = NO;
++    NSView* content = _dragPreview.contentView;
++    content.wantsLayer = YES;
++    content.layer.cornerRadius = 6;
++    content.layer.masksToBounds = YES;
++    content.layer.contentsGravity = kCAGravityResizeAspectFill;
++  }
++  const NSSize image = _dragSnapshot ? _dragSnapshot.size : NSMakeSize(16, 10);
++  const CGFloat width = 120;
++  const CGFloat height = round(width * image.height / MAX(image.width, 1));
++  [_dragPreview setFrame:NSMakeRect(screenPoint.x - width / 2,
++                                    screenPoint.y - height / 2, width,
++                                    MIN(MAX(height, 50), 120))
++                 display:NO];
++  [self updateDragPreviewImage];
++  [_dragPreview orderFront:nil];
++}
++
++- (void)hideDragPreview {
++  [_dragPreview orderOut:nil];
++}
++
++- (BOOL)screenPointIsOverBar:(NSPoint)screenPoint {
++  if (!self.window) {
++    return NO;
++  }
++  const NSPoint p = [self convertPoint:[self.window
++                                           convertPointFromScreen:screenPoint]
++                              fromView:nil];
++  return NSPointInRect(p, NSInsetRect(self.bounds, 0, -8));
++}
++
++// Where a tab dropped at `screenPoint` goes: before the first tab whose
++// middle is right of the pointer.
++- (NSInteger)insertionIndexForScreenPoint:(NSPoint)screenPoint {
++  const CGFloat x =
++      [_strip convertPoint:[self.window convertPointFromScreen:screenPoint]
++                  fromView:nil]
++          .x;
++  NSInteger index = 0;
++  for (const NSRect& slot : _slotFrames) {
++    if (NSMidX(slot) < x) {
++      ++index;
++    }
++  }
++  return index;
++}
++
++// Safari: dragged out of the bar, the tab leaves this window and a page
++// thumbnail follows the pointer. Dragging back over the bar puts the tab
++// back under the pointer (the drag then continues as a reorder); releasing
++// outside the bar opens the tab in a new window there.
++- (void)dragTabOutsideBar {
++  SafariumTabCell* cell = _dragCell;
++  const int64_t tabId = cell.tabId;
++  const NSSize windowSize = self.window.frame.size;
++  [self hideHoverCard];
++  _dragCell = nil;
++  _pressCell = nil;
++  _outsideTabId = tabId;
++  [self applyVisibleState];  // The tab leaves the bar; its page stays.
++  [NSCursor.arrowCursor set];
++  [self showDragPreviewAt:NSEvent.mouseLocation];
++  while (YES) {
++    NSEvent* next =
++        [NSApp nextEventMatchingMask:NSEventMaskLeftMouseDragged |
++                                     NSEventMaskLeftMouseUp
++                           untilDate:NSDate.distantFuture
++                              inMode:NSEventTrackingRunLoopMode
++                             dequeue:YES];
++    const NSPoint screen = NSEvent.mouseLocation;
++    const NSInteger from = [self modelIndexOfTab:tabId];
++    if (!_controller || from < 0) {  // Tab closed meanwhile.
++      _outsideTabId = 0;
++      [self hideDragPreview];
++      [self applyVisibleState];
++      return;
++    }
++    const BOOL released = !next || next.type == NSEventTypeLeftMouseUp;
++    if ([self screenPointIsOverBar:screen]) {
++      // Back over the bar: the tab returns where the pointer is (slots of
++      // the visible tabs = model indices with this tab left out).
++      [self hideDragPreview];
++      const NSInteger to =
++          MIN([self insertionIndexForScreenPoint:screen],
++              (NSInteger)_lastState.tabs.size() - 1);
++      _outsideTabId = 0;
++      if (to != from) {
++        _controller->MoveTab(from, to);  // -> -updateState:
++      } else {
++        [self applyVisibleState];
++      }
++      SafariumTabCell* back = _activeCell;
++      if (released || !back) {
++        [self refreshHoverAfterDelay];
++        return;  // Dropped on the bar.
++      }
++      // Keep dragging it (as a reorder) from where the pointer is.
++      _pressCell = back;
++      _dragCell = back;
++      _pressWasActive = YES;
++      _dragGrab = back.index >= 0 && back.index < (NSInteger)_slotFrames.size()
++                      ? NSWidth(_slotFrames[back.index]) / 2
++                      : kMaxTabWidth / 2;
++      const NSPoint inWindow = [self.window convertPointFromScreen:screen];
++      _pressStartX = [_strip convertPoint:inWindow fromView:nil].x;
++      _pressStartY = inWindow.y;
++      [self tabMouseDragged:next];
++      return;  // -trackPressUntilMouseUp continues with _pressCell.
++    }
++    if (released) {
++      [self hideDragPreview];
++      NSWindow* window = _controller->MoveTabToNewWindow(from).GetNativeNSWindow();
++      _outsideTabId = 0;
++      [self applyVisibleState];
++      if (window) {
++        // The new window's (single, centered) tab lands under the pointer.
++        const CGFloat kPointerFromTop = 26;
++        [window setFrame:NSMakeRect(screen.x - windowSize.width / 2,
++                                    screen.y + kPointerFromTop -
++                                        windowSize.height,
++                                    windowSize.width, windowSize.height)
++                 display:YES];
++        [window makeKeyAndOrderFront:nil];
++      }
++      return;
++    }
++    [self showDragPreviewAt:screen];
++  }
++}
++
+ - (void)tabMouseUp:(NSEvent*)event {
+   SafariumTabCell* cell = _pressCell;
+   _pressCell = nil;
+@@ -2729,6 +3379,20 @@ - (NSCollectionViewItem*)collectionView:(NSCollectionView*)collectionView
+ }  // namespace
+ 
+ 
++// The Tabs item draws its own flat gray capsule like Safari's. On macOS 26
++// AppKit may also wrap it in a Liquid Glass platter, whose refracting rim
++// around our capsule makes the gray band look uneven. `glassBehavior` is
++// AppKit-private (macOS 26); 0 = no platter, the value AppKit itself uses for
++// plain custom views. Harmless on systems that never call it.
++@interface SafariumTabsToolbarItem : NSToolbarItem
++@end
++
++@implementation SafariumTabsToolbarItem
++- (NSUInteger)glassBehavior {
++  return 0;
++}
++@end
++
+ @interface SafariumToolbarController
+     : NSObject <NSToolbarDelegate,
+                 NSSharingServicePickerToolbarItemDelegate,
+@@ -2768,6 +3432,8 @@ @implementation SafariumToolbarController {
+   uint64_t _overviewTransition;
+   id _escMonitor;  // Local key monitor: Esc leaves the overview.
+   BOOL _closingOverview;  // Freeze the grid while zooming out of it.
++  BOOL _homeItemSynced;   // Initial toolbar/pref reconciliation done.
++  BOOL _syncingHomeItem;  // We are adding/removing the Home item ourselves.
+ }
+ 
+ - (instancetype)initWithTabView:(SafariumTabBarView*)tabView
+@@ -2890,7 +3556,8 @@ - (NSToolbarItem*)toolbar:(NSToolbar*)toolbar
+     return item;
+   }
+   if ([identifier isEqualToString:kTabsItem]) {
+-    NSToolbarItem* item = [[NSToolbarItem alloc] initWithItemIdentifier:identifier];
++    NSToolbarItem* item =
++        [[SafariumTabsToolbarItem alloc] initWithItemIdentifier:identifier];
+     item.label = @"Tabs";
+     item.paletteLabel = @"Tabs";
+     if (flag) {
+@@ -3025,9 +3692,76 @@ - (NSToolbarItem*)extensionItem:(NSToolbarItemIdentifier)identifier
+   return item;
+ }
+ 
++// Settings > Appearance > "Show home button" and the toolbar's Home item are
++// the same thing: the pref adds/removes the item, and adding/removing it with
++// Customize Toolbar updates the pref.
++- (NSUInteger)indexOfToolbarItem:(NSToolbarItemIdentifier)identifier {
++  NSArray<NSToolbarItem*>* items = _toolbar.items;
++  for (NSUInteger i = 0; i < items.count; ++i) {
++    if ([items[i].itemIdentifier isEqualToString:identifier]) {
++      return i;
++    }
++  }
++  return NSNotFound;
++}
++
++- (void)syncHomeItem:(BOOL)show {
++  if (!_window || _window.toolbar != _toolbar ||
++      _toolbar.customizationPaletteIsRunning) {
++    return;
++  }
++  const NSUInteger index = [self indexOfToolbarItem:kHomeItem];
++  if (!_homeItemSynced) {
++    // First sync for this window: a toolbar layout AppKit restored (Home
++    // added earlier via Customize Toolbar) wins over the pref.
++    _homeItemSynced = YES;
++    const BOOL has = index != NSNotFound;
++    if (has != show && _controller) {
++      _controller->SetShowHomeButton(has);
++      return;
++    }
++  }
++  _syncingHomeItem = YES;
++  if (show && index == NSNotFound) {
++    const NSUInteger reload = [self indexOfToolbarItem:kReloadItem];
++    [_toolbar insertItemWithItemIdentifier:kHomeItem
++                                   atIndex:reload == NSNotFound ? 0
++                                                                : reload + 1];
++  } else if (!show && index != NSNotFound) {
++    [_toolbar removeItemAtIndex:index];
++  }
++  _syncingHomeItem = NO;
++}
++
++- (void)homeItemChangedByUser:(BOOL)present {
++  if (_syncingHomeItem) {
++    return;
++  }
++  // Async: setting the pref pushes state back into -syncHomeItem:, which must
++  // see the toolbar after AppKit finished adding/removing the item.
++  __weak SafariumToolbarController* weakSelf = self;
++  dispatch_async(dispatch_get_main_queue(), ^{
++    SafariumToolbarController* strongSelf = weakSelf;
++    if (strongSelf && strongSelf->_controller) {
++      strongSelf->_controller->SetShowHomeButton(present);
++    }
++  });
++}
++
++- (void)toolbarDidRemoveItem:(NSNotification*)notification {
++  NSToolbarItem* item = notification.userInfo[NSToolbarItemKey];
++  if ([item.itemIdentifier isEqualToString:kHomeItem]) {
++    [self homeItemChangedByUser:NO];
++  }
++}
++
+ - (void)toolbarWillAddItem:(NSNotification*)notification {
+   NSToolbarItem* item = notification.userInfo[NSToolbarItemKey];
+   NSString* identifier = item.itemIdentifier;
++  if ([identifier isEqualToString:kHomeItem]) {
++    [self homeItemChangedByUser:YES];
++    return;
++  }
+   if (![identifier hasPrefix:kExtensionItemPrefix]) {
+     return;
+   }
+@@ -3096,6 +3830,7 @@ - (void)updateState:(const safarium::BarState&)state {
+   _canGoBack = state.can_go_back;
+   _canGoForward = state.can_go_forward;
+   _isLoading = state.is_loading;
++  [self syncHomeItem:state.show_home_button];
+   NSMutableArray<SafariumOverviewTab*>* tabs = [NSMutableArray array];
+   for (size_t i = 0; i < state.tabs.size(); ++i) {
+     const safarium::TabItem& t = state.tabs[i];
+@@ -3475,6 +4210,7 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+   ~ToolbarInstaller() override {
+     extension_updates_ = {};
+     controller_->SetView(nullptr);
++    [tab_view_ hideHoverCard];
+     [tab_view_ setController:nullptr];
+     tab_view_.willFocusAddressField = nil;
+     [toolbar_ uninstall];
+@@ -3516,6 +4252,20 @@ void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) override {
+     [toolbar_ thumbnailChanged:gfx::NSImageFromImageSkia(image) forTab:tab_id];
+   }
+ 
++  void HoverCardThumbnailChanged(int64_t tab_id,
++                                 const gfx::ImageSkia& image) override {
++    [tab_view_ hoverCardThumbnail:gfx::NSImageFromImageSkia(image)
++                           forTab:tab_id];
++  }
++
++  void HoverCardMemoryChanged(int64_t tab_id,
++                              const std::u16string& text,
++                              bool high_usage) override {
++    [tab_view_ hoverCardMemory:base::SysUTF16ToNSString(text)
++                          high:high_usage
++                        forTab:tab_id];
++  }
++
+  private:
+   const raw_ptr<TabBarController> controller_;
+   SafariumTabBarView* __strong tab_view_;
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 161669d4f7..b6891a3572 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -224,6 +224,8 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+       widget_->RegisterPaintAsActiveChangedCallback(base::BindRepeating(
+           &WebUIBrowserWindow::PaintAsActiveChanged, base::Unretained(this)));
+ 
++  UpdateSafariumWindowColorMode();
++
+   if (auto* theme_observer = BrowserWindowThemeObserver::From(browser_.get())) {
+     theme_changed_subscription_ =
+         theme_observer->RegisterThemeChangedCallback(base::BindRepeating(
+@@ -1054,9 +1056,27 @@ void WebUIBrowserWindow::ConfirmBrowserCloseWithPendingDownloads(
+   NOTIMPLEMENTED_LOG_ONCE();
+ }
+ 
++void WebUIBrowserWindow::UpdateSafariumWindowColorMode() {
++  if (!safarium_controller_) {
++    return;
++  }
++  // The widget's own color provider (which picks the NSWindow appearance)
++  // only follows the OS; override it when the profile forces light/dark.
++  std::optional<ui::ColorProviderKey::ColorMode> color_mode;
++  const auto* theme_service =
++      ThemeServiceFactory::GetForProfile(browser_->GetProfile());
++  if (browser_->GetProfile()->IsIncognitoProfile() ||
++      theme_service->GetBrowserColorScheme() !=
++          ThemeService::BrowserColorScheme::kSystem) {
++    color_mode = GetColorProviderKey().color_mode;
++  }
++  widget_->SetColorModeOverride(color_mode);
++}
++
+ void WebUIBrowserWindow::UserChangedTheme(
+     BrowserThemeChangeType theme_change_type) {
+   NotifyColorProviderChanged();
++  UpdateSafariumWindowColorMode();
+   extensions_container_->NotifyOfAllActions();  // Icons may need re-rendering.
+ }
+ 
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index ed35ada7ae..a763e473c9 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -247,6 +247,9 @@ class WebUIBrowserWindow : public BrowserWindow,
+ 
+   // Called by BrowserWindowThemeObserver when the theme changes.
+   void UserChangedTheme(BrowserThemeChangeType theme_change_type);
++  // Safarium: makes the native window (NSToolbar, tab bar, popovers) follow
++  // Settings > Appearance > Mode instead of always following the system.
++  void UpdateSafariumWindowColorMode();
+ 
+   // Called by BrowserWindowZoomObserver when zoom changes on the active tab.
+   void ZoomChangedForActiveTab(bool can_show_bubble);
