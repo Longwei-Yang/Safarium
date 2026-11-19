@@ -10,12 +10,15 @@ Safarium is a macOS web browser that pairs the Chromium engine with a native App
 
 ## Animation
 
-Motion is a first-class part of Safarium. Each transition was timed frame by frame against screen recordings of Safari and tuned to match its curves, and in several places Safarium goes further:
+Motion is a first-class part of Safarium. Each transition was timed frame by frame against screen recordings of Safari and tuned to match its curves:
 
-- **Tabs never jump.** Opening, closing, switching and dragging tabs slide every tab to its new place, and the tab strip grows and shrinks smoothly when tabs come and go.
-- **The address field moves, it doesn't swap.** When you start editing, the site name stays put while the full address grows around it and slides into place; the favicon glides between the centre and the edge.
-- **Tab Overview zooms.** The current page shrinks into its card in the grid and grows back out of whichever card you pick, and the address field fades into a search field instead of popping.
-- **Full screen video stays live.** The video grows from its place in the page and shrinks back while it keeps playing. Sites that resize their own player afterwards, such as YouTube, are waited for, so there's no flash of a mis-sized video on the way back, which Safari itself shows on YouTube.
+- **Tabs.** Opening, closing, switching and dragging tabs slide every tab to its new place, and the tab strip grows and shrinks smoothly when tabs come and go.
+- **Address field.** When you start editing, the site name stays put while the full address grows around it and slides into place; the favicon glides between the centre and the edge.
+- **Tab Overview.** The current page shrinks into its card in the grid and grows back out of whichever card you pick, and the address field fades into a search field.
+
+In one place Safarium goes further than Safari:
+
+- **Full screen video.** The video grows from its place in the page and shrinks back while it keeps playing. Sites that resize their own player after full screen, such as YouTube, are waited for, so there's no flash of a mis-sized video on the way back, which Safari itself shows on YouTube.
 
 The interface and its animations will keep being refined.
 
