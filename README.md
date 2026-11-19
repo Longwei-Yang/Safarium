@@ -32,13 +32,17 @@ Safarium runs on Apple silicon Macs with macOS 26 or later. It is built and test
 
 1. Download the latest `Safarium-<version>-arm64.dmg` from [Releases](../../releases).
 2. Open it and drag **Safarium** into **Applications**.
-3. The app is signed ad hoc and not notarized, so macOS blocks the first launch. Right-click Safarium in Applications, choose **Open**, then **Open** again. Alternatively run:
+3. The app is signed ad hoc and not notarized, so the first launch shows **"Safarium.app" Not Opened**. Click **Done** (not Move to Trash), then either:
+   - open **System Settings › Privacy & Security**, scroll to the message about Safarium, click **Open Anyway** and confirm, then open Safarium again and choose **Open Anyway**; or
+   - run this once in Terminal:
 
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Safarium.app
-   ```
+     ```sh
+     xattr -dr com.apple.quarantine /Applications/Safarium.app
+     ```
 
-To update, quit Safarium and replace the app with the one from the newer DMG. Bookmarks, history, passwords and extensions are stored in `~/Library/Application Support/Safarium` and are kept. macOS may ask once more for permission to use the "Safarium Safe Storage" keychain item.
+   Right-click › Open no longer bypasses this check on macOS 15 and later.
+
+To update, quit Safarium and replace the app with the one from the newer DMG, then repeat step 3 for the new copy. Bookmarks, history, passwords and extensions are stored in `~/Library/Application Support/Safarium` and are kept. macOS may ask once more for permission to use the "Safarium Safe Storage" keychain item.
 
 ## Limitations
 
