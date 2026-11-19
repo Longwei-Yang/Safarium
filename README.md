@@ -8,6 +8,17 @@ Safarium is a macOS web browser that pairs the Chromium engine with a native App
 
 ![Safarium with the compact tab bar](docs/screenshots/horizontal.png)
 
+## Animation
+
+Motion is a first-class part of Safarium. Each transition was timed frame by frame against screen recordings of Safari and tuned to match its curves, and in several places Safarium goes further:
+
+- **Tabs never jump.** Opening, closing, switching and dragging tabs slide every tab to its new place, and the tab strip grows and shrinks smoothly when tabs come and go.
+- **The address field moves, it doesn't swap.** When you start editing, the site name stays put while the full address grows around it and slides into place; the favicon glides between the centre and the edge.
+- **Tab Overview zooms.** The current page shrinks into its card in the grid and grows back out of whichever card you pick, and the address field fades into a search field instead of popping.
+- **Full screen video stays live.** The video grows from its place in the page and shrinks back while it keeps playing. Sites that resize their own player afterwards, such as YouTube, are waited for, so there's no flash of a mis-sized video on the way back, which Safari itself shows on YouTube.
+
+The interface and its animations will keep being refined.
+
 ## Features
 
 **Compact tab bar.** Tabs share one row with the address field, as in Safari's compact layout. The current tab is the address field. Tabs show hover cards, can be dragged to reorder, and can be torn off into a new window.
@@ -24,7 +35,7 @@ Safarium is a macOS web browser that pairs the Chromium engine with a native App
 
 ![Tab Overview](docs/screenshots/overview.png)
 
-**Full screen video.** When a video goes full screen, the toolbar and sidebar step aside so only the video shows.
+**Full screen video.** A video goes into its own full-screen space and returns to where you were, the desktop or a full-screen browser window.
 
 **New Tab shortcuts.** The New Tab page holds up to 20 shortcuts.
 

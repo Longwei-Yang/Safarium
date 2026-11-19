@@ -1,0 +1,2033 @@
+From cbcef6bde13ac2933400937e001d929ec11e36f4 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:51:24 -0500
+Subject: [PATCH] Safarium: Safari-style animated video full screen
+
+When a page element such as a video goes full screen, move it into its own
+full-screen window and zoom it there from its place in the page, live, the
+way Safari does; on exit it shrinks back into place while the page keeps a
+placeholder (page snapshot plus the video's last frame) until the page has
+drawn the video in place again.
+
+- Blink reports the full-screen element's rect (safarium_fullscreen.mojom,
+  SafariumFullscreenHost) so the zoom starts and ends at the right spot.
+- ExclusiveAccessContext::GetTabFullscreenOverride lets the Safarium window
+  handle tab full screen itself.
+- ViewsNSWindowDelegate supports AppKit's custom full-screen enter/exit
+  animations and destinationWindowToExitFullScreenForWindow, so leaving
+  full screen returns to the browser window's Space (desktop or the full
+  screen browser) without passing through other Spaces. Only windows that
+  ask for it change; NativeWidgetMacNSWindow skips frame constraining for
+  them so the video window starts at its final full-screen size.
+- The video window is screen-sized from the start and only its compositor
+  layer zooms, so the picture stays live (resizing a window during the
+  transition freezes it).
+- On exit, wait (up to 1.5 s) until the page's videos are back at their
+  original size before fading the placeholder; sites such as YouTube resize
+  their video with script after full screen ends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/BUILD.gn                       |    1 +
+ ...ontent_browser_client_receiver_bindings.cc |    5 +
+ .../exclusive_access_context.h                |    9 +
+ .../exclusive_access_manager.cc               |    6 +
+ .../exclusive_access/fullscreen_controller.cc |   13 +
+ chrome/browser/ui/webui_browser/BUILD.gn      |   21 +
+ .../webui_browser/safarium_fullscreen_host.cc |  103 ++
+ .../webui_browser/safarium_fullscreen_host.h  |   36 +
+ .../webui_browser/safarium_video_fullscreen.h |  122 ++
+ .../safarium_video_fullscreen_mac.mm          | 1014 +++++++++++++++++
+ .../webui_browser_exclusive_access_context.cc |   77 ++
+ .../webui_browser_exclusive_access_context.h  |    6 +
+ .../ui/webui_browser/webui_browser_window.cc  |   91 +-
+ .../ui/webui_browser/webui_browser_window.h   |   10 +
+ .../app_shim/native_widget_mac_nswindow.mm    |    6 +
+ .../app_shim/views_nswindow_delegate.h        |   19 +
+ .../app_shim/views_nswindow_delegate.mm       |   50 +
+ third_party/blink/public/mojom/BUILD.gn       |    1 +
+ .../mojom/frame/safarium_fullscreen.mojom     |   17 +
+ .../renderer/core/fullscreen/fullscreen.cc    |   18 +
+ 20 files changed, 1624 insertions(+), 1 deletion(-)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_fullscreen_host.cc
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_fullscreen_host.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_video_fullscreen.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm
+ create mode 100644 third_party/blink/public/mojom/frame/safarium_fullscreen.mojom
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 254d44a522..8327fc2489 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1624,6 +1624,7 @@ source_set("core") {
+       "//chrome/browser/ui/webui/webnn_internals:mojo_bindings",
+       "//chrome/browser/ui/webui/whats_new",
+       "//chrome/browser/ui/webui_browser",
++      "//chrome/browser/ui/webui_browser:safarium_fullscreen_host",
+       "//chrome/browser/web_applications",
+       "//chrome/browser/web_applications:features",
+       "//chrome/browser/web_applications:sub_apps_service",
+diff --git a/chrome/browser/chrome_content_browser_client_receiver_bindings.cc b/chrome/browser/chrome_content_browser_client_receiver_bindings.cc
+index 98945faff3..0b6152fa3b 100644
+--- a/chrome/browser/chrome_content_browser_client_receiver_bindings.cc
++++ b/chrome/browser/chrome_content_browser_client_receiver_bindings.cc
+@@ -9,6 +9,7 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
++#include "chrome/browser/ui/webui_browser/safarium_fullscreen_host.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/chrome_browser_interface_binders.h"
+ #include "chrome/browser/chrome_browser_interface_binders_webui.h"
+@@ -387,6 +388,10 @@ void ChromeContentBrowserClient::
+       base::BindRepeating(
+           &autofill::ContentAutofillDriverFactory::BindAutofillDriver,
+           &render_frame_host));
++  // Safarium: where an element asking for full screen sits (Safari-style
++  // video full screen).
++  associated_registry.AddInterface<blink::mojom::SafariumFullscreenHost>(
++      base::BindRepeating(&safarium::BindFullscreenHost, &render_frame_host));
+   if (base::FeatureList::IsEnabled(
+           payments::facilitated::kEnableDesktopQrCodeDetection)) {
+     associated_registry
+diff --git a/chrome/browser/ui/exclusive_access/exclusive_access_context.h b/chrome/browser/ui/exclusive_access/exclusive_access_context.h
+index e1ad5c2682..92747a0683 100644
+--- a/chrome/browser/ui/exclusive_access/exclusive_access_context.h
++++ b/chrome/browser/ui/exclusive_access/exclusive_access_context.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_EXCLUSIVE_ACCESS_EXCLUSIVE_ACCESS_CONTEXT_H_
+ #define CHROME_BROWSER_UI_EXCLUSIVE_ACCESS_EXCLUSIVE_ACCESS_CONTEXT_H_
+ 
++#include <optional>
++
+ #include "chrome/browser/ui/exclusive_access/exclusive_access_bubble_hide_callback.h"
+ #include "chrome/browser/ui/exclusive_access/exclusive_access_bubble_type.h"
+ #include "chrome/browser/ui/exclusive_access/fullscreen_tab_params.h"
+@@ -33,6 +35,13 @@ class ExclusiveAccessContext {
+   // in the browser fullscreen. Currently only supported on Mac.
+   virtual void UpdateUIForTabFullscreen() {}
+ 
++  // Safarium: whether `web_contents` should see itself as full screen,
++  // overriding the controller's own state (nullopt: no override). Lets a
++  // separate full screen window hold the page back until it is ready, and
++  // keep it full screen while it animates closed.
++  virtual std::optional<bool> GetTabFullscreenOverride(
++      const content::WebContents* web_contents) const;
++
+   // Enters fullscreen and updates the exclusive access bubble.
+   virtual void EnterFullscreen(const url::Origin& origin,
+                                ExclusiveAccessBubbleType bubble_type,
+diff --git a/chrome/browser/ui/exclusive_access/exclusive_access_manager.cc b/chrome/browser/ui/exclusive_access/exclusive_access_manager.cc
+index b3f166c48e..e1f208bbd9 100644
+--- a/chrome/browser/ui/exclusive_access/exclusive_access_manager.cc
++++ b/chrome/browser/ui/exclusive_access/exclusive_access_manager.cc
+@@ -293,3 +293,9 @@ void ExclusiveAccessManager::HandleUserHeldEscape() {
+     pointer_lock_controller_.StartUserEscapeCooldown();
+   }
+ }
++
++// ExclusiveAccessContext has no .cc of its own.
++std::optional<bool> ExclusiveAccessContext::GetTabFullscreenOverride(
++    const content::WebContents* web_contents) const {
++  return std::nullopt;
++}
+diff --git a/chrome/browser/ui/exclusive_access/fullscreen_controller.cc b/chrome/browser/ui/exclusive_access/fullscreen_controller.cc
+index 9b923b442f..d18dc256b9 100644
+--- a/chrome/browser/ui/exclusive_access/fullscreen_controller.cc
++++ b/chrome/browser/ui/exclusive_access/fullscreen_controller.cc
+@@ -169,6 +169,19 @@ content::FullscreenState FullscreenController::GetFullscreenState(
+     return state;
+   }
+ 
++  // Safarium: a separate full screen window decides what the page sees while
++  // it opens and closes.
++  if (const std::optional<bool> shown =
++          exclusive_access_manager()->context()->GetTabFullscreenOverride(
++              web_contents)) {
++    state.target_mode = *shown ? content::FullscreenMode::kContent
++                               : content::FullscreenMode::kWindowed;
++    if (*shown) {
++      state.target_display_id = GetDisplayId(*web_contents);
++    }
++    return state;
++  }
++
+   // Handle not fullscreen, browser fullscreen, and exiting tab fullscreen.
+   if (!tab_fullscreen_ || web_contents != exclusive_access_tab()) {
+     state.target_mode = content::FullscreenMode::kWindowed;
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index 03ab2dbf79..2998f4cd54 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -10,6 +10,24 @@ source_set("headers") {
+   sources = [ "webui_browser.h" ]
+ }
+ 
++# Safarium: the element position a page reports before asking for full
++# screen (bound for renderers in chrome_content_browser_client).
++source_set("safarium_fullscreen_host") {
++  sources = [
++    "safarium_fullscreen_host.cc",
++    "safarium_fullscreen_host.h",
++  ]
++  public_deps = [
++    "//mojo/public/cpp/bindings",
++    "//third_party/blink/public/mojom:mojom_core",
++    "//ui/gfx/geometry",
++  ]
++  deps = [
++    "//base",
++    "//content/public/browser",
++  ]
++}
++
+ source_set("webui_browser") {
+   sources = [
+     "browser_elements_webui_browser.h",
+@@ -95,6 +113,8 @@ source_set("impl") {
+       "safarium_root_view.h",
+       "safarium_side_panel_header_mac.mm",
+       "safarium_tab_bar_host_mac.mm",
++      "safarium_video_fullscreen.h",
++      "safarium_video_fullscreen_mac.mm",
+       "webui_browser_window_mac.mm",
+     ]
+     deps = [
+@@ -108,6 +128,7 @@ source_set("impl") {
+ 
+   deps += [
+     ":browser_mojo_bindings",
++    ":safarium_fullscreen_host",
+     ":webui_browser",
+     "//base",
+     "//build:safarium_buildflags",
+diff --git a/chrome/browser/ui/webui_browser/safarium_fullscreen_host.cc b/chrome/browser/ui/webui_browser/safarium_fullscreen_host.cc
+new file mode 100644
+index 0000000000..5a5344873d
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_fullscreen_host.cc
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/safarium_fullscreen_host.h"
++
++#include <memory>
++
++#include "base/time/time.h"
++#include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "mojo/public/cpp/bindings/self_owned_associated_receiver.h"
++#include "ui/gfx/geometry/point_conversions.h"
++#include "ui/gfx/geometry/point_f.h"
++
++namespace safarium {
++
++namespace {
++
++// How long a reported position stays valid for the full screen request that
++// follows it.
++constexpr base::TimeDelta kRequestLifetime = base::Seconds(3);
++
++class FullscreenRequest
++    : public content::WebContentsUserData<FullscreenRequest> {
++ public:
++  ~FullscreenRequest() override = default;
++
++  gfx::Rect bounds;
++  base::TimeTicks time;
++
++ private:
++  friend class content::WebContentsUserData<FullscreenRequest>;
++  explicit FullscreenRequest(content::WebContents* contents)
++      : content::WebContentsUserData<FullscreenRequest>(*contents) {}
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(FullscreenRequest);
++
++class FullscreenHost : public blink::mojom::SafariumFullscreenHost {
++ public:
++  explicit FullscreenHost(content::GlobalRenderFrameHostId frame_id)
++      : frame_id_(frame_id) {}
++
++  void WillRequestFullscreen(const gfx::Rect& bounds) override {
++    content::RenderFrameHost* frame =
++        content::RenderFrameHost::FromID(frame_id_);
++    if (!frame) {
++      return;
++    }
++    content::WebContents* contents =
++        content::WebContents::FromRenderFrameHost(frame);
++    content::RenderWidgetHostView* view = frame->GetView();
++    if (!contents || !view) {
++      return;
++    }
++    // From the frame's local root widget (an out-of-process iframe has its
++    // own) to the page's view.
++    const gfx::PointF origin =
++        view->TransformPointToRootCoordSpaceF(gfx::PointF(bounds.origin()));
++    FullscreenRequest* request =
++        FullscreenRequest::GetOrCreateForWebContents(contents);
++    request->bounds =
++        gfx::Rect(gfx::ToRoundedPoint(origin), bounds.size());
++    request->time = base::TimeTicks::Now();
++  }
++
++ private:
++  const content::GlobalRenderFrameHostId frame_id_;
++};
++
++}  // namespace
++
++void BindFullscreenHost(
++    content::RenderFrameHost* frame,
++    mojo::PendingAssociatedReceiver<blink::mojom::SafariumFullscreenHost>
++        receiver) {
++  mojo::MakeSelfOwnedAssociatedReceiver(
++      std::make_unique<FullscreenHost>(frame->GetGlobalId()),
++      std::move(receiver));
++}
++
++std::optional<gfx::Rect> TakeFullscreenElementBounds(
++    content::WebContents* contents) {
++  FullscreenRequest* request = FullscreenRequest::FromWebContents(contents);
++  if (!request) {
++    return std::nullopt;
++  }
++  const gfx::Rect bounds = request->bounds;
++  const bool recent =
++      base::TimeTicks::Now() - request->time < kRequestLifetime;
++  contents->RemoveUserData(FullscreenRequest::UserDataKey());
++  if (!recent || bounds.IsEmpty()) {
++    return std::nullopt;
++  }
++  return bounds;
++}
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_fullscreen_host.h b/chrome/browser/ui/webui_browser/safarium_fullscreen_host.h
+new file mode 100644
+index 0000000000..d3a9823372
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_fullscreen_host.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Safarium: where the element that asks for full screen sits in its page, so
++// a video can go full screen in its own window that grows from that spot.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_FULLSCREEN_HOST_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_FULLSCREEN_HOST_H_
++
++#include <optional>
++
++#include "mojo/public/cpp/bindings/pending_associated_receiver.h"
++#include "third_party/blink/public/mojom/frame/safarium_fullscreen.mojom.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace content {
++class RenderFrameHost;
++class WebContents;
++}  // namespace content
++
++namespace safarium {
++
++void BindFullscreenHost(
++    content::RenderFrameHost* frame,
++    mojo::PendingAssociatedReceiver<blink::mojom::SafariumFullscreenHost>
++        receiver);
++
++// The bounds (DIPs of the page's view) of the element that last asked for
++// full screen in `contents`, if it asked in the last few seconds.
++std::optional<gfx::Rect> TakeFullscreenElementBounds(
++    content::WebContents* contents);
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_FULLSCREEN_HOST_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_video_fullscreen.h b/chrome/browser/ui/webui_browser/safarium_video_fullscreen.h
+new file mode 100644
+index 0000000000..6acbdc3b57
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_video_fullscreen.h
+@@ -0,0 +1,122 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Safarium: Safari-style page (video) full screen. The page leaves the
++// browser window for a window of its own, placed exactly over the element
++// that asked for full screen; macOS then grows that window into a full screen
++// Space and shrinks it back on exit. The browser window keeps a still image
++// of the page, with a fill where the element was.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_VIDEO_FULLSCREEN_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_VIDEO_FULLSCREEN_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "ui/gfx/native_ui_types.h"
++
++#ifdef __OBJC__
++@class NSImage;
++#else
++class NSImage;
++#endif
++
++namespace views {
++class WebView;
++class Widget;
++class WidgetDelegate;
++}  // namespace views
++
++namespace safarium {
++
++class VideoFullscreen : public content::WebContentsObserver {
++ public:
++  struct Callbacks {
++    // Shows `contents` in the browser window's page area (null: none).
++    base::RepeatingCallback<void(content::WebContents*)> set_page;
++    // The browser window's active tab.
++    base::RepeatingCallback<content::WebContents*()> active_page;
++    // The video window finished entering or leaving full screen.
++    base::RepeatingClosure state_changed;
++    // The user left full screen from the video window itself (its window
++    // controls, the keyboard shortcut, Mission Control).
++    base::RepeatingCallback<void(content::WebContents*)> exited_by_user;
++  };
++
++  VideoFullscreen(gfx::NativeWindow browser_window, Callbacks callbacks);
++  VideoFullscreen(const VideoFullscreen&) = delete;
++  VideoFullscreen& operator=(const VideoFullscreen&) = delete;
++  ~VideoFullscreen() override;
++
++  // Starts full screen for the active page `contents`. Returns false when it
++  // can't (the caller then uses the window's own full screen).
++  bool Begin(content::WebContents* contents);
++  // The page no longer wants full screen: shrink back and return the page.
++  void End();
++  // Entering, in or leaving video full screen.
++  bool IsActive() const { return state_ != State::kNone; }
++  // What `contents` should see while this runs (see
++  // ExclusiveAccessContext::GetTabFullscreenOverride()).
++  std::optional<bool> GetOverride(const content::WebContents* contents) const;
++  // Called before the browser window shows another active tab.
++  void ActivePageChanging(content::WebContents* contents);
++
++  // From the video window's full screen animator (AppKit's custom full
++  // screen transition, as in WebKit's WKFullScreenWindowController).
++  void StartEnterAnimation(double duration);
++  void StartExitAnimation(double duration);
++  gfx::NativeWindow browser_window() const { return browser_window_; }
++
++ private:
++  enum class State {
++    kNone,
++    kPreparing,  // Taking the page's picture; the page still sees no change.
++    kWindowed,   // The video window is shown over the element.
++    kEntering,   // Growing into full screen.
++    kFullscreen,
++    kExiting,    // Shrinking back over the element.
++    kReturning,  // Keeping its last frame, then returning the page.
++  };
++  struct ObjCStorage;
++
++  void OnSnapshot(NSImage* image);
++  void OnVideoDrawn();
++  void GoFullscreen();
++  void OnDidEnterFullScreen();
++  void OnWillExitFullScreen();
++  void OnDidExitFullScreen();
++  void ReturnPage();
++  void CaptureElementFrame(base::OnceClosure done);
++  // The video window is closing (e.g. Cmd+W): return the page now.
++  void OnWindowClosing();
++  // Puts the page back (`reattach`: into the browser window) and closes the
++  // video window. `fade` fades the still image out once the page has drawn.
++  void Finish(bool reattach, bool fade);
++  // Sends the page its (possibly overridden) full screen state.
++  void SyncPage(content::WebContents* contents = nullptr);
++
++  // content::WebContentsObserver:
++  void WebContentsDestroyed() override;
++
++  const gfx::NativeWindow browser_window_;
++  const Callbacks callbacks_;
++  State state_ = State::kNone;
++  bool end_requested_ = false;
++  bool finishing_ = false;
++  // The page's video rects before full screen (JSON; see Begin()).
++  std::string video_rects_;
++  bool window_closing_ = false;
++  std::unique_ptr<ObjCStorage> objc_;
++  std::unique_ptr<views::WidgetDelegate> widget_delegate_;
++  std::unique_ptr<views::Widget> widget_;
++  base::WeakPtrFactory<VideoFullscreen> weak_factory_{this};
++};
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_VIDEO_FULLSCREEN_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm b/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm
+new file mode 100644
+index 0000000000..207b52f0cd
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm
+@@ -0,0 +1,1014 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/safarium_video_fullscreen.h"
++
++#import <AppKit/AppKit.h>
++#import <QuartzCore/QuartzCore.h>
++
++#include <cmath>
++#include <utility>
++
++#include "base/auto_reset.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/webui_browser/safarium_fullscreen_host.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "content/public/browser/render_frame_host.h"
++#import "components/remote_cocoa/app_shim/views_nswindow_delegate.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "content/public/browser/render_widget_host.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/visibility.h"
++#include "content/public/browser/web_contents.h"
++#include "skia/ext/skia_utils_mac.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/gfx/mac/coordinate_conversion.h"
++#include "ui/views/background.h"
++#include "ui/views/controls/webview/webview.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_delegate.h"
++
++// The page as it was. While the element is away, its spot shows a fill (or
++// its last frame, as it comes back).
++@interface SafariumVideoPlaceholderView : NSView
++@property(nonatomic, strong) NSImage* image;
++@property(nonatomic) NSRect hole;  // Top-left based, like the page.
++@property(nonatomic) BOOL showsHole;
++@property(nonatomic, strong) NSImage* holeImage;
++@property(nonatomic) NSRect holeSourceRect;  // Part of holeImage (or all).
++@end
++
++// Layers rather than -drawRect:, so the page's picture shows in the same frame
++// as the page leaves (a full page image draws slowly).
++@implementation SafariumVideoPlaceholderView {
++  CALayer* _holeLayer;
++}
++@synthesize image = _image;
++@synthesize hole = _hole;
++@synthesize showsHole = _showsHole;
++@synthesize holeImage = _holeImage;
++@synthesize holeSourceRect = _holeSourceRect;
++
++- (instancetype)initWithFrame:(NSRect)frame {
++  if ((self = [super initWithFrame:frame])) {
++    CALayer* root = [CALayer layer];
++    root.geometryFlipped = YES;  // Top-left based, like the page.
++    root.contentsGravity = kCAGravityResize;
++    _holeLayer = [CALayer layer];
++    _holeLayer.backgroundColor = NSColor.blackColor.CGColor;
++    _holeLayer.contentsGravity = kCAGravityResize;
++    _holeLayer.hidden = YES;
++    [root addSublayer:_holeLayer];
++    self.layer = root;
++    self.wantsLayer = YES;
++  }
++  return self;
++}
++
++- (BOOL)isFlipped {
++  return YES;
++}
++
++- (void)update:(void (^)(void))block {
++  [CATransaction begin];
++  [CATransaction setDisableActions:YES];
++  block();
++  [CATransaction commit];
++}
++
++- (void)setImage:(NSImage*)image {
++  _image = image;
++  [self update:^{
++    self.layer.contents = image;
++  }];
++}
++
++- (void)setHole:(NSRect)hole {
++  _hole = hole;
++  CALayer* layer = _holeLayer;
++  [self update:^{
++    layer.frame = NSRectToCGRect(hole);
++  }];
++}
++
++- (void)setShowsHole:(BOOL)showsHole {
++  _showsHole = showsHole;
++  CALayer* layer = _holeLayer;
++  [self update:^{
++    layer.hidden = !showsHole;
++  }];
++}
++
++- (void)setHoleImage:(NSImage*)holeImage {
++  _holeImage = holeImage;
++  [self updateHoleContents];
++}
++
++- (void)setHoleSourceRect:(NSRect)rect {
++  _holeSourceRect = rect;
++  [self updateHoleContents];
++}
++
++- (void)updateHoleContents {
++  NSImage* image = _holeImage;
++  CGRect unit = CGRectMake(0, 0, 1, 1);
++  if (image && !NSIsEmptyRect(_holeSourceRect)) {
++    const NSSize size = image.size;
++    unit = CGRectMake(NSMinX(_holeSourceRect) / size.width,
++                      NSMinY(_holeSourceRect) / size.height,
++                      NSWidth(_holeSourceRect) / size.width,
++                      NSHeight(_holeSourceRect) / size.height);
++  }
++  CALayer* layer = _holeLayer;
++  [self update:^{
++    layer.contents = image;
++    layer.contentsRect = unit;
++  }];
++}
++@end
++
++// Runs the video window's full screen transitions (AppKit's custom full
++// screen animation) and sends it back to the browser window on exit.
++@interface SafariumVideoFullScreenAnimator
++    : NSObject <ViewsNSWindowFullScreenAnimator>
++- (instancetype)initWithOwner:(base::WeakPtr<safarium::VideoFullscreen>)owner;
++@end
++
++@implementation SafariumVideoFullScreenAnimator {
++  base::WeakPtr<safarium::VideoFullscreen> _owner;
++}
++
++- (instancetype)initWithOwner:(base::WeakPtr<safarium::VideoFullscreen>)owner {
++  if ((self = [super init])) {
++    _owner = owner;
++  }
++  return self;
++}
++
++- (void)window:(NSWindow*)window
++    startEnterFullScreenAnimationWithDuration:(NSTimeInterval)duration {
++  if (_owner) {
++    _owner->StartEnterAnimation(duration);
++  }
++}
++
++- (void)window:(NSWindow*)window
++    startExitFullScreenAnimationWithDuration:(NSTimeInterval)duration {
++  if (_owner) {
++    _owner->StartExitAnimation(duration);
++  }
++}
++
++- (NSWindow*)destinationWindowToExitFullScreenForWindow:(NSWindow*)window {
++  return _owner ? _owner->browser_window().GetNativeNSWindow() : nil;
++}
++@end
++
++namespace safarium {
++
++namespace {
++
++// If the page can't be asked whether it has drawn.
++constexpr base::TimeDelta kDrawFallback = base::Milliseconds(150);
++constexpr base::TimeDelta kDrawTimeout = base::Milliseconds(500);
++constexpr base::TimeDelta kLastFrameTimeout = base::Milliseconds(150);
++constexpr NSTimeInterval kFadeDuration = 0.15;
++// Extra time for the page to draw a current frame back in the browser window
++// (the first one there can still be from before full screen).
++constexpr base::TimeDelta kReturnSettle = base::Milliseconds(150);
++// How long to wait for the page's videos to fit the element's spot again.
++constexpr base::TimeDelta kVideosFitTimeout = base::Milliseconds(1500);
++
++// Where the page's videos are (JSON [[x, y, width, height], ...]).
++constexpr char16_t kVideoRectsScript[] =
++    u"JSON.stringify([...document.querySelectorAll('video')].map(v => {"
++    u"  const r = v.getBoundingClientRect();"
++    u"  return [r.x, r.y, r.width, r.height].map(Math.round);"
++    u"}))";
++constexpr base::TimeDelta kVideosFitPoll = base::Milliseconds(50);
++
++void SetWindowButtonsHidden(NSWindow* window, BOOL hidden) {
++  for (NSWindowButton kind :
++       {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
++    [window standardWindowButton:kind].hidden = hidden;
++  }
++}
++
++// Runs `done` once `contents` has drawn a frame at its current size (a copy
++// of its surface completes then), or after a short wait.
++void WhenDrawn(content::WebContents* contents,
++               base::OnceClosure done,
++               base::TimeDelta settle = base::TimeDelta()) {
++  if (settle.is_positive()) {
++    done = base::BindOnce(
++        [](base::OnceClosure done, base::TimeDelta settle) {
++          base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++              FROM_HERE, std::move(done), settle);
++        },
++        std::move(done), settle);
++  }
++  content::RenderWidgetHostView* view =
++      contents ? contents->GetRenderWidgetHostView() : nullptr;
++  if (!view || !view->IsSurfaceAvailableForCopy()) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE, std::move(done), kDrawFallback);
++    return;
++  }
++  view->CopyFromSurface(
++      gfx::Rect(), gfx::Size(1, 1), kDrawTimeout,
++      base::BindOnce(
++          [](base::OnceClosure done, const content::CopyFromSurfaceResult&) {
++            std::move(done).Run();
++          },
++          std::move(done)));
++}
++
++// Runs `done` once the page's videos are back where they were before full
++// screen (`video_rects`, from kVideoRectsScript; sites such as YouTube resize
++// theirs with script, in steps, after full screen ends) and the page has
++// drawn that, or by `deadline`.
++void WhenVideosBack(base::WeakPtr<content::WebContents> contents,
++                    std::string video_rects,
++                    base::TimeTicks deadline,
++                    base::OnceClosure done) {
++  if (!contents) {
++    std::move(done).Run();
++    return;
++  }
++  if (video_rects.empty() || base::TimeTicks::Now() >= deadline) {
++    WhenDrawn(contents.get(), std::move(done), kReturnSettle);
++    return;
++  }
++  const std::u16string script =
++      u"(() => {"
++      u"  if (document.fullscreenElement) return false;"
++      u"  const before = " + base::UTF8ToUTF16(video_rects) + u";"
++      u"  const now = JSON.parse(" + std::u16string(kVideoRectsScript) + u");"
++      u"  const ok = now.length === before.length && now.every((r, i) =>"
++      u"      r.every((v, j) => Math.abs(v - before[i][j]) <= 4));"
++      u"  return ok;"
++      u"})()";
++  contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      script,
++      base::BindOnce(
++          [](base::WeakPtr<content::WebContents> contents,
++             std::string video_rects, base::TimeTicks deadline,
++             base::OnceClosure done, base::Value back) {
++            if (contents && back.is_bool() && back.GetBool()) {
++              WhenDrawn(contents.get(), std::move(done), kReturnSettle);
++              return;
++            }
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++                FROM_HERE,
++                base::BindOnce(&WhenVideosBack, contents,
++                               std::move(video_rects), deadline,
++                               std::move(done)),
++                kVideosFitPoll);
++          },
++          contents, std::move(video_rects), deadline, std::move(done)),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++NSImage* ImageFromCopy(const content::CopyFromSurfaceResult& result,
++                       NSSize size) {
++  if (!result.has_value() || result->bitmap.drawsNothing()) {
++    return nil;
++  }
++  NSImage* image = skia::SkBitmapToNSImage(result->bitmap);
++  image.size = size;
++  return image;
++}
++
++// The window's frame in full screen (below a notch, if any).
++NSRect FullScreenFrame(NSScreen* screen) {
++  NSRect frame = screen.frame;
++  if (@available(macOS 12.0, *)) {
++    // With a notch, full screen windows sit just below the notch's band
++    // (measured on macOS 27: 1pt below the safe area's top inset).
++    if (screen.safeAreaInsets.top > 0) {
++      frame.size.height =
++          std::floor(frame.size.height - screen.safeAreaInsets.top - 1);
++    }
++  }
++  return frame;
++}
++
++// WebKit's timing for full screen zooms.
++CAMediaTimingFunction* TimingFunction(double duration) {
++  return duration >= 0.8
++             ? [CAMediaTimingFunction
++                   functionWithName:kCAMediaTimingFunctionEaseInEaseOut]
++             : [CAMediaTimingFunction functionWithControlPoints:0.25:0:0:1];
++}
++
++// The smallest rect with `aspect` around `rect` (centered).
++NSRect EnclosingRectWithAspect(NSRect rect, NSSize aspect) {
++  const CGFloat ratio = aspect.width / aspect.height;
++  NSSize size = rect.size;
++  if (size.width / size.height > ratio) {
++    size.height = size.width / ratio;
++  } else {
++    size.width = size.height * ratio;
++  }
++  return NSMakeRect(NSMidX(rect) - size.width / 2,
++                    NSMidY(rect) - size.height / 2, size.width, size.height);
++}
++
++// The largest rect with `aspect` inside `bounds` (centered).
++NSRect InscribedRectWithAspect(NSRect bounds, NSSize aspect) {
++  const CGFloat ratio = aspect.width / aspect.height;
++  NSSize size = bounds.size;
++  if (size.width / size.height > ratio) {
++    size.width = size.height * ratio;
++  } else {
++    size.height = size.width / ratio;
++  }
++  return NSMakeRect(NSMidX(bounds) - size.width / 2,
++                    NSMidY(bounds) - size.height / 2, size.width, size.height);
++}
++
++// Zooms `layer` (the full screen page, `bounds`, in its window's coordinates)
++// out so that its element part sits at `initial` (window coordinates), as
++// WebKit does: the page stays laid out full screen while it animates.
++CATransform3D ZoomTransform(NSRect initial, NSRect bounds, CALayer* layer) {
++  if (layer.geometryFlipped) {
++    initial.origin.y = NSHeight(bounds) - NSMaxY(initial);
++  }
++  const NSRect scaled = EnclosingRectWithAspect(initial, bounds.size);
++  const CGFloat scale = NSWidth(scaled) / NSWidth(bounds);
++  // Layer transforms apply around the anchor point.
++  const CGPoint anchor = CGPointMake(layer.anchorPoint.x * NSWidth(bounds),
++                                     layer.anchorPoint.y * NSHeight(bounds));
++  return CATransform3DScale(
++      CATransform3DMakeTranslation(NSMinX(scaled) - (1 - scale) * anchor.x,
++                                   NSMinY(scaled) - (1 - scale) * anchor.y, 0),
++      scale, scale, 1);
++}
++
++// The layer to zoom: views' compositor layer (it draws the page) rather than
++// the content view's own layer, which AppKit manages and resets.
++NSView* ZoomView(NSWindow* window) {
++  for (NSView* view in window.contentView.subviews) {
++    if ([NSStringFromClass(view.class) isEqualToString:
++                                           @"ViewsCompositorSuperview"]) {
++      return view;
++    }
++  }
++  return window.contentView;
++}
++
++// Zooms `view` out to `initial` (screen) and crops it to the element.
++void ApplyInitialZoom(NSWindow* window, NSView* view, NSRect initial_screen) {
++  [CATransaction begin];
++  [CATransaction setDisableActions:YES];
++  const NSRect initial = [window convertRectFromScreen:initial_screen];
++  view.layer.transform = ZoomTransform(initial, view.bounds, view.layer);
++  CALayer* mask = [CALayer layer];
++  mask.backgroundColor = NSColor.blackColor.CGColor;
++  mask.frame = InscribedRectWithAspect(view.bounds, initial.size);
++  view.layer.mask = mask;
++  [CATransaction commit];
++}
++
++CABasicAnimation* Animation(NSString* key_path,
++                            id from,
++                            id to,
++                            double duration) {
++  CABasicAnimation* animation =
++      [CABasicAnimation animationWithKeyPath:key_path];
++  animation.fromValue = from;
++  animation.toValue = to;
++  animation.duration = duration;
++  animation.timingFunction = TimingFunction(duration);
++  animation.fillMode = kCAFillModeBoth;
++  animation.removedOnCompletion = NO;
++  return animation;
++}
++
++}  // namespace
++
++struct VideoFullscreen::ObjCStorage {
++  NSRect video_frame = NSZeroRect;  // The element on screen.
++  NSRect page_frame = NSZeroRect;   // Browser window's content view.
++  NSRect full_frame = NSZeroRect;   // The video window's (full screen).
++  NSRect hole = NSZeroRect;         // In the page, top-left based.
++  SafariumVideoPlaceholderView* placeholder;
++  SafariumVideoFullScreenAnimator* animator;
++  NSView* backdrop;  // Black, behind the page; fades in.
++  NSMutableArray<id>* observers = [NSMutableArray array];
++};
++
++VideoFullscreen::VideoFullscreen(gfx::NativeWindow browser_window,
++                                 Callbacks callbacks)
++    : browser_window_(browser_window),
++      callbacks_(std::move(callbacks)),
++      objc_(std::make_unique<ObjCStorage>()) {}
++
++VideoFullscreen::~VideoFullscreen() {
++  if (IsActive()) {
++    Finish(/*reattach=*/false, /*fade=*/false);
++  }
++  [objc_->placeholder removeFromSuperview];
++}
++
++bool VideoFullscreen::Begin(content::WebContents* contents) {
++  NSWindow* window = browser_window_.GetNativeNSWindow();
++  NSView* page = contents ? contents->GetNativeView().GetNativeNSView() : nil;
++  if (IsActive() || !window || !page || page.window != window ||
++      NSIsEmptyRect(page.bounds) || !window.visible || window.miniaturized) {
++    return false;
++  }
++
++  // The element's spot (the whole page if the page didn't say).
++  const NSRect page_bounds = page.bounds;
++  NSRect hole = NSMakeRect(0, 0, NSWidth(page_bounds), NSHeight(page_bounds));
++  if (std::optional<gfx::Rect> bounds =
++          TakeFullscreenElementBounds(contents)) {
++    const NSRect element = NSIntersectionRect(
++        NSMakeRect(bounds->x(), bounds->y(), bounds->width(),
++                   bounds->height()),
++        hole);
++    if (NSWidth(element) >= 40 && NSHeight(element) >= 30) {
++      hole = element;
++    }
++  }
++  NSRect in_page = hole;
++  if (!page.isFlipped) {
++    in_page.origin.y = NSHeight(page_bounds) - NSMaxY(hole);
++  }
++  objc_->hole = hole;
++  objc_->video_frame =
++      [window convertRectToScreen:[page convertRect:in_page toView:nil]];
++  objc_->page_frame = [window.contentView
++      convertRect:[page convertRect:page_bounds toView:nil]
++         fromView:nil];
++
++  state_ = State::kPreparing;
++  end_requested_ = false;
++  Observe(contents);
++
++  // Where the page's videos are now, to know when they are back after full
++  // screen.
++  video_rects_.clear();
++  contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      kVideoRectsScript,
++      base::BindOnce(
++          [](base::WeakPtr<VideoFullscreen> self, base::Value rects) {
++            if (self && rects.is_string()) {
++              self->video_rects_ = rects.GetString();
++            }
++          },
++          weak_factory_.GetWeakPtr()),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++
++  // The page as it is now, for the browser window while the page is away.
++  content::RenderWidgetHostView* view = contents->GetRenderWidgetHostView();
++  if (!view || !view->IsSurfaceAvailableForCopy()) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&VideoFullscreen::OnSnapshot,
++                                  weak_factory_.GetWeakPtr(),
++                                  static_cast<NSImage*>(nil)));
++    return true;
++  }
++  view->CopyFromSurface(
++      gfx::Rect(), gfx::Size(), base::Milliseconds(300),
++      base::BindOnce(
++          [](base::WeakPtr<VideoFullscreen> self, NSSize size,
++             const content::CopyFromSurfaceResult& result) {
++            if (self) {
++              self->OnSnapshot(ImageFromCopy(result, size));
++            }
++          },
++          weak_factory_.GetWeakPtr(), page_bounds.size));
++  return true;
++}
++
++void VideoFullscreen::OnSnapshot(NSImage* image) {
++  content::WebContents* contents = web_contents();
++  NSWindow* browser_window = browser_window_.GetNativeNSWindow();
++  if (state_ != State::kPreparing || !contents || !browser_window) {
++    return;
++  }
++
++  // The browser window keeps the page's picture (the element too, until its
++  // own window shows it).
++  SafariumVideoPlaceholderView* placeholder =
++      [[SafariumVideoPlaceholderView alloc] initWithFrame:objc_->page_frame];
++  placeholder.image = image;
++  placeholder.hole = objc_->hole;
++  [objc_->placeholder removeFromSuperview];
++  objc_->placeholder = placeholder;
++  [browser_window.contentView addSubview:placeholder
++                              positioned:NSWindowAbove
++                              relativeTo:nil];
++
++  // The page moves into a window of its own, exactly over the element.
++  callbacks_.set_page.Run(nullptr);
++  widget_delegate_ = std::make_unique<views::WidgetDelegate>();
++  widget_delegate_->SetCanFullscreen(true);
++  widget_delegate_->SetCanResize(true);
++  window_closing_ = false;
++  widget_delegate_->RegisterWindowClosingCallback(base::BindOnce(
++      &VideoFullscreen::OnWindowClosing, weak_factory_.GetWeakPtr()));
++  auto web_view =
++      std::make_unique<views::WebView>(contents->GetBrowserContext());
++  views::WebView* view =
++      widget_delegate_->SetContentsView(std::move(web_view));
++  widget_ = std::make_unique<views::Widget>();
++  views::Widget::InitParams params(
++      views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_WINDOW);
++  params.delegate = widget_delegate_.get();
++  // The size of the full screen from the start, as WebKit does: the page
++  // lays out full screen once, and the transitions only zoom it.
++  NSScreen* screen = browser_window.screen ?: NSScreen.mainScreen;
++  const NSRect full_frame = FullScreenFrame(screen);
++  objc_->full_frame = full_frame;
++  params.bounds = gfx::ScreenRectFromNSRect(full_frame);
++  params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++  params.name = "SafariumVideoFullscreen";
++  widget_->Init(std::move(params));
++
++  NSWindow* window = widget_->GetNativeWindow().GetNativeNSWindow();
++  window.titleVisibility = NSWindowTitleHidden;
++  window.titlebarAppearsTransparent = YES;
++  window.styleMask |= NSWindowStyleMaskFullSizeContentView;
++  window.opaque = NO;
++  window.backgroundColor = NSColor.clearColor;
++  window.hasShadow = NO;
++  window.animationBehavior = NSWindowAnimationBehaviorNone;
++  window.ignoresMouseEvents = YES;  // Until it is full screen.
++  SetWindowButtonsHidden(window, YES);
++  [window setFrame:full_frame display:NO];
++  window.alphaValue = 0;  // Until the page has drawn in it.
++
++  // A black backdrop behind the page (outside the zoomed content view).
++  NSView* content = window.contentView;
++  NSView* backdrop = [[NSView alloc] initWithFrame:content.frame];
++  backdrop.wantsLayer = YES;
++  backdrop.layer.backgroundColor = NSColor.blackColor.CGColor;
++  backdrop.layer.opacity = 0;
++  backdrop.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++  [content.superview addSubview:backdrop
++                     positioned:NSWindowBelow
++                     relativeTo:content];
++  objc_->backdrop = backdrop;
++
++  // The page, zoomed out to the element's spot and cropped to it.
++  ApplyInitialZoom(window, ZoomView(window), objc_->video_frame);
++  objc_->animator = [[SafariumVideoFullScreenAnimator alloc]
++      initWithOwner:weak_factory_.GetWeakPtr()];
++  ViewsNSWindowSetFullScreenAnimator(window, objc_->animator);
++
++  // The page now sees full screen, at the element's size: the element fills
++  // the window, where it was.
++  state_ = State::kWindowed;
++  view->SetWebContents(contents);
++  SyncPage();
++  contents->UpdateWebContentsVisibility(content::Visibility::VISIBLE);
++
++  // (Blocks copy the weak pointer and member function by value.)
++  const std::pair<NSNotificationName, void (VideoFullscreen::*)()> kEvents[] = {
++      {NSWindowDidEnterFullScreenNotification,
++       &VideoFullscreen::OnDidEnterFullScreen},
++      {NSWindowWillExitFullScreenNotification,
++       &VideoFullscreen::OnWillExitFullScreen},
++      {NSWindowDidExitFullScreenNotification,
++       &VideoFullscreen::OnDidExitFullScreen},
++  };
++  for (const auto& event : kEvents) {
++    base::WeakPtr<VideoFullscreen> weak = weak_factory_.GetWeakPtr();
++    void (VideoFullscreen::*fn)() = event.second;
++    [objc_->observers
++        addObject:[NSNotificationCenter.defaultCenter
++                      addObserverForName:event.first
++                                  object:window
++                                   queue:nil
++                              usingBlock:^(NSNotification*) {
++                                if (VideoFullscreen* self = weak.get()) {
++                                  (self->*fn)();
++                                }
++                              }]];
++  }
++
++  // Ordered in on whatever Space is showing (a full screen browser window's
++  // too), as WebKit does.
++  const NSWindowCollectionBehavior behavior = window.collectionBehavior;
++  window.collectionBehavior =
++      behavior | NSWindowCollectionBehaviorCanJoinAllSpaces;
++  widget_->Show();
++  window.collectionBehavior = behavior;
++  // Showing a window keeps it clear of the menu bar and the Dock; this one
++  // is the full screen's size from the start (as WebKit's is), so the page
++  // lays out once, at its final size.
++  [window setFrame:full_frame display:NO];
++  view->RequestFocus();
++  contents->Focus();
++  WhenDrawn(contents, base::BindOnce(&VideoFullscreen::OnVideoDrawn,
++                                     weak_factory_.GetWeakPtr()));
++}
++
++void VideoFullscreen::OnVideoDrawn() {
++  if (state_ != State::kWindowed || !widget_) {
++    return;
++  }
++  if (end_requested_) {
++    ReturnPage();
++    return;
++  }
++  // The element now shows in its own window, over its spot in the page.
++  NSWindow* window = widget_->GetNativeWindow().GetNativeNSWindow();
++  if (!NSEqualRects(window.frame, objc_->full_frame)) {
++    [window setFrame:objc_->full_frame display:NO];
++  }
++
++  ApplyInitialZoom(window, ZoomView(window), objc_->video_frame);
++  window.alphaValue = 1;
++  // Let that reach the screen before the transition starts.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&VideoFullscreen::GoFullscreen,
++                     weak_factory_.GetWeakPtr()),
++      base::Milliseconds(30));
++}
++
++void VideoFullscreen::GoFullscreen() {
++  if (state_ != State::kWindowed || !widget_) {
++    return;
++  }
++  if (end_requested_) {
++    ReturnPage();
++    return;
++  }
++  state_ = State::kEntering;
++  // The element lifts out of the page: its spot shows a fill.
++  objc_->placeholder.showsHole = YES;
++  objc_->placeholder.needsDisplay = YES;
++  widget_->SetFullscreen(true);
++}
++
++void VideoFullscreen::StartEnterAnimation(double duration) {
++  if (state_ != State::kEntering || !widget_) {
++    return;
++  }
++  // The live page zooms from the element's spot to the screen.
++  NSView* content = ZoomView(widget_->GetNativeWindow().GetNativeNSWindow());
++  CALayer* layer = content.layer;
++  CALayer* mask = layer.mask;
++  const NSRect bounds = content.bounds;
++  const CATransform3D from = layer.transform;
++  [CATransaction begin];
++  [CATransaction setDisableActions:YES];
++  layer.transform = CATransform3DIdentity;
++  [layer addAnimation:Animation(@"transform",
++                                [NSValue valueWithCATransform3D:from],
++                                [NSValue valueWithCATransform3D:
++                                             CATransform3DIdentity],
++                                duration)
++               forKey:@"zoom"];
++  if (mask) {
++    [mask addAnimation:Animation(@"bounds", [NSValue valueWithRect:mask.bounds],
++                                 [NSValue valueWithRect:NSMakeRect(
++                                              0, 0, NSWidth(bounds),
++                                              NSHeight(bounds))],
++                                 duration)
++                forKey:@"bounds"];
++    [mask addAnimation:Animation(@"position",
++                                 [NSValue valueWithPoint:mask.position],
++                                 [NSValue valueWithPoint:NSMakePoint(
++                                              NSMidX(bounds), NSMidY(bounds))],
++                                 duration)
++                forKey:@"position"];
++  }
++  objc_->backdrop.layer.opacity = 1;
++  [objc_->backdrop.layer addAnimation:Animation(@"opacity", @0, @1, duration)
++                               forKey:@"fade"];
++  [CATransaction commit];
++}
++
++void VideoFullscreen::OnDidEnterFullScreen() {
++  if (state_ != State::kEntering) {
++    return;
++  }
++  state_ = State::kFullscreen;
++  NSWindow* window = widget_->GetNativeWindow().GetNativeNSWindow();
++  CALayer* layer = ZoomView(window).layer;
++  [CATransaction begin];
++  [CATransaction setDisableActions:YES];
++  [layer removeAllAnimations];
++  [layer.mask removeAllAnimations];
++  layer.transform = CATransform3DIdentity;
++  layer.mask = nil;
++  [CATransaction commit];
++  window.ignoresMouseEvents = NO;
++  // In full screen the window controls show with the menu bar, as usual.
++  SetWindowButtonsHidden(window, NO);
++  callbacks_.state_changed.Run();
++  if (end_requested_) {
++    End();
++  }
++}
++
++void VideoFullscreen::OnWillExitFullScreen() {
++  if (state_ != State::kFullscreen) {
++    return;  // Our own End() (already kExiting).
++  }
++  // Left from the window itself: the page still shows full screen while it
++  // shrinks back; tell the browser to drop full screen.
++  state_ = State::kExiting;
++  SetWindowButtonsHidden(widget_->GetNativeWindow().GetNativeNSWindow(), YES);
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<VideoFullscreen> self) {
++            if (self && self->web_contents()) {
++              self->callbacks_.exited_by_user.Run(self->web_contents());
++            }
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
++void VideoFullscreen::StartExitAnimation(double duration) {
++  if (state_ != State::kExiting || !widget_) {
++    return;
++  }
++  // Where the element's spot is now (the browser window may have moved).
++  if (SafariumVideoPlaceholderView* placeholder = objc_->placeholder;
++      placeholder.window) {
++    objc_->video_frame = [placeholder.window
++        convertRectToScreen:[placeholder convertRect:objc_->hole toView:nil]];
++  }
++  NSWindow* window = widget_->GetNativeWindow().GetNativeNSWindow();
++  NSView* content = ZoomView(window);
++  CALayer* layer = content.layer;
++  const NSRect bounds = content.bounds;
++  const NSRect initial = [window convertRectFromScreen:objc_->video_frame];
++  const CATransform3D to = ZoomTransform(initial, bounds, layer);
++  CALayer* mask = [CALayer layer];
++  mask.backgroundColor = NSColor.blackColor.CGColor;
++  [CATransaction begin];
++  [CATransaction setDisableActions:YES];
++  mask.frame = InscribedRectWithAspect(bounds, initial.size);
++  layer.mask = mask;
++  layer.transform = to;
++  [layer addAnimation:Animation(@"transform",
++                                [NSValue valueWithCATransform3D:
++                                             CATransform3DIdentity],
++                                [NSValue valueWithCATransform3D:to], duration)
++               forKey:@"zoom"];
++  [mask addAnimation:Animation(@"bounds",
++                               [NSValue valueWithRect:NSMakeRect(
++                                            0, 0, NSWidth(bounds),
++                                            NSHeight(bounds))],
++                               [NSValue valueWithRect:mask.bounds], duration)
++              forKey:@"bounds"];
++  [mask addAnimation:Animation(@"position",
++                               [NSValue valueWithPoint:NSMakePoint(
++                                            NSMidX(bounds), NSMidY(bounds))],
++                               [NSValue valueWithPoint:mask.position],
++                               duration)
++              forKey:@"position"];
++  objc_->backdrop.layer.opacity = 0;
++  [objc_->backdrop.layer addAnimation:Animation(@"opacity", @1, @0, duration)
++                               forKey:@"fade"];
++  [CATransaction commit];
++}
++
++void VideoFullscreen::OnDidExitFullScreen() {
++  if (state_ == State::kExiting) {
++    ReturnPage();
++  }
++}
++
++void VideoFullscreen::End() {
++  switch (state_) {
++    case State::kNone:
++    case State::kExiting:
++    case State::kReturning:
++      return;
++    case State::kPreparing:
++      // Nothing moved yet.
++      state_ = State::kNone;
++      Observe(nullptr);
++      [objc_->placeholder removeFromSuperview];
++      objc_->placeholder = nil;
++      return;
++    case State::kWindowed:
++    case State::kEntering:
++      // Return it once drawn, or shrink back once full screen.
++      end_requested_ = true;
++      return;
++    case State::kFullscreen:
++      // The current frame first: the video shrinks back as that picture, and
++      // its spot keeps showing it, so nothing steps back in time. (Copies
++      // made during the transition only complete after it.)
++      state_ = State::kExiting;
++      SetWindowButtonsHidden(widget_->GetNativeWindow().GetNativeNSWindow(),
++                             YES);
++      CaptureElementFrame(base::BindOnce(
++          [](base::WeakPtr<VideoFullscreen> self) {
++            if (self && self->state_ == State::kExiting && self->widget_) {
++              self->widget_->SetFullscreen(false);
++            }
++          },
++          weak_factory_.GetWeakPtr()));
++      return;
++  }
++}
++
++// Puts the page's current element frame into the element's spot.
++void VideoFullscreen::CaptureElementFrame(base::OnceClosure done) {
++  content::WebContents* contents = web_contents();
++  content::RenderWidgetHostView* view =
++      contents ? contents->GetRenderWidgetHostView() : nullptr;
++  if (!view || !view->IsSurfaceAvailableForCopy() || !widget_) {
++    std::move(done).Run();
++    return;
++  }
++  const NSSize size =
++      widget_->GetNativeWindow().GetNativeNSWindow().contentView.bounds.size;
++  view->CopyFromSurface(
++      gfx::Rect(), gfx::Size(), kLastFrameTimeout,
++      base::BindOnce(
++          [](base::WeakPtr<VideoFullscreen> self, NSSize size,
++             base::OnceClosure done,
++             const content::CopyFromSurfaceResult& result) {
++            if (!self) {
++              return;
++            }
++            NSImage* image = ImageFromCopy(result, size);
++            if (image && self->widget_) {
++              // Over the page, inside the zoomed layer (zoomed and cropped
++              // with it).
++              CALayer* zoomed =
++                  ZoomView(self->widget_->GetNativeWindow().GetNativeNSWindow())
++                      .layer;
++              CALayer* cover = [CALayer layer];
++              [CATransaction begin];
++              [CATransaction setDisableActions:YES];
++              cover.frame = zoomed.bounds;
++              cover.contents = image;
++              cover.contentsGravity = kCAGravityResize;
++              [zoomed addSublayer:cover];
++              [CATransaction commit];
++              // The element's part of it, for the spot.
++              const NSRect part = InscribedRectWithAspect(
++                  NSMakeRect(0, 0, size.width, size.height),
++                  self->objc_->hole.size);
++              self->objc_->placeholder.holeImage = image;
++              self->objc_->placeholder.holeSourceRect = part;
++              self->objc_->placeholder.needsDisplay = YES;
++            }
++            std::move(done).Run();
++          },
++          weak_factory_.GetWeakPtr(), size, std::move(done)));
++}
++
++// The window is back over the element's spot: keep its last frame in the
++// spot, then return the page to the browser window.
++void VideoFullscreen::ReturnPage() {
++  state_ = State::kReturning;
++  // Without a frame of the element, the page's picture of it.
++  objc_->placeholder.showsHole = objc_->placeholder.holeImage != nil;
++  objc_->placeholder.needsDisplay = YES;
++  Finish(/*reattach=*/true, /*fade=*/true);
++}
++
++void VideoFullscreen::OnWindowClosing() {
++  if (finishing_ || !widget_) {
++    return;  // Our own Finish() closes it.
++  }
++  window_closing_ = true;
++  content::WebContents* contents = web_contents();
++  if (contents && state_ != State::kExiting && state_ != State::kReturning) {
++    // The browser drops full screen first, while this still counts as full
++    // screen (End() does nothing in kReturning).
++    state_ = State::kReturning;
++    callbacks_.exited_by_user.Run(contents);
++  }
++  if (IsActive()) {
++    Finish(/*reattach=*/true, /*fade=*/false);
++  }
++}
++
++void VideoFullscreen::Finish(bool reattach, bool fade) {
++  base::AutoReset<bool> finishing(&finishing_, true);
++  content::WebContents* contents = web_contents();
++  state_ = State::kNone;
++  end_requested_ = false;
++  Observe(nullptr);
++  for (id observer in objc_->observers) {
++    [NSNotificationCenter.defaultCenter removeObserver:observer];
++  }
++  [objc_->observers removeAllObjects];
++
++  if (widget_) {
++    NSWindow* window = widget_->GetNativeWindow().GetNativeNSWindow();
++    ViewsNSWindowSetFullScreenAnimator(window, nil);
++    // Out of sight before the page leaves it (it would show black).
++    window.alphaValue = 0;
++    if (auto* view = static_cast<views::WebView*>(
++            widget_delegate_ ? widget_delegate_->GetContentsView() : nullptr)) {
++      view->SetWebContents(nullptr);
++    }
++    if (window_closing_) {
++      // Already closing: let it finish before deleting.
++      base::SingleThreadTaskRunner::GetCurrentDefault()->DeleteSoon(
++          FROM_HERE, std::move(widget_));
++      base::SingleThreadTaskRunner::GetCurrentDefault()->DeleteSoon(
++          FROM_HERE, std::move(widget_delegate_));
++    } else {
++      widget_->CloseNow();
++      widget_.reset();
++    }
++  }
++  widget_delegate_.reset();
++  window_closing_ = false;
++  objc_->animator = nil;
++  objc_->backdrop = nil;
++
++  // The page sees the end of full screen and returns to the browser window
++  // (unless another tab took its place meanwhile).
++  // (Back in the browser window first, so the page relayouts once, at its
++  // size there.)
++  if (contents) {
++    if (reattach && callbacks_.active_page.Run() == contents) {
++      callbacks_.set_page.Run(contents);
++      contents->Focus();
++    } else {
++      fade = false;
++    }
++    SyncPage(contents);
++  }
++
++  SafariumVideoPlaceholderView* placeholder = objc_->placeholder;
++  objc_->placeholder = nil;
++  if (!fade) {
++    [placeholder removeFromSuperview];
++  } else if (placeholder) {
++    // Once the page's videos are back in place and the page has drawn that
++    // in the browser window.
++    WhenVideosBack(contents->GetWeakPtr(), video_rects_,
++                  base::TimeTicks::Now() + kVideosFitTimeout,
++                  base::BindOnce(^{
++                    [NSAnimationContext
++                        runAnimationGroup:^(NSAnimationContext* context) {
++                          context.duration = kFadeDuration;
++                          placeholder.animator.alphaValue = 0;
++                        }
++                        completionHandler:^{
++                          [placeholder removeFromSuperview];
++                        }];
++                  }));
++  }
++  callbacks_.state_changed.Run();
++}
++
++std::optional<bool> VideoFullscreen::GetOverride(
++    const content::WebContents* contents) const {
++  if (state_ == State::kNone || contents != web_contents()) {
++    return std::nullopt;
++  }
++  // Held back until the page has left the browser window; kept full screen
++  // until the window has shrunk back.
++  return state_ != State::kPreparing;
++}
++
++void VideoFullscreen::ActivePageChanging(content::WebContents* contents) {
++  if (!IsActive()) {
++    return;
++  }
++  if (contents == web_contents()) {
++    // Back to the full screen page: return it to the browser window now.
++    Finish(/*reattach=*/false, /*fade=*/false);
++    return;
++  }
++  // Another tab shows in the browser window: no still image over it.
++  [objc_->placeholder removeFromSuperview];
++  objc_->placeholder = nil;
++}
++
++void VideoFullscreen::SyncPage(content::WebContents* contents) {
++  if (!contents) {
++    contents = web_contents();
++  }
++  if (contents) {
++    if (auto* view = contents->GetRenderWidgetHostView()) {
++      view->GetRenderWidgetHost()->SynchronizeVisualProperties();
++    }
++  }
++}
++
++void VideoFullscreen::WebContentsDestroyed() {
++  // Nothing to return: close the window without touching the page.
++  Observe(nullptr);
++  Finish(/*reattach=*/false, /*fade=*/false);
++}
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.cc b/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.cc
+index 1dc8329849..84e9ba825b 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.cc
+@@ -10,11 +10,14 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
++#include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
+ #include "chrome/browser/ui/fullscreen/browser_window_fullscreen_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_window.h"
++#include "components/input/native_web_keyboard_event.h"
+ #include "content/public/browser/web_contents.h"
++#include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/display/types/display_constants.h"
+ #include "ui/views/widget/widget.h"
+ 
+@@ -58,6 +61,11 @@ void WebUIBrowserExclusiveAccessContext::EnterFullscreen(
+     const url::Origin& origin,
+     ExclusiveAccessBubbleType bubble_type,
+     FullscreenTabParams fullscreen_tab_params) {
++  // Safarium: the page is (going) full screen in a window of its own.
++  if (WebUIBrowserWindow* window = WebUIBrowserWindow::FromBrowser(browser_);
++      window && window->IsSafariumVideoFullscreenActive()) {
++    return;
++  }
+   const int64_t display_id = fullscreen_tab_params.display_id;
+   if (IsFullscreen() && display_id == display::kInvalidDisplayId) {
+     return;
+@@ -71,6 +79,13 @@ void WebUIBrowserExclusiveAccessContext::ExitFullscreen() {
+     return;
+   }
+ 
++  // Safarium: the page's own full screen window shrinks back.
++  if (WebUIBrowserWindow* window = WebUIBrowserWindow::FromBrowser(browser_);
++      window && window->IsSafariumVideoFullscreenActive()) {
++    EndSafariumVideoFullscreen();
++    return;
++  }
++
+   if (!IsFullscreen()) {
+     return;
+   }
+@@ -92,6 +107,13 @@ void WebUIBrowserExclusiveAccessContext::UpdateExclusiveAccessBubble(
+     // download.
+     should_close_bubble |= params.type == EXCLUSIVE_ACCESS_BUBBLE_TYPE_NONE;
+   }
++  // Safarium: no "press Esc" bubble for page full screen in its own window
++  // (as in Safari); the bubble would sit in the browser window anyway.
++  if (const WebUIBrowserWindow* window =
++          WebUIBrowserWindow::FromBrowser(browser_);
++      window && window->IsSafariumVideoFullscreenActive()) {
++    should_close_bubble = true;
++  }
+ 
+   if (should_close_bubble) {
+     if (first_hide_callback) {
+@@ -170,9 +192,64 @@ bool WebUIBrowserExclusiveAccessContext::CanUserExitFullscreen() const {
+ }
+ 
+ bool WebUIBrowserExclusiveAccessContext::IsFullscreen() const {
++  if (const WebUIBrowserWindow* window =
++          WebUIBrowserWindow::FromBrowser(browser_);
++      window && window->IsSafariumVideoFullscreenActive()) {
++    return true;
++  }
+   return widget_->IsFullscreen();
+ }
+ 
++// Called as a tab enters full screen (after it became the exclusive access
++// tab) and as it returns to browser full screen.
++void WebUIBrowserExclusiveAccessContext::UpdateUIForTabFullscreen() {
++  WebUIBrowserWindow* window = WebUIBrowserWindow::FromBrowser(browser_);
++  ExclusiveAccessManager* manager = ExclusiveAccessManager::From(browser_);
++  if (!window || !manager) {
++    return;
++  }
++  if (manager->fullscreen_controller()->IsWindowFullscreenForTabOrPending()) {
++    if (!window->IsSafariumVideoFullscreenActive()) {
++      window->BeginSafariumVideoFullscreen(GetWebContentsForExclusiveAccess());
++    }
++  } else if (window->IsSafariumVideoFullscreenActive()) {
++    EndSafariumVideoFullscreen();
++  }
++}
++
++void WebUIBrowserExclusiveAccessContext::EndSafariumVideoFullscreen() {
++  WebUIBrowserWindow::FromBrowser(browser_)->EndSafariumVideoFullscreen();
++  // An Esc that ended it starts Chrome's press-and-hold timer (hold Esc to
++  // leave browser full screen); its key-up can get lost while the window
++  // animates out, which would then also take the browser window out of full
++  // screen. Release the hold once this key press is done.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<WebUIBrowserExclusiveAccessContext> self) {
++            ExclusiveAccessManager* manager =
++                self ? ExclusiveAccessManager::From(self->browser_) : nullptr;
++            if (!manager ||
++                !manager->esc_key_hold_timer_for_test().IsRunning()) {
++              return;
++            }
++            input::NativeWebKeyboardEvent key_up(
++                blink::WebInputEvent::Type::kKeyUp,
++                blink::WebInputEvent::kNoModifiers, base::TimeTicks::Now());
++            key_up.windows_key_code = ui::VKEY_ESCAPE;
++            manager->HandleUserKeyEvent(key_up);
++          },
++          weak_ptr_factory_.GetWeakPtr()));
++}
++
++std::optional<bool>
++WebUIBrowserExclusiveAccessContext::GetTabFullscreenOverride(
++    const content::WebContents* web_contents) const {
++  const WebUIBrowserWindow* window = WebUIBrowserWindow::FromBrowser(browser_);
++  return window ? window->GetSafariumVideoFullscreenOverride(web_contents)
++                : std::nullopt;
++}
++
+ ExclusiveAccessManager*
+ WebUIBrowserExclusiveAccessContext::GetExclusiveAccessManager() {
+   // The exclusive_access_manager is created in InitPostWindowConstruction,
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.h b/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.h
+index 2018474821..42e8d77963 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.h
+@@ -68,6 +68,9 @@ class WebUIBrowserExclusiveAccessContext
+   bool CanUserEnterFullscreen() const override;
+   bool CanUserExitFullscreen() const override;
+   bool IsFullscreen() const override;
++  void UpdateUIForTabFullscreen() override;
++  std::optional<bool> GetTabFullscreenOverride(
++      const content::WebContents* web_contents) const override;
+ 
+   // ExclusiveAccessBubbleViewsContext:
+   ExclusiveAccessManager* GetExclusiveAccessManager() override;
+@@ -79,6 +82,9 @@ class WebUIBrowserExclusiveAccessContext
+   void DestroyAnyExclusiveAccessBubble() override;
+ 
+  private:
++  // Safarium: ends the page's own full screen window.
++  void EndSafariumVideoFullscreen();
++
+   const raw_ptr<Profile> profile_;
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<TabStripModel> tab_strip_model_;
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 3e7a9c4091..52995466eb 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -45,6 +45,9 @@
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "extensions/common/extension.h"
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/webui_browser/safarium_video_fullscreen.h"
++#endif
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_client_view.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.h"
+@@ -222,6 +225,48 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+           }
+         },
+         base::Unretained(this)));
++#if BUILDFLAG(IS_MAC)
++    safarium_video_fullscreen_ = std::make_unique<safarium::VideoFullscreen>(
++        widget_->GetNativeWindow(),
++        safarium::VideoFullscreen::Callbacks{
++            .set_page = base::BindRepeating(
++                [](WebUIBrowserWindow* window, content::WebContents* page) {
++                  if (window->safarium_root_) {
++                    window->safarium_root_->SetActiveContents(page);
++                  }
++                },
++                base::Unretained(this)),
++            .active_page = base::BindRepeating(
++                [](WebUIBrowserWindow* window) -> content::WebContents* {
++                  return window->browser_ ? window->browser_->GetTabStripModel()
++                                                ->GetActiveWebContents()
++                                          : nullptr;
++                },
++                base::Unretained(this)),
++            .state_changed = base::BindRepeating(
++                [](WebUIBrowserWindow* window) {
++                  if (auto* manager = window->browser_
++                                          ? ExclusiveAccessManager::From(
++                                                window->browser_)
++                                          : nullptr) {
++                    manager->fullscreen_controller()
++                        ->WindowFullscreenStateChanged();
++                  }
++                },
++                base::Unretained(this)),
++            .exited_by_user = base::BindRepeating(
++                [](WebUIBrowserWindow* window, content::WebContents* page) {
++                  if (auto* manager = window->browser_
++                                          ? ExclusiveAccessManager::From(
++                                                window->browser_)
++                                          : nullptr) {
++                    manager->fullscreen_controller()->ExitFullscreenModeForTab(
++                        page);
++                  }
++                },
++                base::Unretained(this)),
++        });
++#endif
+   } else {
+     web_view->LoadInitialURL(GURL(chrome::kChromeUIWebuiBrowserURL));
+     web_view_ = widget_->SetClientContentsView(std::move(web_view));
+@@ -262,6 +307,7 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+ }
+ 
+ WebUIBrowserWindow::~WebUIBrowserWindow() {
++  safarium_video_fullscreen_.reset();
+   browser_->GetFeatures().TearDownPreBrowserWindowDestruction();
+   web_view_ = nullptr;
+   // We want to destroy the extensions container before the `widget_` since
+@@ -731,6 +777,42 @@ void WebUIBrowserWindow::ProcessFullscreen(bool fullscreen) {
+       ->WindowFullscreenStateChanged();
+ }
+ 
++bool WebUIBrowserWindow::BeginSafariumVideoFullscreen(
++    content::WebContents* contents) {
++#if BUILDFLAG(IS_MAC)
++  return safarium_video_fullscreen_ &&
++         safarium_video_fullscreen_->Begin(contents);
++#else
++  return false;
++#endif
++}
++
++void WebUIBrowserWindow::EndSafariumVideoFullscreen() {
++#if BUILDFLAG(IS_MAC)
++  if (safarium_video_fullscreen_) {
++    safarium_video_fullscreen_->End();
++  }
++#endif
++}
++
++bool WebUIBrowserWindow::IsSafariumVideoFullscreenActive() const {
++#if BUILDFLAG(IS_MAC)
++  return safarium_video_fullscreen_ && safarium_video_fullscreen_->IsActive();
++#else
++  return false;
++#endif
++}
++
++std::optional<bool> WebUIBrowserWindow::GetSafariumVideoFullscreenOverride(
++    const content::WebContents* contents) const {
++#if BUILDFLAG(IS_MAC)
++  if (safarium_video_fullscreen_) {
++    return safarium_video_fullscreen_->GetOverride(contents);
++  }
++#endif
++  return std::nullopt;
++}
++
+ void WebUIBrowserWindow::UpdateSafariumContentFullscreen() {
+   if (!safarium_root_ || !browser_) {
+     return;
+@@ -738,8 +820,10 @@ void WebUIBrowserWindow::UpdateSafariumContentFullscreen() {
+   auto* manager = ExclusiveAccessManager::From(browser_);
+   // Only when the window is (going) full screen for the page: not the
+   // window's own full screen, nor a page "full screen" inside its tab.
++  // (Not while the page is full screen in its own window: the browser window
++  // keeps its toolbar and sidebar around the page's picture.)
+   safarium_root_->SetContentFullscreen(
+-      manager && IsFullscreen() &&
++      manager && IsFullscreen() && !IsSafariumVideoFullscreenActive() &&
+       manager->fullscreen_controller()->IsWindowFullscreenForTabOrPending());
+ }
+ 
+@@ -858,6 +942,11 @@ void WebUIBrowserWindow::OnActiveTabChanged(content::WebContents* old_contents,
+                                             int index,
+                                             int reason) {
+   if (safarium_root_) {
++#if BUILDFLAG(IS_MAC)
++    if (safarium_video_fullscreen_) {
++      safarium_video_fullscreen_->ActivePageChanging(new_contents);
++    }
++#endif
+     safarium_root_->SetActiveContents(new_contents);
+     // Mirror BrowserView: blank/NTP tabs focus the address field, others
+     // focus the page.
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 9298a8a90e..5647bc0b62 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_WINDOW_H_
+ #define CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_WINDOW_H_
+ 
++#include <optional>
+ #include <memory>
+ 
+ #include "base/callback_list.h"
+@@ -43,6 +44,7 @@ class WebUIStubLocationBar;
+ namespace safarium {
+ class SafariumRootView;
+ class TabBarController;
++class VideoFullscreen;
+ }  // namespace safarium
+ 
+ // A BrowserWindow implementation that uses WebUI for its primary UI. It still
+@@ -66,6 +68,13 @@ class WebUIBrowserWindow : public BrowserWindow,
+   // Returns the WebUIBrowserWindow for a BrowserWindowInterface. If browser
+   // does not use WebUIBrowserWindow, returns nullptr.
+   static WebUIBrowserWindow* FromBrowser(BrowserWindowInterface* browser);
++  // Safarium: page (video) full screen in a window of its own (see
++  // safarium_video_fullscreen.h). Begin returns false if it can't.
++  bool BeginSafariumVideoFullscreen(content::WebContents* contents);
++  void EndSafariumVideoFullscreen();
++  bool IsSafariumVideoFullscreenActive() const;
++  std::optional<bool> GetSafariumVideoFullscreenOverride(
++      const content::WebContents* contents) const;
+   static const WebUIBrowserWindow* FromBrowser(
+       const BrowserWindowInterface* browser);
+ 
+@@ -315,6 +324,7 @@ class WebUIBrowserWindow : public BrowserWindow,
+   std::unique_ptr<views::WebView> safarium_ui_web_view_;
+   std::unique_ptr<safarium::TabBarController> safarium_controller_;
+   raw_ptr<safarium::SafariumRootView> safarium_root_ = nullptr;
++  std::unique_ptr<safarium::VideoFullscreen> safarium_video_fullscreen_;
+ 
+   // A mapping between accelerators and Chrome command IDs as defined in
+   // //chrome/app/chrome_command_ids.h.
+diff --git a/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm b/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm
+index 95532e9a29..a90bc19af9 100644
+--- a/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm
++++ b/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm
+@@ -574,6 +574,12 @@ - (BOOL)shouldSuppressAppKitFrameAdjustments {
+ // respect the menu bar while avoiding AppKit's horizontal snapping across
+ // display boundaries.
+ - (NSRect)constrainFrameRect:(NSRect)frameRect toScreen:(NSScreen*)screen {
++  // Safarium: a window with its own full screen transition covers the whole
++  // screen (menu bar and Dock areas too) before and while it animates, as
++  // WebKit's full screen window does.
++  if (ViewsNSWindowHasFullScreenAnimator(self)) {
++    return frameRect;
++  }
+   if (self.isHeadless || self.parentWindow) {
+     // AppKit's default implementation moves child windows down to avoid
+     // the menu bar. We don't want that behavior, because widgets like the
+diff --git a/components/remote_cocoa/app_shim/views_nswindow_delegate.h b/components/remote_cocoa/app_shim/views_nswindow_delegate.h
+index 070acf4960..ff09b29cfc 100644
+--- a/components/remote_cocoa/app_shim/views_nswindow_delegate.h
++++ b/components/remote_cocoa/app_shim/views_nswindow_delegate.h
+@@ -35,6 +35,25 @@ typedef NS_OPTIONS(NSUInteger, NSWindowLiveResizeEdges) {
+ 
+ // The delegate set on the NSWindow when a
+ // remote_cocoa::NativeWidgetNSWindowBridge is initialized.
++// Safarium: a window can run AppKit's custom full screen animation itself,
++// and pick the window that leaving full screen returns to (as WebKit's
++// element full screen windows do). Windows without one keep AppKit's default
++// transition.
++@protocol ViewsNSWindowFullScreenAnimator <NSObject>
++- (void)window:(NSWindow*)window
++    startEnterFullScreenAnimationWithDuration:(NSTimeInterval)duration;
++- (void)window:(NSWindow*)window
++    startExitFullScreenAnimationWithDuration:(NSTimeInterval)duration;
++- (NSWindow*)destinationWindowToExitFullScreenForWindow:(NSWindow*)window;
++@end
++
++// Sets (or, with nil, clears) `window`'s full screen animator.
++REMOTE_COCOA_APP_SHIM_EXPORT void ViewsNSWindowSetFullScreenAnimator(
++    NSWindow* window,
++    id<ViewsNSWindowFullScreenAnimator> animator);
++REMOTE_COCOA_APP_SHIM_EXPORT bool ViewsNSWindowHasFullScreenAnimator(
++    NSWindow* window);
++
+ REMOTE_COCOA_APP_SHIM_EXPORT
+ @interface ViewsNSWindowDelegate : NSObject <NSWindowDelegate>
+ 
+diff --git a/components/remote_cocoa/app_shim/views_nswindow_delegate.mm b/components/remote_cocoa/app_shim/views_nswindow_delegate.mm
+index 45ff0c7552..cffae62856 100644
+--- a/components/remote_cocoa/app_shim/views_nswindow_delegate.mm
++++ b/components/remote_cocoa/app_shim/views_nswindow_delegate.mm
+@@ -4,6 +4,8 @@
+ 
+ #import "components/remote_cocoa/app_shim/views_nswindow_delegate.h"
+ 
++#import <objc/runtime.h>
++
+ #include <cmath>
+ #include <optional>
+ 
+@@ -23,6 +25,25 @@ @interface NSWindow (SPI)
+ - (NSWindowLiveResizeEdges)liveResizeEdges;
+ @end
+ 
++namespace {
++const char kFullScreenAnimatorKey = 0;
++
++id<ViewsNSWindowFullScreenAnimator> FullScreenAnimator(NSWindow* window) {
++  return objc_getAssociatedObject(window, &kFullScreenAnimatorKey);
++}
++}  // namespace
++
++bool ViewsNSWindowHasFullScreenAnimator(NSWindow* window) {
++  return FullScreenAnimator(window) != nil;
++}
++
++void ViewsNSWindowSetFullScreenAnimator(
++    NSWindow* window,
++    id<ViewsNSWindowFullScreenAnimator> animator) {
++  objc_setAssociatedObject(window, &kFullScreenAnimatorKey, animator,
++                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++}
++
+ @implementation ViewsNSWindowDelegate {
+  @private
+   raw_ptr<remote_cocoa::NativeWidgetNSWindowBridge, DanglingUntriaged>
+@@ -403,6 +424,35 @@ - (void)windowDidExitFullScreen:(NSNotification*)notification {
+   _parent->fullscreen_controller().OnWindowDidExitFullscreen();
+ }
+ 
++// Safarium: custom full screen transitions (see
++// ViewsNSWindowFullScreenAnimator). nil keeps AppKit's own.
++- (NSArray<NSWindow*>*)customWindowsToEnterFullScreenForWindow:
++    (NSWindow*)window {
++  return FullScreenAnimator(window) ? @[ window ] : nil;
++}
++
++- (NSArray<NSWindow*>*)customWindowsToExitFullScreenForWindow:
++    (NSWindow*)window {
++  return FullScreenAnimator(window) ? @[ window ] : nil;
++}
++
++- (void)window:(NSWindow*)window
++    startCustomAnimationToEnterFullScreenWithDuration:(NSTimeInterval)duration {
++  [FullScreenAnimator(window) window:window
++      startEnterFullScreenAnimationWithDuration:duration];
++}
++
++- (void)window:(NSWindow*)window
++    startCustomAnimationToExitFullScreenWithDuration:(NSTimeInterval)duration {
++  [FullScreenAnimator(window) window:window
++      startExitFullScreenAnimationWithDuration:duration];
++}
++
++- (NSWindow*)destinationWindowToExitFullScreenForWindow:(NSWindow*)window {
++  return [FullScreenAnimator(window)
++      destinationWindowToExitFullScreenForWindow:window];
++}
++
+ // Allow non-resizable windows (without NSWindowStyleMaskResizable) to fill the
+ // screen in fullscreen mode. This only happens when
+ // -[NSWindow toggleFullscreen:] is called since non-resizable windows have no
+diff --git a/third_party/blink/public/mojom/BUILD.gn b/third_party/blink/public/mojom/BUILD.gn
+index 08a4ca9e43..e7dc16fe0b 100644
+--- a/third_party/blink/public/mojom/BUILD.gn
++++ b/third_party/blink/public/mojom/BUILD.gn
+@@ -1186,6 +1186,7 @@ mojom("mojom_core") {
+     "frame/frame_visual_properties.mojom",
+     "frame/fullscreen.mojom",
+     "frame/intrinsic_sizing_info.mojom",
++    "frame/safarium_fullscreen.mojom",
+     "frame/lifecycle.mojom",
+     "frame/media_player_action.mojom",
+     "frame/remote_frame.mojom",
+diff --git a/third_party/blink/public/mojom/frame/safarium_fullscreen.mojom b/third_party/blink/public/mojom/frame/safarium_fullscreen.mojom
+new file mode 100644
+index 0000000000..de878a75d2
+--- /dev/null
++++ b/third_party/blink/public/mojom/frame/safarium_fullscreen.mojom
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module blink.mojom;
++
++import "ui/gfx/geometry/mojom/geometry.mojom";
++
++// Safarium: where an element sits just before it asks for full screen, so the
++// browser can show it full screen in its own window that grows from that spot
++// (as Safari does with videos). Channel-associated, so it arrives before the
++// frame's LocalFrameHost.EnterFullscreen request.
++interface SafariumFullscreenHost {
++  // `bounds`: the element's visible bounds in DIPs of the frame's local root
++  // widget.
++  WillRequestFullscreen(gfx.mojom.Rect bounds);
++};
+diff --git a/third_party/blink/renderer/core/fullscreen/fullscreen.cc b/third_party/blink/renderer/core/fullscreen/fullscreen.cc
+index e8c11b5d28..5f7f1a4fb8 100644
+--- a/third_party/blink/renderer/core/fullscreen/fullscreen.cc
++++ b/third_party/blink/renderer/core/fullscreen/fullscreen.cc
+@@ -36,6 +36,9 @@
+ #include "third_party/blink/public/mojom/permissions/permission.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
+ #include "third_party/blink/public/platform/task_type.h"
++#include "mojo/public/cpp/bindings/associated_remote.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
++#include "third_party/blink/public/mojom/frame/safarium_fullscreen.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_fullscreen_options.h"
+ #include "third_party/blink/renderer/core/css/style_change_reason.h"
+@@ -66,6 +69,7 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/event_loop.h"
++#include "third_party/blink/renderer/platform/widget/frame_widget.h"
+ 
+ namespace blink {
+ 
+@@ -888,6 +892,20 @@ void Fullscreen::ContinueRequestFullscreenAfterConditionsEnforcement(
+   From(window).pending_requests_.push_back(MakeGarbageCollected<PendingRequest>(
+       pending, request_type, options, resolver));
+   LocalFrame& frame = *window.GetFrame();
++  // Safarium: tell the browser where the element is first, so it can grow
++  // its full screen window from there (sent on the same channel as, and so
++  // before, the EnterFullscreen request).
++  if ((request_type & FullscreenRequestType::kForCrossProcessDescendant) == 0) {
++    if (FrameWidget* widget = frame.GetWidgetForLocalRoot()) {
++      if (AssociatedInterfaceProvider* provider =
++              frame.GetRemoteNavigationAssociatedInterfaces()) {
++        mojo::AssociatedRemote<mojom::blink::SafariumFullscreenHost> host;
++        provider->GetInterface(&host);
++        host->WillRequestFullscreen(
++            widget->BlinkSpaceToEnclosedDIPs(pending->BoundsInWidget()));
++      }
++    }
++  }
+   frame.GetChromeClient().EnterFullscreen(frame, options, request_type);
+ 
+   // 6. If `error` is false, then consume user activation given `pendingDoc`’s
+-- 
+2.54.0 (Apple Git-157)
+
