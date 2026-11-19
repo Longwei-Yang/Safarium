@@ -1,6 +1,6 @@
 # Safarium
 
-Safarium is a macOS web browser that pairs the Chromium engine with a native AppKit interface modelled on Safari 26. The tab bar, toolbar, sidebar and tab overview are written in AppKit and use the system's Liquid Glass. Pages, extensions and settings come from Chromium, so Chrome Web Store extensions work.
+Safarium is a macOS web browser that pairs the Chromium engine with a native AppKit interface modelled on Safari 27. The tab bar, toolbar, sidebar and tab overview are written in AppKit and use the system's Liquid Glass. Pages, extensions and settings come from Chromium, so Chrome Web Store extensions work.
 
 ![Safarium with the compact tab bar](docs/screenshots/horizontal.png)
 
@@ -24,7 +24,7 @@ Safarium is a macOS web browser that pairs the Chromium engine with a native App
 
 ## Install
 
-Safarium runs on Apple silicon Macs with macOS 26 or later.
+Safarium runs on Apple silicon Macs with macOS 26 or later. It is built and tested on macOS 27.2.
 
 1. Download the latest `Safarium-<version>-arm64.dmg` from [Releases](../../releases).
 2. Open it and drag **Safarium** into **Applications**.
