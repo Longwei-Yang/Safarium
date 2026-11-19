@@ -1,0 +1,51 @@
+From 3964f561d36ef7ee1bd7ad94e42acdaf4a6d8bd1 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 01:12:23 -0500
+Subject: [PATCH] Safarium: avoid native toolbar relayout during window
+ teardown
+
+Leave toolbar release to the closing NSWindow so AppKit cannot re-enter the destroyed widget delegate. Guard browser preference access after OnWidgetDestroyed clears the browser pointer.
+
+Validation: Default and Release builds pass; isolated horizontal and vertical window/tab-close and application-quit checks exit normally. The installed Release app also starts and quits normally.
+---
+ .../browser/ui/webui_browser/safarium_tab_bar_host_mac.mm  | 7 ++++---
+ .../browser/ui/webui_browser/webui_browser_window_mac.mm   | 7 +++++--
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index fbe0d428e8..f0df24c8a1 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -5328,9 +5328,10 @@ - (void)uninstall {
+   [NSNotificationCenter.defaultCenter removeObserver:self name:nil object:_window];
+   ++_overviewTransition;
+   [_downloadsPopover close];
+-  if (_window.toolbar == _toolbar) {
+-    _window.toolbar = nil;
+-  }
++  // The widget delegate has already been destroyed when ToolbarInstaller's
++  // view is deleted. Detaching the toolbar here makes AppKit recalculate the
++  // title bar through that dead delegate. Let the closing NSWindow release
++  // its toolbar instead.
+   _toolbar.delegate = nil;
+   _overviewView.delegate = nil;
+   [_overviewView resetZoom];
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index fec6015955..409c2e0f6a 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -187,9 +187,12 @@ void GetWindowFrameTitlebarHeight(bool* override_titlebar_height,
+     if (safarium::IsNativeUIEnabled()) {
+       // The horizontal toolbar supplies its own height. The vertical
+       // sidebar reserves a title bar row for the native window controls.
++      // OnWidgetDestroyed() clears browser_ before the view hierarchy is
++      // destroyed. Uninstalling the native toolbar can still make AppKit query
++      // this height during that teardown; let AppKit use its default then.
+       *override_titlebar_height =
+-          browser_->GetProfile()->GetPrefs()->GetBoolean(
+-              prefs::kVerticalTabsEnabled);
++          browser_ && browser_->GetProfile()->GetPrefs()->GetBoolean(
++                          prefs::kVerticalTabsEnabled);
+       *titlebar_height = 52;
+       return;
+     }
