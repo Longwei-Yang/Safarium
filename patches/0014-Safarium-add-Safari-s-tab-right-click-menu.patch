@@ -1,0 +1,558 @@
+From 5c5ca31197774b8356f45140465f6c7982b37b92 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:29:06 -0500
+Subject: [PATCH 14/17] Safarium: add Safari's tab right-click menu
+
+Right-click or Control-click a tab, the current tab's address field, a
+vertical sidebar tab or a Tab Overview card for Reload, Duplicate,
+Pin/Unpin, Mute/Unmute, Move Tab to New Window, Close Tab, Close Other
+Tabs, Close Tabs to the Right (Below), Copy Link and Arrange Tabs By
+Title or Website. The commands run through TabStripModel's own tab
+context menu commands; mute is per tab, as in Safari.
+
+AppKit answers clicks in the toolbar with its Customize Toolbar menu
+before item views see them, so the tab bar watches its window's right
+and Control clicks. The bar now also refreshes when only a tab's pinned
+state changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_controller.cc            | 136 +++++++++++
+ .../safarium_tab_bar_controller.h             |  26 ++
+ .../safarium_tab_bar_host_mac.mm              | 222 ++++++++++++++++++
+ 3 files changed, 384 insertions(+)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index 75b55840d2..7f3fe20008 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -14,6 +14,10 @@
+ #include "ui/base/base_window.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_muted_utils.h"
++#include "base/i18n/case_conversion.h"
++#include "base/strings/string_util.h"
++#include "components/tabs/public/tab_context_menu_command.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
+@@ -520,6 +524,134 @@ gfx::NativeWindow TabBarController::MoveTabToNewWindow(int index) {
+   return moved->GetWindow()->GetNativeWindow();
+ }
+ 
++namespace {
++
++std::optional<tabs::TabContextMenuCommand> ToChromeCommand(
++    TabBarController::TabMenuCommand command) {
++  using enum TabBarController::TabMenuCommand;
++  switch (command) {
++    case kReload:
++      return tabs::CommandReload;
++    case kDuplicate:
++      return tabs::CommandDuplicate;
++    case kTogglePinned:
++      return tabs::CommandTogglePinned;
++    case kMoveToNewWindow:
++      return tabs::CommandMoveTabsToNewWindow;
++    case kCloseTab:
++      return tabs::CommandCloseTab;
++    case kCloseOtherTabs:
++      return tabs::CommandCloseOtherTabs;
++    case kCloseTabsAfter:
++      return tabs::CommandCloseTabsToRight;
++    case kToggleMuted:
++    case kArrangeByTitle:
++    case kArrangeByWebsite:
++      return std::nullopt;
++  }
++}
++
++// Sort key for Arrange Tabs By > Website: the host without "www.".
++std::u16string WebsiteKey(content::WebContents* contents) {
++  std::string_view host = contents->GetLastCommittedURL().host();
++  if (base::StartsWith(host, "www.")) {
++    host = host.substr(4);
++  }
++  return base::UTF8ToUTF16(host);
++}
++
++}  // namespace
++
++bool TabBarController::IsTabMenuCommandEnabled(int64_t tab_id,
++                                               TabMenuCommand command) const {
++  tabs::TabInterface* tab = FindTab(tab_id);
++  if (!tab) {
++    return false;
++  }
++  TabStripModel* model = browser_->GetTabStripModel();
++  switch (command) {
++    case TabMenuCommand::kToggleMuted:
++      return tab->GetContents() != nullptr;
++    case TabMenuCommand::kArrangeByTitle:
++    case TabMenuCommand::kArrangeByWebsite:
++      return model->count() - model->IndexOfFirstNonPinnedTab() >= 2;
++    default:
++      return model->IsContextMenuCommandEnabled(tab->GetHandle(),
++                                                *ToChromeCommand(command));
++  }
++}
++
++void TabBarController::ExecuteTabMenuCommand(int64_t tab_id,
++                                             TabMenuCommand command) {
++  tabs::TabInterface* tab = FindTab(tab_id);
++  if (!tab || !IsTabMenuCommandEnabled(tab_id, command)) {
++    return;
++  }
++  TabStripModel* model = browser_->GetTabStripModel();
++  switch (command) {
++    case TabMenuCommand::kToggleMuted: {
++      content::WebContents* contents = tab->GetContents();
++      SetTabAudioMuted(contents, !contents->IsAudioMuted(),
++                       TabMutedReason::kAudioIndicator, std::string());
++      return;
++    }
++    case TabMenuCommand::kArrangeByTitle:
++    case TabMenuCommand::kArrangeByWebsite: {
++      // Like Safari: sorts the unpinned tabs; pinned tabs stay first.
++      struct Entry {
++        tabs::TabHandle handle;
++        std::u16string website;
++        std::u16string title;
++      };
++      const int first = model->IndexOfFirstNonPinnedTab();
++      std::vector<Entry> entries;
++      for (int i = first; i < model->count(); ++i) {
++        content::WebContents* contents = model->GetWebContentsAt(i);
++        entries.push_back({model->GetTabAtIndex(i)->GetHandle(),
++                           base::i18n::ToLower(WebsiteKey(contents)),
++                           base::i18n::ToLower(contents->GetTitle())});
++      }
++      const bool by_website = command == TabMenuCommand::kArrangeByWebsite;
++      std::stable_sort(entries.begin(), entries.end(),
++                       [by_website](const Entry& a, const Entry& b) {
++                         if (by_website && a.website != b.website) {
++                           return a.website < b.website;
++                         }
++                         return a.title < b.title;
++                       });
++      for (size_t i = 0; i < entries.size(); ++i) {
++        tabs::TabInterface* moving = entries[i].handle.Get();
++        const int from = moving ? model->GetIndexOfTab(moving) : -1;
++        const int to = first + static_cast<int>(i);
++        if (from >= 0 && from != to) {
++          model->MoveWebContentsAt(from, to, /*select_after_move=*/false);
++        }
++      }
++      return;
++    }
++    default:
++      model->ExecuteContextMenuCommand(tab->GetHandle(),
++                                       *ToChromeCommand(command));
++      return;
++  }
++}
++
++bool TabBarController::IsTabMuted(int64_t tab_id) const {
++  tabs::TabInterface* tab = FindTab(tab_id);
++  return tab && tab->GetContents() && tab->GetContents()->IsAudioMuted();
++}
++
++bool TabBarController::IsTabPinned(int64_t tab_id) const {
++  tabs::TabInterface* tab = FindTab(tab_id);
++  return tab && tab->IsPinned();
++}
++
++GURL TabBarController::TabURL(int64_t tab_id) const {
++  tabs::TabInterface* tab = FindTab(tab_id);
++  return tab && tab->GetContents() ? tab->GetContents()->GetVisibleURL()
++                                   : GURL();
++}
++
+ void TabBarController::ExecuteCommand(int command_id) {
+   chrome::ExecuteCommand(browser_, command_id);
+ }
+@@ -662,4 +794,8 @@ void TabBarController::OnTabChangedAt(tabs::TabInterface* tab,
+   PushState();
+ }
+ 
++void TabBarController::OnTabPinnedStateChanged(tabs::TabHandle tab) {
++  PushState();
++}
++
+ }  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index db9da50166..dc7a3d1543 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -99,6 +99,9 @@ class TabBarController : public TabStripModelObserver,
+   ~TabBarController() override;
+ 
+   void SetView(TabBarView* view);
++  base::WeakPtr<TabBarController> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
+   void PushState();
+ 
+   // Actions from the view.
+@@ -109,6 +112,26 @@ class TabBarController : public TabStripModelObserver,
+   // window, or a null window if the tab can't be moved (e.g. the last tab).
+   gfx::NativeWindow MoveTabToNewWindow(int index);
+ 
++  // Tab right-click menu, as in Safari. Tabs are named by TabItem::id, so a
++  // tab that moved while the menu was open is still the one acted on.
++  enum class TabMenuCommand {
++    kReload,
++    kDuplicate,
++    kTogglePinned,
++    kToggleMuted,
++    kMoveToNewWindow,
++    kCloseTab,
++    kCloseOtherTabs,
++    kCloseTabsAfter,  // To the right (below, with vertical tabs).
++    kArrangeByTitle,
++    kArrangeByWebsite,
++  };
++  bool IsTabMenuCommandEnabled(int64_t tab_id, TabMenuCommand command) const;
++  void ExecuteTabMenuCommand(int64_t tab_id, TabMenuCommand command);
++  bool IsTabMuted(int64_t tab_id) const;
++  bool IsTabPinned(int64_t tab_id) const;
++  GURL TabURL(int64_t tab_id) const;
++
+   // Subscribes to Chromium's tab thumbnails (the hover-card capture
+   // service) for every tab while the tab overview is shown.
+   void SetWantsThumbnails(bool wants);
+@@ -153,6 +176,9 @@ class TabBarController : public TabStripModelObserver,
+                               const TabStripSelectionChange& selection) override;
+   void OnTabChangedAt(tabs::TabInterface* tab,
+                       TabChangeType change_type) override;
++  // Pinning a tab that doesn't move (e.g. the first one) is only reported
++  // here.
++  void OnTabPinnedStateChanged(tabs::TabHandle tab) override;
+ 
+   // TabResourceUsageCollector::Observer:
+   void OnTabResourceMetricsRefreshed() override;
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 926c25a63f..92eaa3673c 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -271,6 +271,9 @@ - (void)addressFieldTextChanged;
+ // Press / drag / release on a tab. `cell` is the SafariumTabCell, or nil
+ // for the current tab when the press landed on the address field.
+ - (void)tabMouseDown:(NSEvent*)event cell:(NSView*)cell;
++// Right-click menu for a tab (`cell`: a SafariumTabCell, or nil for the
++// current tab when the click landed on the address field).
++- (NSMenu*)menuForTab:(NSView*)cell;
+ // Tab overview: the current tab's pill becomes an empty search field.
+ - (void)setOverviewMode:(BOOL)overview;
+ - (void)hideHoverCard;
+@@ -319,6 +322,15 @@ - (void)mouseDown:(NSEvent*)event {
+   [super mouseDown:event];
+ }
+ 
++// Right-click on the idle field shows the tab's menu, as in Safari; while
++// editing it is a text field's menu.
++- (NSMenu*)menuForEvent:(NSEvent*)event {
++  if (!self.editing) {
++    return [self.bar menuForTab:nil];
++  }
++  return [super menuForEvent:event];
++}
++
+ - (void)mouseDragged:(NSEvent*)event {
+   if (_pressForwarded) {
+     [self.bar tabMouseDragged:event];
+@@ -435,6 +447,108 @@ - (void)showIdleText {
+ // ---------------------------------------------------------------------------
+ // One tab cell.
+ 
++// --- Tab right-click menu ---------------------------------------------------
++
++// Runs the tab menu's items. Each item holds it (representedObject), so it
++// lives as long as the menu.
++@interface SafariumTabMenuHandler : NSObject
++- (instancetype)initWithController:
++                    (base::WeakPtr<safarium::TabBarController>)controller
++                             tabId:(int64_t)tabId;
++@end
++
++@implementation SafariumTabMenuHandler {
++  base::WeakPtr<safarium::TabBarController> _controller;
++  int64_t _tabId;
++}
++
++- (instancetype)initWithController:
++                    (base::WeakPtr<safarium::TabBarController>)controller
++                             tabId:(int64_t)tabId {
++  if ((self = [super init])) {
++    _controller = controller;
++    _tabId = tabId;
++  }
++  return self;
++}
++
++- (void)runCommand:(NSMenuItem*)item {
++  if (_controller) {
++    _controller->ExecuteTabMenuCommand(
++        _tabId,
++        static_cast<safarium::TabBarController::TabMenuCommand>(item.tag));
++  }
++}
++
++- (void)copyLink:(id)sender {
++  const GURL url = _controller ? _controller->TabURL(_tabId) : GURL();
++  if (!url.is_valid()) {
++    return;
++  }
++  NSString* spec = base::SysUTF8ToNSString(url.spec());
++  NSPasteboard* pasteboard = NSPasteboard.generalPasteboard;
++  [pasteboard declareTypes:@[ NSPasteboardTypeURL, NSPasteboardTypeString ]
++                     owner:nil];
++  [pasteboard setString:spec forType:NSPasteboardTypeURL];
++  [pasteboard setString:spec forType:NSPasteboardTypeString];
++}
++@end
++
++namespace {
++
++// Safari's tab menu, for a tab in the bar, the sidebar or the overview.
++NSMenu* TabMenu(safarium::TabBarController* controller,
++                int64_t tabId,
++                BOOL vertical) {
++  using Command = safarium::TabBarController::TabMenuCommand;
++  SafariumTabMenuHandler* handler =
++      [[SafariumTabMenuHandler alloc] initWithController:controller->GetWeakPtr()
++                                                   tabId:tabId];
++  NSMenu* menu = [[NSMenu alloc] initWithTitle:@""];
++  menu.autoenablesItems = NO;
++  auto add = [&](NSMenu* into, NSString* title, NSString* symbol,
++                 Command command) {
++    NSMenuItem* item = AddPageMenuItem(into, title, symbol, handler,
++                                       @selector(runCommand:));
++    item.tag = static_cast<NSInteger>(command);
++    item.representedObject = handler;
++    item.enabled = controller->IsTabMenuCommandEnabled(tabId, command);
++    return item;
++  };
++  const bool pinned = controller->IsTabPinned(tabId);
++  const bool muted = controller->IsTabMuted(tabId);
++  add(menu, @"Reload Tab", @"arrow.clockwise", Command::kReload);
++  add(menu, @"Duplicate Tab", @"plus.square.on.square", Command::kDuplicate);
++  add(menu, pinned ? @"Unpin Tab" : @"Pin Tab", pinned ? @"pin.slash" : @"pin",
++      Command::kTogglePinned);
++  add(menu, muted ? @"Unmute Tab" : @"Mute Tab",
++      muted ? @"speaker.wave.2" : @"speaker.slash", Command::kToggleMuted);
++  add(menu, @"Move Tab to New Window", @"macwindow.badge.plus",
++      Command::kMoveToNewWindow);
++  [menu addItem:NSMenuItem.separatorItem];
++  add(menu, @"Close Tab", @"xmark", Command::kCloseTab);
++  add(menu, @"Close Other Tabs", nil, Command::kCloseOtherTabs);
++  add(menu, vertical ? @"Close Tabs Below" : @"Close Tabs to the Right", nil,
++      Command::kCloseTabsAfter);
++  [menu addItem:NSMenuItem.separatorItem];
++  NSMenuItem* copy =
++      AddPageMenuItem(menu, @"Copy Link", @"link", handler, @selector(copyLink:));
++  copy.representedObject = handler;
++  copy.enabled = controller->TabURL(tabId).is_valid();
++  [menu addItem:NSMenuItem.separatorItem];
++  NSMenuItem* arrange = AddPageMenuItem(menu, @"Arrange Tabs By",
++                                        @"arrow.up.arrow.down", nil, nullptr);
++  arrange.submenu = [[NSMenu alloc] initWithTitle:@""];
++  arrange.submenu.autoenablesItems = NO;
++  add(arrange.submenu, @"Title", nil, Command::kArrangeByTitle);
++  add(arrange.submenu, @"Website", nil, Command::kArrangeByWebsite);
++  arrange.enabled =
++      controller->IsTabMenuCommandEnabled(tabId, Command::kArrangeByTitle);
++  return menu;
++}
++
++}  // namespace
++
+ @interface SafariumTabCell : NSView
+ @property(nonatomic) NSInteger index;
+ @property(nonatomic) BOOL active;
+@@ -710,6 +824,10 @@ - (void)mouseDown:(NSEvent*)event {
+   [self.bar tabMouseDown:event cell:self];
+ }
+ 
++- (NSMenu*)menuForEvent:(NSEvent*)event {
++  return [self.bar menuForTab:self];
++}
++
+ - (void)mouseDragged:(NSEvent*)event {
+   [self.bar tabMouseDragged:event];
+ }
+@@ -942,6 +1060,7 @@ - (void)setMemoryText:(NSString*)text high:(BOOL)high {
+ @implementation SafariumTabBarView {
+   // Weak; cleared by the host before the controller goes away.
+   RAW_PTR_EXCLUSION safarium::TabBarController* _controller;
++  id _contextClickMonitor;  // See -handleContextClick:.
+ 
+   NSView* _tabsGlass;
+   SafariumTintView* _tabsTint;
+@@ -1200,6 +1319,7 @@ - (void)viewDidMoveToWindow {
+              object:self.window];
+     [self updatePreferredWidthAnimated:NO];
+   }
++  [self updateContextClickMonitor];
+ }
+ 
+ - (void)windowDidResize:(NSNotification*)notification {
+@@ -2639,6 +2759,82 @@ - (void)tabMouseUp:(NSEvent*)event {
+   }
+ }
+ 
++- (NSMenu*)menuForTab:(NSView*)view {
++  SafariumTabCell* cell = view ? (SafariumTabCell*)view : _activeCell;
++  if (!_controller || !cell || _dragCell) {
++    return nil;
++  }
++  [self hideHoverCard];
++  return TabMenu(_controller, cell.tabId, _vertical);
++}
++
++// A right-click or Control-click on a tab (or the idle address field) pops
++// up the tab's menu. AppKit hands clicks in the toolbar to the toolbar's own
++// Customize Toolbar menu before any item view sees them, so the bar watches
++// its window's clicks instead. Returns nil (consumed) when it showed a menu.
++- (NSEvent*)handleContextClick:(NSEvent*)event {
++  if (event.window != self.window || self.hiddenOrHasHiddenAncestor ||
++      !self.superview) {
++    return event;
++  }
++  if (event.type == NSEventTypeLeftMouseDown &&
++      !(event.modifierFlags & NSEventModifierFlagControl)) {
++    return event;
++  }
++  NSView* hit = [self hitTest:[self.superview convertPoint:event.locationInWindow
++                                                  fromView:nil]];
++  NSView* tab = nil;
++  for (NSView* view = hit; view && view != self; view = view.superview) {
++    if ([view isKindOfClass:[SafariumTabCell class]]) {
++      tab = view;
++      break;
++    }
++    if (view == _addressField) {
++      if (_addressField.editing) {
++        return event;  // The text field's own menu.
++      }
++      tab = _activeCell;
++      break;
++    }
++    if ([view isKindOfClass:[NSTextView class]]) {
++      return event;  // The field editor.
++    }
++  }
++  NSMenu* menu = tab ? [self menuForTab:tab] : nil;
++  if (!menu) {
++    return event;
++  }
++  [NSMenu popUpContextMenu:menu withEvent:event forView:tab];
++  return nil;
++}
++
++- (void)dealloc {
++  if (_contextClickMonitor) {
++    [NSEvent removeMonitor:_contextClickMonitor];
++  }
++}
++
++- (void)updateContextClickMonitor {
++  if (_contextClickMonitor) {
++    [NSEvent removeMonitor:_contextClickMonitor];
++    _contextClickMonitor = nil;
++  }
++  if (!self.window) {
++    return;
++  }
++  __weak SafariumTabBarView* weakSelf = self;
++  _contextClickMonitor = [NSEvent
++      addLocalMonitorForEventsMatchingMask:NSEventMaskRightMouseDown |
++                                           NSEventMaskLeftMouseDown
++                                   handler:^NSEvent*(NSEvent* event) {
++                                     SafariumTabBarView* strongSelf = weakSelf;
++                                     return strongSelf
++                                                ? [strongSelf
++                                                      handleContextClick:event]
++                                                : event;
++                                   }];
++}
++
+ - (void)tabCellCloseClicked:(SafariumTabCell*)cell {
+   if (_controller) {
+     _controller->CloseTab(cell.index);
+@@ -2840,6 +3036,7 @@ @implementation SafariumOverviewTab
+ @protocol SafariumOverviewDelegate
+ - (void)overviewSelectTab:(SafariumOverviewTab*)tab;
+ - (void)overviewCloseTab:(SafariumOverviewTab*)tab;
++- (NSMenu*)overviewMenuForTab:(SafariumOverviewTab*)tab;
+ - (void)overviewNewTab;
+ - (void)overviewDismiss;
+ @end
+@@ -2849,10 +3046,21 @@ - (void)overviewDismiss;
+ // double-click wait as with a gesture recognizer.
+ @interface SafariumCardRootView : NSView
+ @property(nonatomic, copy) void (^onClick)(void);
++@property(nonatomic, copy) NSMenu* (^menuProvider)(void);
+ @end
+ 
+ @implementation SafariumCardRootView {
+   void (^_onClick)(void);
++  NSMenu* (^_menuProvider)(void);
++}
++- (NSMenu* (^)(void))menuProvider {
++  return _menuProvider;
++}
++- (void)setMenuProvider:(NSMenu* (^)(void))menuProvider {
++  _menuProvider = [menuProvider copy];
++}
++- (NSMenu*)menuForEvent:(NSEvent*)event {
++  return _menuProvider ? _menuProvider() : nil;
+ }
+ - (void (^)(void))onClick {
+   return _onClick;
+@@ -2883,6 +3091,7 @@ - (NSRect)headerRectInView:(NSView*)view;
+ - (NSBitmapImageRep*)headerSnapshot;
+ // Fades the header (close/icon/title) and card corners for the zoom.
+ - (void)setZoomedIn:(BOOL)zoomedIn duration:(CFTimeInterval)duration;
++- (NSMenu*)menuForCard;
+ @end
+ 
+ @implementation SafariumOverviewCard {
+@@ -2906,6 +3115,10 @@ - (void)loadView {
+   root.onClick = ^{
+     [weakSelf cardClicked:nil];
+   };
++  root.menuProvider = ^NSMenu* {
++    SafariumOverviewCard* strongSelf = weakSelf;
++    return strongSelf ? [strongSelf menuForCard] : nil;
++  };
+   _card = [[NSView alloc] initWithFrame:root.bounds];
+   _card.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+   _card.wantsLayer = YES;
+@@ -3080,6 +3293,11 @@ - (void)closeClicked:(id)sender {
+   }
+ }
+ 
++// Right-click on a tab's card: the tab's menu (none for the "+" card).
++- (NSMenu*)menuForCard {
++  return _tab ? [_delegate overviewMenuForTab:_tab] : nil;
++}
++
+ - (void)cardClicked:(id)sender {
+   if (_tab) {
+     [_delegate overviewSelectTab:_tab];
+@@ -5941,6 +6159,10 @@ - (void)overviewCloseTab:(SafariumOverviewTab*)tab {
+   }
+ }
+ 
++- (NSMenu*)overviewMenuForTab:(SafariumOverviewTab*)tab {
++  return _controller ? TabMenu(_controller, tab.tabId, _verticalTabs) : nil;
++}
++
+ - (void)overviewNewTab {
+   [self setOverview:NO zoomToTab:0];
+   if (_controller) {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,129 @@
+From fe5d68dab8e4485a53d04566fb8cf4ffb68220a1 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:33:09 -0500
+Subject: [PATCH 17/17] Safarium: sidebar button groups in interactive Liquid
+ Glass
+
+On macOS 27 each sidebar button group is one interactive
+NSGlassEffectView (effectIsInteractive) holding plain borderless
+buttons, so the system draws the press feedback. The hand-drawn
+hover highlight is dropped there. Earlier macOS keeps the
+click-through glass with the painted rollover.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 70 +++++++++++++++----
+ 1 file changed, 56 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index a3b0818ed3..d77b063917 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -4038,7 +4038,8 @@ - (void)configureButtonsWithTarget:(id)target;
+ - (void)layoutEditBadges;
+ @end
+ 
+-// Paint the toolbar-style rollover behind one icon on the shared glass.
++// Paint the toolbar-style rollover behind one icon on the shared glass
++// (before macOS 27; see MakeSidebarGroup).
+ @interface SafariumSidebarButton : NSButton
+ @end
+ 
+@@ -4103,9 +4104,14 @@ - (void)drawRect:(NSRect)dirtyRect {
+                                    NSString* label,
+                                    id target,
+                                    SEL action) {
+-  NSButton* button = [SafariumSidebarButton buttonWithImage:image
+-                                                      target:target
+-                                                      action:action];
++  // macOS 27: plain buttons inside interactive glass (MakeSidebarGroup).
++  Class button_class = [SafariumSidebarButton class];
++  if (@available(macOS 27.0, *)) {
++    button_class = [NSButton class];
++  }
++  NSButton* button = [button_class buttonWithImage:image
++                                            target:target
++                                            action:action];
+   button.bordered = NO;
+   button.imagePosition = NSImageOnly;
+   button.imageScaling = NSImageScaleProportionallyDown;
+@@ -4115,6 +4121,50 @@ - (void)drawRect:(NSRect)dirtyRect {
+   return button;
+ }
+ 
++// One sidebar button group: a Liquid Glass capsule holding the group's
++// buttons. On macOS 27 the capsule is interactive glass (the system draws the
++// press feedback) and the buttons are plain borderless NSButtons inside its
++// content view; earlier systems keep the click-through glass behind the
++// buttons with the painted toolbar-style rollover.
++static NSView* MakeSidebarGroup(NSArray<NSButton*>* buttons) {
++  NSView* host = nil;
++  NSView* group = nil;
++  if (@available(macOS 27.0, *)) {
++    NSGlassEffectView* glass =
++        [[NSGlassEffectView alloc] initWithFrame:NSZeroRect];
++    glass.style = NSGlassEffectViewStyleRegular;
++    glass.cornerRadius = kControlHeight / 2;
++    glass.effectIsInteractive = YES;
++    NSView* content = [[NSView alloc] initWithFrame:NSZeroRect];
++    content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++    glass.contentView = content;
++    group = glass;
++    host = content;
++  } else {
++    group = [[NSView alloc] initWithFrame:NSZeroRect];
++    NSView* glass = MakeGlass(kControlHeight / 2);
++    glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++    [group addSubview:glass];
++    host = group;
++  }
++  for (NSButton* button in buttons) {
++    [button removeFromSuperview];
++    [host addSubview:button];
++  }
++  return group;
++}
++
++// The view a sidebar group's buttons live in (see MakeSidebarGroup).
++static NSView* SidebarGroupContent(NSView* group) {
++  if (@available(macOS 27.0, *)) {
++    if ([group isKindOfClass:[NSGlassEffectView class]] &&
++        ((NSGlassEffectView*)group).contentView) {
++      return ((NSGlassEffectView*)group).contentView;
++    }
++  }
++  return group;
++}
++
+ @implementation SafariumSidebarView {
+   // Opaque window-background fill (like the horizontal toolbar) and a
+   // separator line on the trailing edge (like the one under the toolbar).
+@@ -4256,15 +4306,7 @@ - (void)setRows:(NSArray<NSArray<SafariumSidebarSegment*>*>*)rows {
+     for (SafariumSidebarSegment* segment in row) {
+       NSView* view = nil;
+       if (segment.kind == kSidebarSegmentGroup) {
+-        // System Liquid Glass capsule behind the group's native buttons.
+-        view = [[NSView alloc] initWithFrame:NSZeroRect];
+-        NSView* glass = MakeGlass(kControlHeight / 2);
+-        glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+-        [view addSubview:glass];
+-        for (NSButton* button in segment.buttons) {
+-          [button removeFromSuperview];
+-          [view addSubview:button];
+-        }
++        view = MakeSidebarGroup(segment.buttons);
+       } else {
+         SafariumSidebarSpacer* spacer =
+             [[SafariumSidebarSpacer alloc] initWithFrame:NSZeroRect];
+@@ -4574,7 +4616,7 @@ - (void)draggingSession:(NSDraggingSession*)session
+   _draggingItem = NO;
+   for (NSView* view in _segmentViews) {
+     view.alphaValue = 1;
+-    for (NSView* v in view.subviews) {
++    for (NSView* v in SidebarGroupContent(view).subviews) {
+       v.alphaValue = 1;
+     }
+   }
+-- 
+2.54.0 (Apple Git-157)
+

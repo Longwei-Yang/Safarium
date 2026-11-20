@@ -1,0 +1,811 @@
+From 36119dc057b2b755e36820aa95da6d4fe8d37698 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:40:49 -0500
+Subject: [PATCH 12/17] Safarium: make everyday features work, hide the ones
+ that can't
+
+Bubbles: Chrome anchors its password, address, bookmark and translate
+bubbles to its own location bar; Safarium registers its address field as
+that anchor (safarium_bubble_anchors) and gives the window an autofill
+bubble handler, so saving passwords and addresses, autofill, Bookmark This
+Tab and the QR code work. Address bubbles find the handler through the tab
+(Safarium windows have no BrowserView); the eyedropper and emoji panel are
+wired to the window.
+
+Context menu: Reading Mode and Listen open in the side panel (the immersive
+view needs Chrome's page area); the Lens overlay is off (it CHECKs without
+that page area), so image search opens Google in a new tab and "Ask Google
+about this page" is gone.
+
+Removed what can't work here: Cast (needs Chrome's toolbar), Google
+Translate settings (needs Google API keys), "AI in Chrome" settings, the
+sync / Google services row, and View > Always Show Toolbar in Full Screen
+(Safarium's toolbar doesn't read it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/media/router/BUILD.gn          |  1 +
+ .../media/router/media_router_feature.cc      |  7 +-
+ .../languages_page/languages_page.html.ts     |  2 +
+ .../languages_page_index.html.ts              |  2 +
+ .../languages_page/languages_page_index.ts    | 11 ++-
+ .../settings/people_page/people_page.html.ts  |  2 +
+ .../ui/autofill/address_bubbles_controller.cc | 36 +++++--
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |  4 +-
+ chrome/browser/ui/lens/BUILD.gn               |  1 +
+ .../lens_overlay_entry_point_controller.cc    |  8 ++
+ chrome/browser/ui/read_anything/BUILD.gn      |  1 +
+ .../read_anything_entry_point_controller.cc   |  7 ++
+ .../browser/ui/webui/settings/settings_ui.cc  |  9 ++
+ chrome/browser/ui/webui_browser/BUILD.gn      |  2 +
+ .../webui_browser/safarium_bubble_anchors.cc  | 98 +++++++++++++++++++
+ .../webui_browser/safarium_bubble_anchors.h   | 57 +++++++++++
+ .../safarium_tab_bar_host_mac.mm              | 55 +++++++++++
+ .../ui/webui_browser/webui_browser_window.cc  | 67 +++++++++++--
+ .../ui/webui_browser/webui_browser_window.h   |  5 +
+ 19 files changed, 355 insertions(+), 20 deletions(-)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_bubble_anchors.cc
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_bubble_anchors.h
+
+diff --git a/chrome/browser/media/router/BUILD.gn b/chrome/browser/media/router/BUILD.gn
+index 2ee20bbff0..7a5fb43785 100644
+--- a/chrome/browser/media/router/BUILD.gn
++++ b/chrome/browser/media/router/BUILD.gn
+@@ -47,6 +47,7 @@ static_library("media_router_feature") {
+     "//extensions/buildflags",
+   ]
+   deps = [
++    "//build:safarium_buildflags",
+     "//chrome/browser/profiles",
+     "//chrome/browser/profiles:profile",
+     "//chrome/common:constants",
+diff --git a/chrome/browser/media/router/media_router_feature.cc b/chrome/browser/media/router/media_router_feature.cc
+index e501001040..c56431b529 100644
+--- a/chrome/browser/media/router/media_router_feature.cc
++++ b/chrome/browser/media/router/media_router_feature.cc
+@@ -17,6 +17,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "build/build_config.h"
++#include "build/safarium_buildflags.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/common/pref_names.h"
+@@ -44,7 +45,11 @@
+ namespace media_router {
+ 
+ #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+-BASE_FEATURE(kMediaRouter, base::FEATURE_ENABLED_BY_DEFAULT);
++// Safarium: Cast's dialogs need Chrome's Views toolbar, which Safarium
++// doesn't have; leave the Media Router (Cast) off.
++BASE_FEATURE(kMediaRouter,
++             BUILDFLAG(SAFARIUM_BRANDING) ? base::FEATURE_DISABLED_BY_DEFAULT
++                                          : base::FEATURE_ENABLED_BY_DEFAULT);
+ BASE_FEATURE(kCastAllowAllIPsFeature,
+              "CastAllowAllIPs",
+              base::FEATURE_DISABLED_BY_DEFAULT);
+diff --git a/chrome/browser/resources/settings/languages_page/languages_page.html.ts b/chrome/browser/resources/settings/languages_page/languages_page.html.ts
+index 74fa2376ad..d966e2bf04 100644
+--- a/chrome/browser/resources/settings/languages_page/languages_page.html.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page.html.ts
+@@ -32,9 +32,11 @@ export function getHtml(this: SettingsLanguagesPageElement) {
+             <div title="${item.language.nativeDisplayName}" role="none">
+               ${this.formatIndex_(index)}. ${item.language.displayName}
+             </div>
++<if expr="not pp_if('is_safarium_branded')">
+             <div class="target-info secondary">
+               $i18n{translateTargetLabel}
+             </div>
++</if>
+ <if expr="is_win">
+             <div class="explain-selected"
+                 ?hidden="${!this.isProspectiveUiLanguage_(
+diff --git a/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts b/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
+index a0875b63fc..9c9ee72a30 100644
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
+@@ -17,7 +17,9 @@ export function getHtml(this: SettingsLanguagesPageIndexElement) {
+   <settings-spell-check-page slot="view" id="spellCheck">
+   </settings-spell-check-page>
+ 
++<if expr="not pp_if('is_safarium_branded')">
+   <settings-translate-page slot="view" id="translate"></settings-translate-page>
++</if>
+ 
+ <if expr="not is_macosx">
+   <settings-edit-dictionary-page slot="view" id="editDictionary"
+diff --git a/chrome/browser/resources/settings/languages_page/languages_page_index.ts b/chrome/browser/resources/settings/languages_page/languages_page_index.ts
+index 6240ce82f4..3cb6c26b24 100644
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.ts
+@@ -55,9 +55,14 @@ export class SettingsLanguagesPageIndexElement extends
+   protected accessor routes_: SettingsRoutes = routes;
+ 
+   private showDefaultViews_() {
+-    this.$.viewManager.switchViews(
+-        ['languages', 'spellCheck', 'translate'], 'no-animation',
+-        'no-animation');
++    // Safarium has no Google Translate (it needs Google API keys).
++    // <if expr="pp_if('is_safarium_branded')">
++    const views = ['languages', 'spellCheck'];
++    // </if>
++    // <if expr="not pp_if('is_safarium_branded')">
++    const views = ['languages', 'spellCheck', 'translate'];
++    // </if>
++    this.$.viewManager.switchViews(views, 'no-animation', 'no-animation');
+   }
+ 
+   override currentRouteChanged(newRoute: Route, oldRoute?: Route) {
+diff --git a/chrome/browser/resources/settings/people_page/people_page.html.ts b/chrome/browser/resources/settings/people_page/people_page.html.ts
+index 62ecdd2164..65b2ea1c45 100644
+--- a/chrome/browser/resources/settings/people_page/people_page.html.ts
++++ b/chrome/browser/resources/settings/people_page/people_page.html.ts
+@@ -83,6 +83,7 @@ export function getHtml(this: SettingsPeoplePageElement) {
+       </div>
+     </cr-link-row>
+ 
++<if expr="not pp_if('is_safarium_branded')">
+     <cr-link-row id="sync-setup" label="$i18n{syncAndNonPersonalizedServices}"
+         .subLabel="${this.getSyncAndNonPersonalizedServicesSubtext_()}"
+         @click="${this.onSyncClick_}"
+@@ -95,6 +96,7 @@ export function getHtml(this: SettingsPeoplePageElement) {
+         role-description="$i18n{subpageArrowRoleDescription}"
+         ?hidden="${!this.shouldHideSyncSetupLinkRow_()}">
+     </cr-link-row>
++</if>
+ 
+ <if expr="not is_chromeos">
+     ${this.signinAllowed_ ? html`
+diff --git a/chrome/browser/ui/autofill/address_bubbles_controller.cc b/chrome/browser/ui/autofill/address_bubbles_controller.cc
+index b8476585e5..1949f366c8 100644
+--- a/chrome/browser/ui/autofill/address_bubbles_controller.cc
++++ b/chrome/browser/ui/autofill/address_bubbles_controller.cc
+@@ -38,6 +38,7 @@
+ #include "components/autofill/content/browser/content_autofill_client.h"
+ #include "components/autofill/core/browser/data_model/addresses/autofill_profile.h"
+ #include "components/autofill/core/browser/field_types.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/autofill/core/browser/foundations/autofill_client.h"
+ #include "components/autofill/core/browser/ui/addresses/autofill_address_util.h"
+ #include "components/autofill/core/common/autofill_features.h"
+@@ -51,6 +52,22 @@ namespace autofill {
+ 
+ namespace {
+ 
++// The window's handler (registered as user data on the browser, which also
++// covers windows without a BrowserView such as the WebUI browser).
++AutofillBubbleHandler* GetBubbleHandler(content::WebContents* web_contents) {
++  if (tabs::TabInterface* tab =
++          tabs::TabInterface::MaybeGetFromContents(web_contents)) {
++    if (BrowserWindowInterface* browser = tab->GetBrowserWindowInterface()) {
++      if (AutofillBubbleHandler* handler =
++              AutofillBubbleHandler::Get(browser->GetUnownedUserDataHost())) {
++        return handler;
++      }
++    }
++  }
++  return BrowserWindow::FindBrowserWindowWithWebContents(web_contents)
++      ->GetAutofillBubbleHandler();
++}
++
+ AutofillBubbleBase* ShowSaveBubble(
+     const AutofillProfile& profile,
+     AutofillClient::SaveAddressBubbleType save_address_bubble_type,
+@@ -60,8 +77,7 @@ AutofillBubbleBase* ShowSaveBubble(
+   auto controller = std::make_unique<SaveAddressBubbleController>(
+       delegate, web_contents, profile, save_address_bubble_type);
+ 
+-  return BrowserWindow::FindBrowserWindowWithWebContents(web_contents)
+-      ->GetAutofillBubbleHandler()
++  return GetBubbleHandler(web_contents)
+       ->ShowSaveAddressProfileBubble(web_contents, std::move(controller),
+                                      shown_by_user_gesture);
+ }
+@@ -74,8 +90,7 @@ AutofillBubbleBase* ShowUpdateBubble(
+     base::WeakPtr<AddressBubbleControllerDelegate> delegate) {
+   auto update_controller = std::make_unique<UpdateAddressBubbleController>(
+       delegate, web_contents, profile, original_profile);
+-  return BrowserWindow::FindBrowserWindowWithWebContents(web_contents)
+-      ->GetAutofillBubbleHandler()
++  return GetBubbleHandler(web_contents)
+       ->ShowUpdateAddressProfileBubble(
+           web_contents, std::move(update_controller), shown_by_user_gesture);
+ }
+@@ -88,8 +103,7 @@ AutofillBubbleBase* ShowSignInPromo(
+     base::WeakPtr<AddressBubbleControllerDelegate> delegate) {
+   // TODO(crbug.com/381390420): Expose the `AutofillBubbleHandler` in
+   // `BrowserWindowInterface` and use that instead.
+-  return BrowserWindow::FindBrowserWindowWithWebContents(web_contents)
+-      ->GetAutofillBubbleHandler()
++  return GetBubbleHandler(web_contents)
+       ->ShowAddressSignInPromo(
+           web_contents, autofill_profile,
+           base::BindOnce(&AddressBubbleControllerDelegate::OnBubbleClosed,
+@@ -329,10 +343,14 @@ void AddressBubblesController::SetUpBubble(
+ }
+ 
+ void AddressBubblesController::MaybeShowIOSDektopAddressPromo() {
++  // Via the tab: windows without a BrowserView (WebUI browser) have none.
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_contents());
+   BrowserWindowInterface* browser =
+-      BrowserWindow::FindBrowserWindowWithWebContents(web_contents())
+-          ->AsBrowserView()
+-          ->browser();
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (!browser) {
++    return;
++  }
+ 
+   // Verify if user is eligible for iOS promo, and attempt showing if they are.
+   ios_promos_utils::VerifyIOSPromoEligibility(
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index e065fcf62b..b6fe91d867 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -302,8 +302,10 @@
+               Item(IDS_BOOKMARK_BAR_ALWAYS_SHOW_MAC)
+                   .command_id(IDC_SHOW_BOOKMARK_BAR)
+                   .remove_if(is_pwa || kSafarium),
++              // Safarium's native toolbar doesn't read this setting.
+               Item(IDS_TOGGLE_FULLSCREEN_TOOLBAR_MAC)
+-                  .command_id(IDC_TOGGLE_FULLSCREEN_TOOLBAR),
++                  .command_id(IDC_TOGGLE_FULLSCREEN_TOOLBAR)
++                  .remove_if(kSafarium),
+               Item(IDS_CONTEXT_MENU_SHOW_FULL_URLS)
+                   .command_id(IDC_SHOW_FULL_URLS)
+                   .remove_if(kSafarium),
+diff --git a/chrome/browser/ui/lens/BUILD.gn b/chrome/browser/ui/lens/BUILD.gn
+index 07f4d77244..05739164c7 100644
+--- a/chrome/browser/ui/lens/BUILD.gn
++++ b/chrome/browser/ui/lens/BUILD.gn
+@@ -219,6 +219,7 @@ if (!is_android) {
+     ]
+ 
+     deps = [
++      "//build:safarium_buildflags",
+       ":backend_logic_impl",
+       ":lens",
+       "//build:branding_buildflags",
+diff --git a/chrome/browser/ui/lens/lens_overlay_entry_point_controller.cc b/chrome/browser/ui/lens/lens_overlay_entry_point_controller.cc
+index 952d76c426..a4df06efa6 100644
+--- a/chrome/browser/ui/lens/lens_overlay_entry_point_controller.cc
++++ b/chrome/browser/ui/lens/lens_overlay_entry_point_controller.cc
+@@ -8,6 +8,7 @@
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/system/sys_info.h"
++#include "build/safarium_buildflags.h"
+ #include "chrome/browser/autocomplete/aim_eligibility_service_factory.h"
+ #include "chrome/browser/command_updater.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_utils.h"
+@@ -82,6 +83,12 @@ LensOverlayEntryPointController* LensOverlayEntryPointController::From(
+ 
+ // static
+ bool LensOverlayEntryPointController::IsEnabledOnInit(Profile* profile) {
++#if BUILDFLAG(SAFARIUM_BRANDING)
++  // Safarium: the overlay draws over Chrome's Views page area, which
++  // Safarium's native window doesn't have (it CHECKs). Image search falls
++  // back to Google Lens in a new tab.
++  return false;
++#else
+   // Feature is disabled via finch.
+   if (!lens::features::IsLensOverlayEnabled()) {
+     return false;
+@@ -115,6 +122,7 @@ bool LensOverlayEntryPointController::IsEnabledOnInit(Profile* profile) {
+   // Finally, only enable the overlay if user meets our minimum RAM requirement.
+   static int phys_mem_mb = base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
+   return phys_mem_mb > lens::features::GetLensOverlayMinRamMb();
++#endif
+ }
+ 
+ LensOverlayEntryPointController::LensOverlayEntryPointController(
+diff --git a/chrome/browser/ui/read_anything/BUILD.gn b/chrome/browser/ui/read_anything/BUILD.gn
+index 081cc12138..1136bceda7 100644
+--- a/chrome/browser/ui/read_anything/BUILD.gn
++++ b/chrome/browser/ui/read_anything/BUILD.gn
+@@ -115,6 +115,7 @@ source_set("impl") {
+     "read_anything_soft_navigation_observer.cc",
+   ]
+   deps = [
++    "//build:safarium_buildflags",
+     ":read_anything",
+     ":views",
+     "//chrome/app:command_ids",
+diff --git a/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc b/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc
+index 1c8435c42a..bd57f6b79f 100644
+--- a/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc
++++ b/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/read_anything/read_anything_entry_point_controller.h"
+ 
++#include "build/safarium_buildflags.h"
+ #include <string_view>
+ #include <type_traits>
+ #include <utility>
+@@ -268,6 +269,12 @@ void ReadAnythingEntryPointController::ShowUI(
+                                   open_trigger);
+   }
+ 
++#if BUILDFLAG(SAFARIUM_BRANDING)
++  // Safarium: the immersive (full page) presentation draws over Chrome's
++  // Views page area, which Safarium's native window doesn't have; use the
++  // side panel, which Safarium hosts.
++  presentation = Presentation::kSidePanel;
++#endif
+   if (tabs::TabInterface* tab = bwi->GetActiveTabInterface()) {
+     auto* controller = ReadAnythingController::From(tab);
+     CHECK(controller);
+diff --git a/chrome/browser/ui/webui/settings/settings_ui.cc b/chrome/browser/ui/webui/settings/settings_ui.cc
+index e003496aee..f7a04a7e61 100644
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -16,6 +16,7 @@
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/strcat.h"
+ #include "base/values.h"
++#include "build/safarium_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_features.h"
+@@ -698,9 +699,15 @@ SettingsUI::SettingsUI(content::WebUI* web_ui)
+   // Within the AI subpage are separate sections for Glic, for GEIC, and for all
+   // other AI features. The visibility of these is separately controlled, but
+   // we want to show the subpage if any of them are enabled.
++#if BUILDFLAG(SAFARIUM_BRANDING)
++  // Safarium: Chrome's AI features need Google services Safarium doesn't
++  // have (no Google API keys, no sign-in).
++  html_source->AddBoolean("showAiPage", false);
++#else
+   html_source->AddBoolean("showAiPage", !ai_settings_section.empty() ||
+                                             show_ai_features_section ||
+                                             enable_ai_mode_search);
++#endif
+   html_source->AddBoolean("showAiPageAiFeatureSection",
+                           show_ai_features_section);
+ 
+@@ -994,9 +1001,11 @@ void SettingsUI::UpdateAiSettingsSection() {
+   base::DictValue update;
+   update.Set("aiSettingsSection", ai_settings_section);
+   update.Set("glicDisallowedByAdmin", enablement.DisallowedByAdmin());
++#if !BUILDFLAG(SAFARIUM_BRANDING)
+   if (!ai_settings_section.empty()) {
+     update.Set("showAiPage", true);
+   }
++#endif
+ 
+   content::WebUIDataSource::Update(
+       web_ui()->GetWebContents()->GetBrowserContext(),
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index 2998f4cd54..67382ae837 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -107,6 +107,8 @@ source_set("impl") {
+   deps = []
+   if (is_mac) {
+     sources += [
++      "safarium_bubble_anchors.cc",
++      "safarium_bubble_anchors.h",
+       "safarium_downloads_popover.h",
+       "safarium_downloads_popover.mm",
+       "safarium_root_view.cc",
+diff --git a/chrome/browser/ui/webui_browser/safarium_bubble_anchors.cc b/chrome/browser/ui/webui_browser/safarium_bubble_anchors.cc
+new file mode 100644
+index 0000000000..5db7e12e76
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_bubble_anchors.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/safarium_bubble_anchors.h"
++
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/interaction/browser_elements.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace safarium {
++
++BubbleAnchors::BubbleAnchors(BrowserWindowInterface& browser)
++    : browser_(browser),
++      scoped_user_data_(browser.GetUnownedUserDataHost(), *this) {}
++
++BubbleAnchors::~BubbleAnchors() = default;
++
++views::BubbleAnchor BubbleAnchors::GetAnchor() {
++  BrowserElements* elements = BrowserElements::From(&browser_.get());
++  if (!elements) {
++    return views::BubbleAnchor();
++  }
++  for (ui::ElementIdentifier id :
++       {kLocationBarElementId, kContentsContainerViewElementId}) {
++    if (ui::TrackedElement* element = elements->GetElement(id)) {
++      return views::BubbleAnchor(element);
++    }
++  }
++  return views::BubbleAnchor();
++}
++
++ExtensionsContainerViews* BubbleAnchors::GetExtensionsContainerViews() {
++  return nullptr;
++}
++
++PinnedToolbarActions* BubbleAnchors::GetPinnedToolbarActions() {
++  return nullptr;
++}
++
++gfx::Size BubbleAnchors::GetToolbarButtonSize() const {
++  return gfx::Size();
++}
++
++views::BubbleAnchor BubbleAnchors::GetDefaultExtensionDialogAnchor() {
++  return GetAnchor();
++}
++
++page_actions::PageActionViewInterface* BubbleAnchors::GetPageActionViewInterface(
++    actions::ActionId action_id) {
++  return nullptr;
++}
++
++AppMenuControl* BubbleAnchors::GetAppMenuControl() {
++  return nullptr;
++}
++
++gfx::Rect BubbleAnchors::GetFindBarBoundingBox(int contents_bottom) {
++  return gfx::Rect();
++}
++
++void BubbleAnchors::FocusToolbar() {}
++
++views::AccessiblePaneView* BubbleAnchors::GetAsAccessiblePaneView() {
++  return nullptr;
++}
++
++views::BubbleAnchor BubbleAnchors::GetBubbleAnchor(
++    std::optional<actions::ActionId> action_id) {
++  return GetAnchor();
++}
++
++views::BubbleAnchor BubbleAnchors::GetPageActionBubbleAnchor(
++    actions::ActionId action_id) {
++  return GetAnchor();
++}
++
++void BubbleAnchors::ZoomChangedForActiveTab(bool can_show_bubble) {}
++
++AvatarToolbarButtonInterface* BubbleAnchors::GetAvatarToolbarButtonInterface() {
++  return nullptr;
++}
++
++ToolbarButton* BubbleAnchors::GetBackButton() {
++  return nullptr;
++}
++
++ReloadControl* BubbleAnchors::GetReloadButton() {
++  return nullptr;
++}
++
++WebUIToolbarWebView* BubbleAnchors::GetWebUIToolbarViewForTesting() {
++  return nullptr;
++}
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_bubble_anchors.h b/chrome/browser/ui/webui_browser/safarium_bubble_anchors.h
+new file mode 100644
+index 0000000000..88e023c761
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_bubble_anchors.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_BUBBLE_ANCHORS_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_BUBBLE_ANCHORS_H_
++
++#include "base/memory/raw_ref.h"
++#include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
++
++class BrowserWindowInterface;
++
++namespace safarium {
++
++// Safarium has no Views toolbar. Chrome's page bubbles that would point at a
++// toolbar or omnibox icon (save address, save card, ...) point at the address
++// field instead (the kLocationBarElementId element), else at the page. It is
++// registered as the browser's ToolbarButtonProvider; only the anchor queries
++// are meaningful (callers handle the null buttons/containers).
++class BubbleAnchors final : public ToolbarButtonProvider {
++ public:
++  explicit BubbleAnchors(BrowserWindowInterface& browser);
++  BubbleAnchors(const BubbleAnchors&) = delete;
++  BubbleAnchors& operator=(const BubbleAnchors&) = delete;
++  ~BubbleAnchors() override;
++
++  // ToolbarButtonProvider:
++  ExtensionsContainerViews* GetExtensionsContainerViews() override;
++  PinnedToolbarActions* GetPinnedToolbarActions() override;
++  gfx::Size GetToolbarButtonSize() const override;
++  views::BubbleAnchor GetDefaultExtensionDialogAnchor() override;
++  page_actions::PageActionViewInterface* GetPageActionViewInterface(
++      actions::ActionId action_id) override;
++  AppMenuControl* GetAppMenuControl() override;
++  gfx::Rect GetFindBarBoundingBox(int contents_bottom) override;
++  void FocusToolbar() override;
++  views::AccessiblePaneView* GetAsAccessiblePaneView() override;
++  views::BubbleAnchor GetBubbleAnchor(
++      std::optional<actions::ActionId> action_id) override;
++  views::BubbleAnchor GetPageActionBubbleAnchor(
++      actions::ActionId action_id) override;
++  void ZoomChangedForActiveTab(bool can_show_bubble) override;
++  AvatarToolbarButtonInterface* GetAvatarToolbarButtonInterface() override;
++  ToolbarButton* GetBackButton() override;
++  ReloadControl* GetReloadButton() override;
++  WebUIToolbarWebView* GetWebUIToolbarViewForTesting() override;
++
++ private:
++  views::BubbleAnchor GetAnchor();
++
++  const raw_ref<BrowserWindowInterface> browser_;
++  ui::ScopedUnownedUserData<ToolbarButtonProvider> scoped_user_data_;
++};
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_BUBBLE_ANCHORS_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index e39cfeab67..926c25a63f 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -24,6 +24,7 @@
+ #include "base/memory/raw_ptr_exclusion.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
+ #import "chrome/browser/ui/webui_browser/safarium_downloads_popover.h"
+@@ -40,6 +41,7 @@
+ #include "ui/views/controls/native/native_view_host.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_class_properties.h"
+ #include "ui/views/view_tracker.h"
+ #include "ui/views/widget/widget.h"
+ 
+@@ -256,6 +258,9 @@ - (BOOL)syncEditingState;
+ @end
+ 
+ @interface SafariumTabBarView : NSView <NSTextFieldDelegate>
++// Screen bounds of the current tab's address field, for Chrome's bubbles
++// (empty while it isn't on screen).
++- (gfx::Rect)addressFieldScreenBounds;
+ - (BOOL)isVertical;
+ - (void)setVertical:(BOOL)vertical;
+ - (void)setController:(safarium::TabBarController*)controller;
+@@ -2283,6 +2288,19 @@ - (void)addressFieldTextChanged {
+   }];
+ }
+ 
++- (gfx::Rect)addressFieldScreenBounds {
++  NSView* view = _activeCell;
++  if (!view.window || view.hiddenOrHasHiddenAncestor) {
++    view = _addressField;
++  }
++  NSWindow* window = view.window;
++  if (!window || view.hiddenOrHasHiddenAncestor) {
++    return gfx::Rect();
++  }
++  NSRect bounds = [view convertRect:view.bounds toView:nil];
++  return gfx::ScreenRectFromNSRect([window convertRectToScreen:bounds]);
++}
++
+ - (void)focusAddressField {
+   // Defer so pending tab-strip updates (which may end editing on a tab
+   // switch) are applied first.
+@@ -6192,6 +6210,42 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+ BEGIN_METADATA(VerticalSidebarView)
+ END_METADATA
+ 
++// Stands in for Chrome's location bar (kLocationBarElementId) so bubbles that
++// anchor there (save password, zoom, find) point at the address field.
++class AddressFieldAnchor : public views::View {
++  METADATA_HEADER(AddressFieldAnchor, views::View)
++
++ public:
++  AddressFieldAnchor(SafariumTabBarView* tab_view, views::View* page_view)
++      : tab_view_(tab_view), page_view_(page_view) {
++    SetProperty(views::kElementIdentifierKey, kLocationBarElementId);
++    SetCanProcessEventsWithinSubtree(false);
++  }
++  AddressFieldAnchor(const AddressFieldAnchor&) = delete;
++  AddressFieldAnchor& operator=(const AddressFieldAnchor&) = delete;
++  ~AddressFieldAnchor() override = default;
++
++  gfx::Rect GetAnchorBoundsInScreen() const override {
++    gfx::Rect bounds = [tab_view_ addressFieldScreenBounds];
++    if (bounds.IsEmpty()) {
++      // Toolbar hidden (e.g. full screen): the top center of the page.
++      if (const views::View* page = page_view_.view()) {
++        const gfx::Rect page_bounds = page->GetBoundsInScreen();
++        bounds = gfx::Rect(page_bounds.CenterPoint().x(), page_bounds.y(), 1,
++                           1);
++      }
++    }
++    return bounds;
++  }
++
++ private:
++  SafariumTabBarView* __weak tab_view_;
++  views::ViewTracker page_view_;
++};
++
++BEGIN_METADATA(AddressFieldAnchor)
++END_METADATA
++
+ class ToolbarInstaller : public views::View, public TabBarView {
+   METADATA_HEADER(ToolbarInstaller, views::View)
+ 
+@@ -6202,6 +6256,7 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+         initWithFrame:NSMakeRect(0, 0, 600, kControlHeight)];
+     [tab_view_ setController:controller];
+     [tab_view_ updatePreferredWidthAnimated:NO];
++    AddChildView(std::make_unique<AddressFieldAnchor>(tab_view_, page_view));
+ 
+     // views::FocusManager must know the page no longer has focus, or
+     // views::WebView re-focuses the renderer on the next navigation commit
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 52995466eb..70ab4f9104 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -39,6 +39,16 @@
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
+ #include "chrome/browser/ui/webui_browser/browser_elements_webui_browser.h"
++#include "chrome/browser/translate/chrome_translate_client.h"
++#include "chrome/browser/ui/actions/chrome_action_id.h"
++#include "chrome/browser/ui/translate/translate_controller.h"
++#include "chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h"
++#include "chrome/browser/ui/views/bookmarks/bookmark_bubble_view.h"
++#include "chrome/browser/ui/views/eye_dropper/eye_dropper.h"
++#include "chrome/browser/ui/webui_browser/safarium_bubble_anchors.h"
++#include "components/translate/core/browser/language_state.h"
++#include "components/translate/core/browser/translate_manager.h"
++#include "ui/display/types/display_constants.h"
+ #include "chrome/browser/ui/webui_browser/safarium_features.h"
+ #include "extensions/browser/extension_registry.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -226,6 +236,11 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+         },
+         base::Unretained(this)));
+ #if BUILDFLAG(IS_MAC)
++    safarium_bubble_anchors_ =
++        std::make_unique<safarium::BubbleAnchors>(*browser_);
++    autofill_bubble_handler_ =
++        std::make_unique<autofill::AutofillBubbleHandlerImpl>(
++            browser_.get(), safarium_bubble_anchors_.get());
+     safarium_video_fullscreen_ = std::make_unique<safarium::VideoFullscreen>(
+         widget_->GetNativeWindow(),
+         safarium::VideoFullscreen::Callbacks{
+@@ -308,6 +323,8 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+ 
+ WebUIBrowserWindow::~WebUIBrowserWindow() {
+   safarium_video_fullscreen_.reset();
++  autofill_bubble_handler_.reset();
++  safarium_bubble_anchors_.reset();
+   browser_->GetFeatures().TearDownPreBrowserWindowDestruction();
+   web_view_ = nullptr;
+   // We want to destroy the extensions container before the `widget_` since
+@@ -1034,6 +1051,9 @@ void WebUIBrowserWindow::OnContentsElementShown(ui::TrackedElement* element) {
+ 
+ autofill::AutofillBubbleHandler*
+ WebUIBrowserWindow::GetAutofillBubbleHandler() {
++  if (autofill_bubble_handler_) {
++    return autofill_bubble_handler_.get();
++  }
+   NOTIMPLEMENTED_LOG_ONCE();
+   return nullptr;
+ }
+@@ -1156,7 +1176,14 @@ void WebUIBrowserWindow::ShowIntentPickerBubble(
+ 
+ void WebUIBrowserWindow::ShowBookmarkBubble(const GURL& url,
+                                             bool already_bookmarked) {
+-  NOTIMPLEMENTED_LOG_ONCE();
++  if (!safarium_bubble_anchors_) {
++    NOTIMPLEMENTED_LOG_ONCE();
++    return;
++  }
++  BookmarkBubbleView::ShowBubble(
++      safarium_bubble_anchors_->GetBubbleAnchor(std::nullopt),
++      browser_->GetTabStripModel()->GetActiveWebContents(),
++      /*highlighted_button=*/nullptr, browser_.get(), url, already_bookmarked);
+ }
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -1172,8 +1199,28 @@ ShowTranslateBubbleResult WebUIBrowserWindow::ShowTranslateBubble(
+     const std::string& target_language,
+     translate::TranslateErrors error_type,
+     bool is_user_gesture) {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return ShowTranslateBubbleResult::kBrowserWindowNotValid;
++  TranslateController* translate_controller =
++      TranslateController::From(browser_.get());
++  if (!safarium_bubble_anchors_ || !translate_controller) {
++    NOTIMPLEMENTED_LOG_ONCE();
++    return ShowTranslateBubbleResult::kBrowserWindowNotValid;
++  }
++  // As BrowserView, pointing at Safarium's address field.
++  if (contents->IsFocusedElementEditable()) {
++    return ShowTranslateBubbleResult::kEditableFieldIsActive;
++  }
++  ChromeTranslateClient::FromWebContents(contents)
++      ->GetTranslateManager()
++      ->GetLanguageState()
++      ->SetTranslateEnabled(true);
++  if (IsMinimized()) {
++    return ShowTranslateBubbleResult::kBrowserWindowMinimized;
++  }
++  translate_controller->ShowTranslateBubble(
++      contents, safarium_bubble_anchors_->GetBubbleAnchor(kActionShowTranslate),
++      /*highlighted_element=*/std::nullopt, step, source_language,
++      target_language, error_type, is_user_gesture);
++  return ShowTranslateBubbleResult::kSuccess;
+ }
+ 
+ DownloadBubbleUIController*
+@@ -1357,14 +1404,22 @@ bool WebUIBrowserWindow::IsVisibleOnAllWorkspaces() const {
+ }
+ 
+ void WebUIBrowserWindow::ShowEmojiPanel() {
+-  NOTIMPLEMENTED_LOG_ONCE();
++  // As BrowserView: leave page full screen first (UI spoofing).
++  if (content::WebContents* contents =
++          browser_->GetTabStripModel()->GetActiveWebContents()) {
++    if (!contents->ForSecurityDropFullscreen(display::kInvalidDisplayId)) {
++      return;
++    }
++  }
++  if (widget_ && !widget_->IsClosed()) {
++    widget_->ShowEmojiPanel();
++  }
+ }
+ 
+ std::unique_ptr<content::EyeDropper> WebUIBrowserWindow::OpenEyeDropper(
+     content::RenderFrameHost* frame,
+     content::EyeDropperListener* listener) {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return nullptr;
++  return ShowEyeDropper(frame, listener);
+ }
+ 
+ void WebUIBrowserWindow::ShowCaretBrowsingDialog() {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 5647bc0b62..1a3e630688 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -42,6 +42,7 @@ class WebUIBrowserWebContentsDelegate;
+ class WebUIStubLocationBar;
+ 
+ namespace safarium {
++class BubbleAnchors;
+ class SafariumRootView;
+ class TabBarController;
+ class VideoFullscreen;
+@@ -325,6 +326,10 @@ class WebUIBrowserWindow : public BrowserWindow,
+   std::unique_ptr<safarium::TabBarController> safarium_controller_;
+   raw_ptr<safarium::SafariumRootView> safarium_root_ = nullptr;
+   std::unique_ptr<safarium::VideoFullscreen> safarium_video_fullscreen_;
++  // Anchors for Chrome's autofill bubbles (save address / card), which Safarium
++  // points at its address field. The handler is destroyed first.
++  std::unique_ptr<safarium::BubbleAnchors> safarium_bubble_anchors_;
++  std::unique_ptr<autofill::AutofillBubbleHandler> autofill_bubble_handler_;
+ 
+   // A mapping between accelerators and Chrome command IDs as defined in
+   // //chrome/app/chrome_command_ids.h.
+-- 
+2.54.0 (Apple Git-157)
+

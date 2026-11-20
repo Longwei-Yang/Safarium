@@ -1,0 +1,86 @@
+From cde1996bc35d0ff07634a4c92eb6b1d5ba500a34 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:48:07 -0500
+Subject: [PATCH 16/17] Safarium: mark pinned tabs in the vertical sidebar
+
+Pinned tabs keep their full row in the sidebar, so they looked like any
+other tab. A small pin at the row's trailing edge now marks them (not on
+the current tab, whose row is the address field). The horizontal bar
+still shows pinned tabs as icon-only tiles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 29 ++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 80a6cfec25..a3b0818ed3 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -584,6 +584,9 @@ - (void)tabCellHoverChanged:(SafariumTabCell*)cell;
+ 
+ @implementation SafariumTabCell {
+   NSTrackingArea* _tracking;
++  // Sidebar rows mark pinned tabs with a pin at the trailing edge (in the
++  // toolbar a pinned tab is an icon-only tile instead).
++  NSImageView* _pinView;
+   BOOL _hovered;
+   CGFloat _contentX;
+   BOOL _hasContentX;
+@@ -644,6 +647,13 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _separator = [[NSView alloc] initWithFrame:NSZeroRect];
+     _separator.wantsLayer = YES;
+     [self addSubview:_separator];
++
++    _pinView = [NSImageView imageViewWithImage:Symbol(@"pin.fill", 12,
++                                                      NSFontWeightRegular)];
++    _pinView.contentTintColor = NSColor.secondaryLabelColor;
++    _pinView.hidden = YES;
++    _pinView.accessibilityElement = NO;
++    [self addSubview:_pinView];
+     [self refreshColors];
+   }
+   return self;
+@@ -657,6 +667,14 @@ - (void)setIcon:(NSImage*)icon {
+   _iconView.image = icon;
+ }
+ 
++- (void)setPinned:(BOOL)pinned {
++  if (_pinned == pinned) {
++    return;
++  }
++  _pinned = pinned;
++  self.needsLayout = YES;
++}
++
+ - (void)layout {
+   [super layout];
+   NSRect b = self.bounds;
+@@ -665,6 +683,7 @@ - (void)layout {
+   _closeButton.frame = NSMakeRect(kTabCloseInset, iconY, kIconSize, kIconSize);
+   const BOOL vertical = [self.bar isVertical];
+   [self updateCloseAffordanceAnimated:NO];
++  _pinView.hidden = !(_pinned && vertical && !_active);
+   if (_pinned && !vertical) {
+     _iconView.frame = NSMakeRect(floor((b.size.width - kIconSize) / 2), iconY,
+                                  kIconSize, kIconSize);
+@@ -676,7 +695,15 @@ - (void)layout {
+   // In the toolbar the centered content reserves a separate close slot.
+   const CGFloat leadingReserve =
+       vertical ? kTabCloseInset : kTabCloseInset + kIconSize + 4;
+-  const CGFloat trailingReserve = 10;
++  CGFloat trailingReserve = 10;
++  if (!_pinView.hidden) {
++    const NSSize pin = _pinView.intrinsicContentSize;
++    _pinView.frame =
++        NSMakeRect(b.size.width - 12 - pin.width,
++                   floor((b.size.height - pin.height) / 2), pin.width,
++                   pin.height);
++    trailingReserve += pin.width + 6;
++  }
+   CGFloat maxTitle = MAX(0, b.size.width - leadingReserve - trailingReserve -
+                                 kIconSize - 6);
+   CGFloat textW = ceil([_titleLabel.stringValue sizeWithAttributes:@{
+-- 
+2.54.0 (Apple Git-157)
+

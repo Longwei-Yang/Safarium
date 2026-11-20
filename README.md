@@ -14,7 +14,9 @@ Motion is a first-class part of Safarium. Each transition was timed frame by fra
 
 - **Tabs.** Opening, closing, switching and dragging tabs slide every tab to its new place, and the tab strip grows and shrinks smoothly when tabs come and go.
 - **Address field.** When you start editing, the site name stays put while the full address grows around it and slides into place; the favicon glides between the centre and the edge.
-- **Tab Overview.** The current page shrinks into its card in the grid and grows back out of whichever card you pick, and the address field fades into a search field.
+- **Tab menu.** Right-click a tab, the address field or a Tab Overview card for Safari's tab menu: pin, mute, copy link, duplicate, arrange tabs by title or website, move to a new window, and close tabs. Right-click an extension's button to manage it or remove it from the toolbar.
+
+**Tab Overview.** The current page shrinks into its card in the grid and grows back out of whichever card you pick, and the address field fades into a search field.
 
 In one place Safarium goes further than Safari:
 
@@ -39,6 +41,8 @@ The interface and its animations will keep being refined.
 ![Tab Overview](docs/screenshots/overview.png)
 
 **Full screen video.** A video goes into its own full-screen space and returns to where you were, the desktop or a full-screen browser window.
+
+**Passwords, autofill and bookmarks.** Safarium offers to save passwords and addresses after you submit a form, fills them in later, and confirms new bookmarks (⌘D), each with a bubble under the address field. Right-click a page to make a QR code for it.
 
 **New Tab shortcuts.** The New Tab page holds up to 20 shortcuts.
 
@@ -65,7 +69,8 @@ To update, quit Safarium and replace the app with the one from the newer DMG, th
 ## Limitations
 
 - No automatic updates. Each release is a new DMG, and Chromium security fixes arrive only with a new Safarium build.
-- No Google account sign-in or sync, since the build has no Google API keys.
+- No Google account sign-in or sync, since the build has no Google API keys. For the same reason page translation, Google Lens and the "AI in Chrome" features are left out.
+- No Cast.
 - Apple silicon only.
 
 ## Build from source

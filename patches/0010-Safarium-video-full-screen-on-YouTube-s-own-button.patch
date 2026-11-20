@@ -1,0 +1,242 @@
+From 82e00d52f9dc908dd177426f4cab667ce3be795b Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:27:20 -0500
+Subject: [PATCH 10/17] Safarium: video full screen on YouTube's own button
+
+YouTube's full-screen button and its "f" key put the whole page (<html>)
+in full screen and enlarge the player with their own CSS, so the zoom
+started and ended at the whole page instead of the video.
+
+- Blink anchors the reported full-screen rect on the largest video inside
+  the full-screen element when that element isn't a video itself.
+- Entering waits (up to 0.6 s) until a video fills the full-screen window
+  before zooming, so the video grows rather than a miniature of the page.
+- Leaving hands back once a video is at that anchor again (or the videos
+  have stopped moving), instead of comparing with rects measured after the
+  site had already enlarged its player.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_video_fullscreen_mac.mm          | 92 ++++++++++++++++---
+ .../renderer/core/fullscreen/fullscreen.cc    | 29 +++++-
+ 2 files changed, 108 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm b/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm
+index 207b52f0cd..e374deac73 100644
+--- a/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_video_fullscreen_mac.mm
+@@ -15,6 +15,7 @@
+ #include "base/functional/callback_helpers.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
++#include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/ui/webui_browser/safarium_fullscreen_host.h"
+ #include "chrome/common/chrome_isolated_world_ids.h"
+@@ -184,6 +185,8 @@ - (NSWindow*)destinationWindowToExitFullScreenForWindow:(NSWindow*)window {
+ constexpr base::TimeDelta kReturnSettle = base::Milliseconds(150);
+ // How long to wait for the page's videos to fit the element's spot again.
+ constexpr base::TimeDelta kVideosFitTimeout = base::Milliseconds(1500);
++// How long entering waits for the page to show a video filling the window.
++constexpr base::TimeDelta kVideoFillsTimeout = base::Milliseconds(600);
+ 
+ // Where the page's videos are (JSON [[x, y, width, height], ...]).
+ constexpr char16_t kVideoRectsScript[] =
+@@ -229,11 +232,50 @@ void WhenDrawn(content::WebContents* contents,
+           std::move(done)));
+ }
+ 
++// Runs `done` once one of the page's videos fills the viewport (width or
++// height, as a letterboxed full-screen video does) and the page has drawn
++// that, or by `deadline`.
++void WhenVideoFills(base::WeakPtr<content::WebContents> contents,
++                    base::TimeTicks deadline,
++                    base::OnceClosure done) {
++  if (!contents) {
++    std::move(done).Run();
++    return;
++  }
++  if (base::TimeTicks::Now() >= deadline) {
++    WhenDrawn(contents.get(), std::move(done));
++    return;
++  }
++  contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      u"[...document.querySelectorAll('video')].some(v => {"
++      u"  const r = v.getBoundingClientRect();"
++      u"  return r.width >= innerWidth * 0.95 ||"
++      u"         r.height >= innerHeight * 0.95;"
++      u"})",
++      base::BindOnce(
++          [](base::WeakPtr<content::WebContents> contents,
++             base::TimeTicks deadline, base::OnceClosure done,
++             base::Value fills) {
++            if (contents && fills.is_bool() && fills.GetBool()) {
++              WhenDrawn(contents.get(), std::move(done));
++              return;
++            }
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++                FROM_HERE,
++                base::BindOnce(&WhenVideoFills, contents, deadline,
++                               std::move(done)),
++                kVideosFitPoll);
++          },
++          contents, deadline, std::move(done)),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
+ // Runs `done` once the page's videos are back where they were before full
+ // screen (`video_rects`, from kVideoRectsScript; sites such as YouTube resize
+ // theirs with script, in steps, after full screen ends) and the page has
+ // drawn that, or by `deadline`.
+ void WhenVideosBack(base::WeakPtr<content::WebContents> contents,
++                    std::string anchor,
+                     std::string video_rects,
+                     base::TimeTicks deadline,
+                     base::OnceClosure done) {
+@@ -245,33 +287,50 @@ void WhenVideosBack(base::WeakPtr<content::WebContents> contents,
+     WhenDrawn(contents.get(), std::move(done), kReturnSettle);
+     return;
+   }
++  // Back = no video fills the viewport any more, and a video is back at
++  // `anchor` (where the page said the full-screen video was when full screen
++  // was requested; exact even for sites such as YouTube that put a whole
++  // container in full screen and enlarge their player first), or the videos
++  // have stopped moving for two checks (pages that moved them).
+   const std::u16string script =
+       u"(() => {"
+-      u"  if (document.fullscreenElement) return false;"
+-      u"  const before = " + base::UTF8ToUTF16(video_rects) + u";"
++      u"  if (document.fullscreenElement) return '';"
++      u"  const prevAll = " + base::UTF8ToUTF16(video_rects) + u";"
++      u"  const stable = prevAll.n || 0;"
++      u"  const prev = prevAll.r || prevAll;"
+       u"  const now = JSON.parse(" + std::u16string(kVideoRectsScript) + u");"
+-      u"  const ok = now.length === before.length && now.every((r, i) =>"
+-      u"      r.every((v, j) => Math.abs(v - before[i][j]) <= 4));"
+-      u"  return ok;"
++      u"  const fills = now.some(r => r[2] >= innerWidth * 0.95 ||"
++      u"                              r[3] >= innerHeight * 0.95);"
++      u"  const same = now.length === prev.length && now.every((r, i) =>"
++      u"      r.every((v, j) => Math.abs(v - prev[i][j]) <= 4));"
++      u"  const anchor = " + base::UTF8ToUTF16(anchor) + u";"
++      u"  const atAnchor = anchor.length === 4 && now.some(r =>"
++      u"      r.every((v, j) => Math.abs(v - anchor[j]) <= 4));"
++      u"  if (!fills && (atAnchor || (same && stable >= 1))) return true;"
++      u"  return JSON.stringify({n: (!fills && same) ? stable + 1 : 0, r: now});"
+       u"})()";
+   contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
+       script,
+       base::BindOnce(
+-          [](base::WeakPtr<content::WebContents> contents,
++          [](base::WeakPtr<content::WebContents> contents, std::string anchor,
+              std::string video_rects, base::TimeTicks deadline,
+              base::OnceClosure done, base::Value back) {
+             if (contents && back.is_bool() && back.GetBool()) {
+               WhenDrawn(contents.get(), std::move(done), kReturnSettle);
+               return;
+             }
++            if (back.is_string() && !back.GetString().empty()) {
++              video_rects = back.GetString();
++            }
+             base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+                 FROM_HERE,
+-                base::BindOnce(&WhenVideosBack, contents,
++                base::BindOnce(&WhenVideosBack, contents, std::move(anchor),
+                                std::move(video_rects), deadline,
+                                std::move(done)),
+                 kVideosFitPoll);
+           },
+-          contents, std::move(video_rects), deadline, std::move(done)),
++          contents, anchor, std::move(video_rects), deadline,
++          std::move(done)),
+       ISOLATED_WORLD_ID_CHROME_INTERNAL);
+ }
+ 
+@@ -610,8 +669,13 @@ void ApplyInitialZoom(NSWindow* window, NSView* view, NSRect initial_screen) {
+   [window setFrame:full_frame display:NO];
+   view->RequestFocus();
+   contents->Focus();
+-  WhenDrawn(contents, base::BindOnce(&VideoFullscreen::OnVideoDrawn,
+-                                     weak_factory_.GetWeakPtr()));
++  // Sites such as YouTube put a whole container in full screen and only
++  // then enlarge their player with script/CSS; zooming before that would grow
++  // a miniature of the whole page. Wait until a video fills the window.
++  WhenVideoFills(contents->GetWeakPtr(),
++                 base::TimeTicks::Now() + kVideoFillsTimeout,
++                 base::BindOnce(&VideoFullscreen::OnVideoDrawn,
++                                weak_factory_.GetWeakPtr()));
+ }
+ 
+ void VideoFullscreen::OnVideoDrawn() {
+@@ -954,7 +1018,13 @@ void ApplyInitialZoom(NSWindow* window, NSView* view, NSRect initial_screen) {
+   } else if (placeholder) {
+     // Once the page's videos are back in place and the page has drawn that
+     // in the browser window.
+-    WhenVideosBack(contents->GetWeakPtr(), video_rects_,
++    const NSRect hole = objc_->hole;
++    const std::string anchor = base::StringPrintf(
++        "[%d,%d,%d,%d]", static_cast<int>(round(NSMinX(hole))),
++        static_cast<int>(round(NSMinY(hole))),
++        static_cast<int>(round(NSWidth(hole))),
++        static_cast<int>(round(NSHeight(hole))));
++    WhenVideosBack(contents->GetWeakPtr(), anchor, video_rects_,
+                   base::TimeTicks::Now() + kVideosFitTimeout,
+                   base::BindOnce(^{
+                     [NSAnimationContext
+diff --git a/third_party/blink/renderer/core/fullscreen/fullscreen.cc b/third_party/blink/renderer/core/fullscreen/fullscreen.cc
+index 5f7f1a4fb8..762445cd9d 100644
+--- a/third_party/blink/renderer/core/fullscreen/fullscreen.cc
++++ b/third_party/blink/renderer/core/fullscreen/fullscreen.cc
+@@ -42,6 +42,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_fullscreen_options.h"
+ #include "third_party/blink/renderer/core/css/style_change_reason.h"
++#include "third_party/blink/renderer/core/html/media/html_video_element.h"
+ #include "third_party/blink/renderer/core/css/style_engine.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/element_traversal.h"
+@@ -75,6 +76,30 @@ namespace blink {
+ 
+ namespace {
+ 
++// Safarium: where the full-screen animation should start and end. Sites
++// such as YouTube put a whole container (often <html>) in full screen and
++// then enlarge their player with CSS; the video inside is what the user
++// sees growing, so anchor on the largest visible video in the element.
++gfx::Rect SafariumFullscreenAnchorBounds(Element& element) {
++  gfx::Rect bounds = element.BoundsInWidget();
++  if (IsA<HTMLVideoElement>(element)) {
++    return bounds;
++  }
++  gfx::Rect best;
++  for (HTMLVideoElement& video :
++       Traversal<HTMLVideoElement>::DescendantsOf(element)) {
++    const gfx::Rect r = video.BoundsInWidget();
++    if (r.size().Area64() > best.size().Area64()) {
++      best = r;
++    }
++  }
++  return best.IsEmpty() ? bounds : best;
++}
++
++}  // namespace
++
++namespace {
++
+ void FullscreenElementChanged(Document& document,
+                               Element* old_element,
+                               Element* new_element,
+@@ -901,8 +926,8 @@ void Fullscreen::ContinueRequestFullscreenAfterConditionsEnforcement(
+               frame.GetRemoteNavigationAssociatedInterfaces()) {
+         mojo::AssociatedRemote<mojom::blink::SafariumFullscreenHost> host;
+         provider->GetInterface(&host);
+-        host->WillRequestFullscreen(
+-            widget->BlinkSpaceToEnclosedDIPs(pending->BoundsInWidget()));
++        host->WillRequestFullscreen(widget->BlinkSpaceToEnclosedDIPs(
++            SafariumFullscreenAnchorBounds(*pending)));
+       }
+     }
+   }
+-- 
+2.54.0 (Apple Git-157)
+

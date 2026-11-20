@@ -1,0 +1,200 @@
+From 248b2d3349b8e4e281dc2840ef922ff7f41aa05d Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:36:27 -0500
+Subject: [PATCH 15/17] Safarium: right-click menu for extension buttons
+
+Right-click or Control-click an extension's button in the toolbar or the
+vertical sidebar for Chrome's extension menu (Options, Manage Extension,
+View Web Permissions, site access, Remove), shown as a native NSMenu
+built from the extension's menu model. AppKit gives toolbar right-clicks
+to Customize Toolbar first, so the toolbar controller watches the
+window's clicks, as the tab bar does.
+
+Safarium places extension buttons with Customize Toolbar rather than
+Chrome's pinning, so "Pin to Toolbar" becomes "Remove from Toolbar"
+(removes the toolbar or sidebar item), and Remove names Safarium.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/webui_browser/BUILD.gn      |   1 +
+ .../safarium_tab_bar_host_mac.mm              | 122 ++++++++++++++++++
+ 2 files changed, 123 insertions(+)
+
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index 67382ae837..a2cf42c9cc 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -125,6 +125,7 @@ source_set("impl") {
+       "//components/download/public/common:public",
+       "//components/history/core/common",
+       "//components/prefs",
++      "//ui/menus",
+     ]
+   }
+ 
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 92eaa3673c..80a6cfec25 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -25,6 +25,7 @@
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/extensions/extension_context_menu_model.h"
+ #include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
+ #import "chrome/browser/ui/webui_browser/safarium_downloads_popover.h"
+@@ -38,6 +39,7 @@
+ #include "ui/gfx/image/image_skia_util_mac.h"
+ #include "ui/gfx/mac/coordinate_conversion.h"
+ #include "ui/gfx/native_ui_types.h"
++#import "ui/menus/cocoa/menu_controller.h"
+ #include "ui/views/controls/native/native_view_host.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
+@@ -5048,6 +5050,9 @@ - (void)updateViewport;
+ - (void)updateState:(const safarium::BarState&)state;
+ @end
+ 
++@interface SafariumToolbarController () <MenuControllerCocoaDelegate>
++@end
++
+ @implementation SafariumToolbarController {
+   RAW_PTR_EXCLUSION safarium::TabBarController* _controller;  // Weak.
+   views::ViewTracker _pageView;
+@@ -5056,6 +5061,9 @@ @implementation SafariumToolbarController {
+   NSToolbar* _toolbar;
+   SafariumDownloadsPopover* _downloadsPopover;
+   __weak NSWindow* _window;
++  id _extensionClickMonitor;  // See -handleExtensionContextClick:.
++  MenuControllerCocoa* _extensionMenu;
++  __weak NSButton* _extensionMenuButton;  // The button it was opened on.
+   __weak NSToolbarItemGroup* _navGroup;
+   __weak NSToolbarItem* _reloadItem;
+   __weak NSToolbarItem* _tabsItem;
+@@ -5105,8 +5113,122 @@ - (void)setController:(safarium::TabBarController*)controller {
+   _controller = controller;
+ }
+ 
++- (void)dealloc {
++  if (_extensionClickMonitor) {
++    [NSEvent removeMonitor:_extensionClickMonitor];
++  }
++}
++
++// A right-click or Control-click on an extension's button, in the toolbar or
++// the sidebar, shows the extension's menu (Options, Manage extension, site
++// access, Remove…), as in Chrome. AppKit would answer it in the toolbar
++// with Customize Toolbar, so this watches the window's clicks. Returns nil
++// (consumed) when it showed the menu.
++- (NSEvent*)handleExtensionContextClick:(NSEvent*)event {
++  if (event.type == NSEventTypeLeftMouseDown &&
++      !(event.modifierFlags & NSEventModifierFlagControl)) {
++    return event;
++  }
++  // The theme frame: covers the toolbar (also the full screen toolbar
++  // window) and the content, in window coordinates.
++  NSView* root = event.window.contentView.superview;
++  if (!root || !_controller) {
++    return event;
++  }
++  NSButton* button = nil;
++  for (NSView* view = [root hitTest:event.locationInWindow]; view;
++       view = view.superview) {
++    if ([view isKindOfClass:NSButton.class] &&
++        ((NSButton*)view).target == self &&
++        [view.identifier hasPrefix:kExtensionItemPrefix]) {
++      button = (NSButton*)view;
++      break;
++    }
++  }
++  if (!button) {
++    return event;
++  }
++  const std::string id = base::SysNSStringToUTF8(
++      [button.identifier substringFromIndex:kExtensionItemPrefix.length]);
++  auto* extensions = _controller->GetExtensionsContainer();
++  ToolbarActionViewModel* action =
++      extensions ? extensions->GetActionForId(id) : nullptr;
++  ui::MenuModel* model =
++      action ? action->GetContextMenu(extensions::ExtensionContextMenuModel::
++                                          ContextMenuSource::kToolbarAction)
++             : nullptr;
++  if (!model) {
++    return event;
++  }
++  // Kept until the next menu: the chosen command may run after the menu
++  // closes.
++  _extensionMenuButton = button;
++  _extensionMenu = [[MenuControllerCocoa alloc] initWithModel:model
++                                                isContextMenu:YES
++                                                     delegate:self];
++  [NSMenu popUpContextMenu:_extensionMenu.menu withEvent:event forView:button];
++  return nil;
++}
++
++// MenuControllerCocoaDelegate (the extension menu). Safarium places
++// extension buttons with Customize Toolbar, not Chrome's pinning, so "Pin to
++// Toolbar" becomes "Remove from Toolbar"; and the product is Safarium.
++- (void)controllerWillAddItem:(NSMenuItem*)item
++                    fromModel:(ui::MenuModel*)model
++                      atIndex:(size_t)index {
++  switch (model->GetCommandIdAt(index)) {
++    case extensions::ExtensionContextMenuModel::TOGGLE_VISIBILITY:
++      item.title = @"Remove from Toolbar";
++      item.target = self;
++      item.action = @selector(removeExtensionButton:);
++      break;
++    case extensions::ExtensionContextMenuModel::UNINSTALL:
++      item.title = @"Remove from Safarium";
++      break;
++    default:
++      break;
++  }
++}
++
++- (void)controllerWillAddMenu:(NSMenu*)menu fromModel:(ui::MenuModel*)model {
++}
++
++- (void)removeExtensionButton:(id)sender {
++  NSButton* button = _extensionMenuButton;
++  NSString* identifier = button.identifier;
++  if (!identifier) {
++    return;
++  }
++  if (_sidebarExtensionButtons[identifier] == button) {
++    NSMutableArray<NSString*>* ids =
++        [[self configuredItemIdentifiers] mutableCopy];
++    [ids removeObject:identifier];
++    [self saveSidebarItemIdentifiers:ids];
++    return;
++  }
++  const NSUInteger index = [self indexOfToolbarItem:identifier];
++  if (index != NSNotFound) {
++    [_toolbar removeItemAtIndex:index];
++  }
++}
++
+ - (void)installInWindow:(NSWindow*)window {
+   _window = window;
++  if (!_extensionClickMonitor) {
++    __weak SafariumToolbarController* weakSelf = self;
++    _extensionClickMonitor = [NSEvent
++        addLocalMonitorForEventsMatchingMask:NSEventMaskRightMouseDown |
++                                             NSEventMaskLeftMouseDown
++                                     handler:^NSEvent*(NSEvent* event) {
++                                       SafariumToolbarController* strongSelf =
++                                           weakSelf;
++                                       return strongSelf
++                                                  ? [strongSelf
++                                                        handleExtensionContextClick:
++                                                            event]
++                                                  : event;
++                                     }];
++  }
+   window.backgroundColor = NSColor.windowBackgroundColor;
+   window.titleVisibility = NSWindowTitleHidden;
+   window.toolbarStyle = NSWindowToolbarStyleUnified;
+-- 
+2.54.0 (Apple Git-157)
+

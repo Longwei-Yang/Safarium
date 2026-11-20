@@ -1,0 +1,381 @@
+From 0364c8ebea8be81332f48e8bd3da907bc45dae1f Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:59:34 -0500
+Subject: [PATCH 13/17] Safarium: hide settings and menu items that need Google
+ or Chrome's UI
+
+Link menu: no "Open Link in Split View" (no split view) or "Add Link to
+Reading List" (nowhere to read it).
+
+Settings: hide Autofill with AI categories (identity docs, travel),
+loyalty cards, shopping, Gemini suggestions, Wallet / Google Account links,
+card benefits and the Wallet note (Google account services); Safe Browsing
+enhanced protection, password leak check and the Advanced Protection link
+(need Google sign-in / API keys); Live Translate and AXTree fixing (Google
+servers); copy confirmations (Chrome toasts, which Safarium's window has
+no host for). History: no synced-tabs page or sync promo. Password
+Manager: no automated password change (needs sign-in).
+
+Elements stay in the templates where WebUI lint requires them, hidden in
+Safarium builds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/renderer_context_menu/BUILD.gn  |  1 +
+ .../render_view_context_menu.cc                |  8 ++++++++
+ chrome/browser/resources/history/BUILD.gn      |  4 ++++
+ chrome/browser/resources/history/app.html.ts   |  2 ++
+ .../browser/resources/history/side_bar.html.ts |  3 +++
+ .../resources/password_manager/BUILD.gn        |  4 ++++
+ .../password_manager/settings_section.ts       |  6 ++++++
+ .../settings/a11y_page/a11y_page.html.ts       |  3 +++
+ .../resources/settings/a11y_page/a11y_page.ts  |  6 ++++++
+ .../settings/a11y_page/live_caption.html.ts    |  2 ++
+ .../autofill_page/autofill_page.html.ts        |  8 ++++++++
+ .../settings/autofill_page/autofill_page.ts    | 18 ++++++++++++++++++
+ .../payments/payments_page.html.ts             |  9 ++++++++-
+ .../security/security_page.html.ts             |  9 +++++++++
+ 14 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/renderer_context_menu/BUILD.gn b/chrome/browser/renderer_context_menu/BUILD.gn
+index 94bd32bd9e..e606f287de 100644
+--- a/chrome/browser/renderer_context_menu/BUILD.gn
++++ b/chrome/browser/renderer_context_menu/BUILD.gn
+@@ -78,6 +78,7 @@ source_set("impl") {
+   sources = [ "context_menu_content_type_factory.cc" ]
+ 
+   deps = [
++    "//build:safarium_buildflags",
+     ":renderer_context_menu",
+     "//base",
+     "//base:i18n",
+diff --git a/chrome/browser/renderer_context_menu/render_view_context_menu.cc b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+index da9e67c422..ac073b32fc 100644
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -36,6 +36,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/system/sys_info.h"
++#include "build/safarium_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -1035,6 +1036,7 @@ bool IsPrintPreviewContent(const GURL& current_url) {
+ }
+ 
+ #if !BUILDFLAG(IS_ANDROID)
++[[maybe_unused]]  // Safarium doesn't offer split view.
+ std::pair<int, const gfx::VectorIcon*> GetOpenLinkInSplitStringAndIcon(
+     tabs::TabInterface* tab,
+     BrowserWindowInterface* const browser) {
+@@ -2082,6 +2084,8 @@ void RenderViewContextMenu::AppendLinkItems() {
+       // Opening a link in split view should also go through the same
+       // constraints as opening a link in a new tab since a split view tab is a
+       // new tab that is then joined with the current active tab.
++      // Safarium has no split view.
++#if !BUILDFLAG(SAFARIUM_BRANDING)
+       if (IsNormalBrowser()) {
+         tabs::TabInterface* tab =
+             tabs::TabInterface::MaybeGetFromContents(GetWebContents());
+@@ -2100,6 +2104,7 @@ void RenderViewContextMenu::AppendLinkItems() {
+         menu_model_.SetElementIdentifierAt(command_index,
+                                            kOpenLinkInSplitMenuItem);
+       }
++#endif
+     }
+ #endif
+ 
+@@ -2270,6 +2275,8 @@ void RenderViewContextMenu::AppendCopyLinkLocationItem() {
+                                   params_.link_url.SchemeIs(url::kMailToScheme)
+                                       ? IDS_CONTENT_CONTEXT_COPYEMAILADDRESS
+                                       : IDS_CONTENT_CONTEXT_COPYLINKLOCATION);
++  // Safarium has no Reading List to show what's added.
++#if !BUILDFLAG(SAFARIUM_BRANDING)
+   if (features::IsMenuSimplificationEnabled() && !params_.has_image_contents &&
+       GetLoadedReadingListModelForUrl(browser_context_, params_.link_url)) {
+     menu_model_.AddItemWithStringIdAndIcon(
+@@ -2279,6 +2286,7 @@ void RenderViewContextMenu::AppendCopyLinkLocationItem() {
+                                            ? kListAltIcon
+                                            : kReadingListOldIcon));
+   }
++#endif
+ }
+ 
+ void RenderViewContextMenu::AppendOpenWithLinkItems() {
+diff --git a/chrome/browser/resources/history/BUILD.gn b/chrome/browser/resources/history/BUILD.gn
+index e7a4758c13..dcf3312bb2 100644
+--- a/chrome/browser/resources/history/BUILD.gn
++++ b/chrome/browser/resources/history/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//extensions/buildflags/buildflags.gni")
++import("//build/config/chrome_build.gni")
+ import("//ui/webui/resources/tools/build_webui.gni")
+ import("//ui/webui/webui_features.gni")
+ 
+@@ -10,6 +11,9 @@ assert(enable_webui_history)
+ 
+ build_webui("build") {
+   grd_prefix = "history"
++  if (is_safarium_branded) {
++    preprocessor_defines = [ "is_safarium_branded=true" ]
++  }
+ 
+   static_files = [
+     "history.html",
+diff --git a/chrome/browser/resources/history/app.html.ts b/chrome/browser/resources/history/app.html.ts
+index c31b0671ee..ba7c92f916 100644
+--- a/chrome/browser/resources/history/app.html.ts
++++ b/chrome/browser/resources/history/app.html.ts
+@@ -71,11 +71,13 @@ export function getHtml(this: HistoryAppElement) {
+       <div id="tabsScrollContainer" class="cr-scrollable">
+         <div class="cr-scrollable-top-shadow" ?hidden="${this.showTabs_}"></div>
+ <if expr="not is_chromeos">
++<if expr="not pp_if('is_safarium_branded')">
+         ${this.shouldShowHistoryPageHistorySyncPromo_() ? html`
+           <div class="history-cards">
+             <history-sync-promo></history-sync-promo>
+           </div>
+         ` : ''}
++</if>
+         <div class="history-cards"
+             ?hidden="${!this.shouldShowHistoryCrossDeviceSigninPromo_}">
+           <history-cross-device-signin-promo id="historyCrossDeviceSigninPromo"
+diff --git a/chrome/browser/resources/history/side_bar.html.ts b/chrome/browser/resources/history/side_bar.html.ts
+index f2384bffe5..164c4e6c27 100644
+--- a/chrome/browser/resources/history/side_bar.html.ts
++++ b/chrome/browser/resources/history/side_bar.html.ts
+@@ -21,6 +21,9 @@ export function getHtml(this: HistorySideBarElement) {
+     <cr-ripple></cr-ripple>
+   </a>
+   <a id="syncedTabs" role="menuitem" href="/syncedTabs"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+       class="page-item cr-nav-menu-item" path="syncedTabs"
+       @click="${this.onItemClick_}">
+     <cr-icon icon="cr:devices"></cr-icon>
+diff --git a/chrome/browser/resources/password_manager/BUILD.gn b/chrome/browser/resources/password_manager/BUILD.gn
+index 5037fe3b9a..cf8dc7c422 100644
+--- a/chrome/browser/resources/password_manager/BUILD.gn
++++ b/chrome/browser/resources/password_manager/BUILD.gn
+@@ -2,10 +2,14 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//build/config/chrome_build.gni")
+ import("//ui/webui/resources/tools/build_webui.gni")
+ 
+ build_webui("build") {
+   grd_prefix = "password_manager"
++  if (is_safarium_branded) {
++    preprocessor_defines = [ "is_safarium_branded=true" ]
++  }
+   static_files = [
+     "images/checkup_result_banner_compromised.svg",
+     "images/checkup_result_banner_compromised_dark.svg",
+diff --git a/chrome/browser/resources/password_manager/settings_section.ts b/chrome/browser/resources/password_manager/settings_section.ts
+index 356eda837a..b8ba0d253e 100644
+--- a/chrome/browser/resources/password_manager/settings_section.ts
++++ b/chrome/browser/resources/password_manager/settings_section.ts
+@@ -129,8 +129,14 @@ export class SettingsSectionElement extends SettingsSectionElementBase {
+   protected accessor credentialsEnableServicePref_:
+       chrome.settingsPrivate.PrefObject<boolean>|undefined;
+   protected accessor hasPasswordsToExport_: boolean = false;
++  // Safarium: automated password change needs Google sign-in.
++  // <if expr="pp_if('is_safarium_branded')">
++  protected accessor isAutomatedPasswordChangeVisible_: boolean = false;
++  // </if>
++  // <if expr="not pp_if('is_safarium_branded')">
+   protected accessor isAutomatedPasswordChangeVisible_: boolean =
+       loadTimeData.getBoolean('passwordChangeAvailable');
++  // </if>
+   protected accessor canAddShortcut_: boolean =
+       loadTimeData.getBoolean('canAddShortcut');
+   private accessor trustedVaultBannerState_: TrustedVaultBannerState =
+diff --git a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+index 0f213b7d3e..268321d753 100644
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+@@ -105,6 +105,9 @@ export function getHtml(this: SettingsA11yPageElement) {
+ </if>
+ <if expr="not is_chromeos">
+     <settings-toggle-button class="hr" id="toastToggle"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+         pref-key="settings.toast.alert_level"
+         .numericUncheckedValues="${this.numericUncheckedToastAlertValues_}"
+         .numericCheckedValue="${ToastAlertLevel.ALL}"
+diff --git a/chrome/browser/resources/settings/a11y_page/a11y_page.ts b/chrome/browser/resources/settings/a11y_page/a11y_page.ts
+index d1946a5dfa..9967034cf2 100644
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.ts
+@@ -183,8 +183,14 @@ export class SettingsA11yPageElement extends SettingsA11yPageElementBase {
+   // </if>
+ 
+   protected accessor hasScreenReader_: boolean = false;
++  // Safarium: needs Google services it doesn't have.
++  // <if expr="pp_if('is_safarium_branded')">
++  protected accessor showAxTreeFixingSection_: boolean = false;
++  // </if>
++  // <if expr="not pp_if('is_safarium_branded')">
+   protected accessor showAxTreeFixingSection_: boolean =
+       loadTimeData.getBoolean('axTreeFixingEnabled');
++  // </if>
+   // <if expr="is_win or is_linux or is_macosx">
+   protected accessor showAxAnnotationsSection_: boolean = false;
+   // </if>
+diff --git a/chrome/browser/resources/settings/a11y_page/live_caption.html.ts b/chrome/browser/resources/settings/a11y_page/live_caption.html.ts
+index f0c2e8c705..9306a1a23b 100644
+--- a/chrome/browser/resources/settings/a11y_page/live_caption.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/live_caption.html.ts
+@@ -131,7 +131,9 @@ ${this.enableLiveCaptionMultiLanguage_ ? html`
+     </settings-toggle-button>
+   </cr-collapse>
+   ${this.enableLiveTranslate_ ? html`
++<if expr="not pp_if('is_safarium_branded')">
+     <settings-live-translate></settings-live-translate>
++</if>
+   ` : ''}
+ ` : ''}
+ 
+diff --git a/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts b/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts
+index dc48181614..ca78167fef 100644
+--- a/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts
++++ b/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts
+@@ -32,11 +32,17 @@ export function getHtml(this: SettingsAutofillPageElement) {
+       .chips="${this.getVisibleChips_(this.hierarchy_.contactInfo.chips)}">
+   </category-reference-card>
+   <category-reference-card id="identityManagerButton"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+       card-title="$i18n{identityDocsCardTitle}"
+       .categoryId="${this.hierarchy_.identityDocs.id}"
+       .chips="${this.getVisibleChips_(this.hierarchy_.identityDocs.chips)}">
+   </category-reference-card>
+   <category-reference-card id="travelManagerButton"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+       card-title="$i18n{travelCardTitle}"
+       .categoryId="${this.hierarchy_.travel.id}"
+       .chips="${this.getVisibleChips_(this.hierarchy_.travel.chips)}">
+@@ -81,6 +87,7 @@ export function getHtml(this: SettingsAutofillPageElement) {
+         @click="${this.onPasswordManagerRelatedServiceClick_}"
+         start-icon="cr20:password-manager" external>
+     </cr-link-row>
++<if expr="not pp_if('is_safarium_branded')">
+     <cr-link-row id="googleWalletButton" label="$i18n{googleWalletTitle}"
+         @click="${this.onGoogleWalletRelatedServiceClick_}"
+         start-icon="settings20:wallet" external>
+@@ -89,6 +96,7 @@ export function getHtml(this: SettingsAutofillPageElement) {
+         @click="${this.onGoogleAccountRelatedServiceClick_}"
+         start-icon="settings20:google" external>
+     </cr-link-row>
++</if>
+   </div>
+ </settings-section>
+ <!--_html_template_end_-->`;
+diff --git a/chrome/browser/resources/settings/autofill_page/autofill_page.ts b/chrome/browser/resources/settings/autofill_page/autofill_page.ts
+index a103283201..dd4e6ec973 100644
+--- a/chrome/browser/resources/settings/autofill_page/autofill_page.ts
++++ b/chrome/browser/resources/settings/autofill_page/autofill_page.ts
+@@ -116,12 +116,30 @@ export class SettingsAutofillPageElement extends
+   }
+ 
+   protected accessor hierarchy_: DataTypeHierarchy;
++  // Safarium: needs Google services it doesn't have.
++  // <if expr="pp_if('is_safarium_branded')">
++  protected accessor isShoppingEnabled_: boolean = false;
++  // </if>
++  // <if expr="not pp_if('is_safarium_branded')">
+   protected accessor isShoppingEnabled_: boolean =
+       loadTimeData.getBoolean('shoppingIntegrationEnabled');
++  // </if>
++  // Safarium: needs Google services it doesn't have.
++  // <if expr="pp_if('is_safarium_branded')">
++  protected accessor isOffersAndLoyaltyCardsEnabled_: boolean = false;
++  // </if>
++  // <if expr="not pp_if('is_safarium_branded')">
+   protected accessor isOffersAndLoyaltyCardsEnabled_: boolean =
+       loadTimeData.getBoolean('offersAndLoyaltyCardsSettingsEnabled');
++  // </if>
++  // Safarium: needs Google services it doesn't have.
++  // <if expr="pp_if('is_safarium_branded')">
++  protected accessor showSuggestionsFromGeminiSettings_: boolean = false;
++  // </if>
++  // <if expr="not pp_if('is_safarium_branded')">
+   protected accessor showSuggestionsFromGeminiSettings_: boolean =
+       loadTimeData.getBoolean('showSuggestionsFromGeminiSettings');
++  // </if>
+   // <if expr="not _google_chrome">
+   protected accessor spark_: string = 'settings20:lightbulb';
+   // </if>
+diff --git a/chrome/browser/resources/settings/autofill_page/payments/payments_page.html.ts b/chrome/browser/resources/settings/autofill_page/payments/payments_page.html.ts
+index a06ef4b023..7e0c8ed3fa 100644
+--- a/chrome/browser/resources/settings/autofill_page/payments/payments_page.html.ts
++++ b/chrome/browser/resources/settings/autofill_page/payments/payments_page.html.ts
+@@ -69,6 +69,9 @@ export function getHtml(this: SettingsPaymentsPageElement) {
+ 
+     <!-- Toggle to enable/disable showing card benefits/rewards in autofill. -->
+     <settings-toggle-button id="cardBenefitsToggle" no-extension-indicator
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+         label="$i18n{cardBenefitsLabel}"
+         sub-label-with-link="$i18n{cardBenefitsToggleSublabel}"
+         @sub-label-link-clicked="${this.onCardBenefitsSubLabelLinkClicked_}"
+@@ -99,7 +102,11 @@ export function getHtml(this: SettingsPaymentsPageElement) {
+             this.onCanMakePaymentSettingsBooleanControlChange_}">
+     </settings-toggle-button>
+ 
+-    <div id="manageLink" class="cr-row">
++    <div id="manageLink" class="cr-row"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
++    >
+       <!-- This span lays out the link correctly, relative to the text. -->
+       <div class="cr-padded-text">$i18nRaw{manageCreditCardsLabel}</div>
+     </div>
+diff --git a/chrome/browser/resources/settings/privacy_page/security/security_page.html.ts b/chrome/browser/resources/settings/privacy_page/security/security_page.html.ts
+index cf9a23f5e9..abe528b7cd 100644
+--- a/chrome/browser/resources/settings/privacy_page/security/security_page.html.ts
++++ b/chrome/browser/resources/settings/privacy_page/security/security_page.html.ts
+@@ -20,6 +20,9 @@ export function getHtml(this: SettingsSecurityPageElement) {
+         selectable-elements="cr-radio-button, settings-collapse-radio-button"
+         @change="${this.onSafeBrowsingRadioChange_}">
+       <settings-collapse-radio-button id="safeBrowsingEnhanced"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+           name="${SafeBrowsingSetting.ENHANCED}"
+           pref-key="generated.safe_browsing" label="$i18n{safeBrowsingEnhanced}"
+           sub-label="$i18n{safeBrowsingEnhancedDescUpdated}"
+@@ -167,6 +170,9 @@ export function getHtml(this: SettingsSecurityPageElement) {
+     <h2 class="cr-title-text">$i18n{advancedPageTitle}</h2>
+   </div>
+   <settings-toggle-button id="passwordsLeakToggle"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+       label="$i18n{passwordsLeakDetectionLabel}"
+       pref-key="generated.password_leak_detection"
+       sub-label="${this.getPasswordsLeakToggleSubLabel_()}">
+@@ -217,6 +223,9 @@ export function getHtml(this: SettingsSecurityPageElement) {
+   </cr-link-row>
+ 
+   <cr-link-row id="advancedProtectionProgramLink" class="hr"
++<if expr="pp_if('is_safarium_branded')">
++      hidden
++</if>
+       label="$i18n{advancedProtectionProgramTitle}"
+       sub-label="$i18n{advancedProtectionProgramDesc}"
+       @click="${this.onAdvancedProtectionProgramLinkClick_}" external>
+-- 
+2.54.0 (Apple Git-157)
+

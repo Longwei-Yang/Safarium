@@ -1,0 +1,161 @@
+From 11059005b1d9cad4f1820b91c8624912d5ab7205 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:37:26 -0500
+Subject: [PATCH 11/17] Safarium: drop menu items that do nothing; fix Delete
+ Browsing Data crash
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Menu bar (Safarium builds only): remove items for features Safarium has no
+UI for — Always Show Bookmarks Bar, Always Show Full URLs, the omnibox chip
+toggles (Lens, AI Mode, search shortcuts), Collapse Vertical Tabs, Cast…,
+Group Tab, Add Tab to New Split View and Search Tabs…. Search Tabs and
+Cast crashed (tab search panel / Cast dialog without a Chrome toolbar).
+
+Delete Browsing Data: ClearBrowsingDataHandler CHECKed that Chrome's
+BrowserView element exists to send an in-product-help event; skip the
+event when it doesn't (Safarium's native window).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/cocoa/BUILD.gn              |  1 +
+ chrome/browser/ui/cocoa/main_menu_builder.mm  | 41 +++++++++++++------
+ .../settings_clear_browsing_data_handler.cc   |  6 ++-
+ 3 files changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/ui/cocoa/BUILD.gn b/chrome/browser/ui/cocoa/BUILD.gn
+index 96d4113709..f085156457 100644
+--- a/chrome/browser/ui/cocoa/BUILD.gn
++++ b/chrome/browser/ui/cocoa/BUILD.gn
+@@ -118,6 +118,7 @@ source_set("cocoa") {
+   public_deps = [ "//chrome/browser/ui:browser_live_tab_context" ]
+ 
+   deps = [
++    "//build:safarium_buildflags",
+     "//chrome/app:command_ids",
+     "//chrome/app/theme:chrome_unscaled_resources_grit",
+     "//chrome/browser:app_controller_mac",
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index 5e507eb268..e065fcf62b 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -10,6 +10,7 @@
+ #include "base/i18n/rtl.h"
+ #include "base/mac/mac_util.h"
+ #include "build/branding_buildflags.h"
++#include "build/safarium_buildflags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+@@ -283,6 +284,11 @@
+   return item;
+ }
+ 
++// Safarium has no bookmarks bar, Chrome omnibox chips, tab groups, split view,
++// tab search panel or Cast dialog anchor; their menu items would do nothing
++// (or crash), so Safarium builds drop them.
++constexpr bool kSafarium = BUILDFLAG(SAFARIUM_BRANDING);
++
+ NSMenuItem* BuildViewMenu(NSApplication* nsapp,
+                           id app_delegate,
+                           const std::u16string& product_name,
+@@ -295,24 +301,29 @@
+           .submenu({
+               Item(IDS_BOOKMARK_BAR_ALWAYS_SHOW_MAC)
+                   .command_id(IDC_SHOW_BOOKMARK_BAR)
+-                  .remove_if(is_pwa),
++                  .remove_if(is_pwa || kSafarium),
+               Item(IDS_TOGGLE_FULLSCREEN_TOOLBAR_MAC)
+                   .command_id(IDC_TOGGLE_FULLSCREEN_TOOLBAR),
+               Item(IDS_CONTEXT_MENU_SHOW_FULL_URLS)
+-                  .command_id(IDC_SHOW_FULL_URLS),
++                  .command_id(IDC_SHOW_FULL_URLS)
++                  .remove_if(kSafarium),
+               Item(IDS_CONTEXT_MENU_SHOW_GOOGLE_LENS_SHORTCUT)
+-                  .command_id(IDC_SHOW_GOOGLE_LENS_SHORTCUT),
++                  .command_id(IDC_SHOW_GOOGLE_LENS_SHORTCUT)
++                  .remove_if(kSafarium),
+                Item(IDS_AI_MODE_ENTRYPOINT_CONTEXT_MENU_SHOW)
+                    .string_format_1(
+                        l10n_util::GetStringUTF16(IDS_AI_MODE_ENTRYPOINT_LABEL))
+-                   .command_id(IDC_SHOW_AI_MODE_OMNIBOX_BUTTON),
++                   .command_id(IDC_SHOW_AI_MODE_OMNIBOX_BUTTON)
++                   .remove_if(kSafarium),
+               Item(IDS_CONTEXT_MENU_SHOW_SEARCH_TOOLS)
+-                  .command_id(IDC_SHOW_SEARCH_TOOLS),
++                  .command_id(IDC_SHOW_SEARCH_TOOLS)
++                  .remove_if(kSafarium),
+                Item(IDS_SWITCH_TO_VERTICAL_TAB_MAC)
+                    .command_id(IDC_TOGGLE_VERTICAL_TABS),
+               Item(IDS_VERTICAL_TABS_VIEW_MENU_TOGGLE_COLLAPSE)
+                   .command_id(IDC_TOGGLE_VERTICAL_TABS_COLLAPSE)
+-                  .key_equivalent(@"L", NSEventModifierFlagCommand),
++                  .key_equivalent(@"L", NSEventModifierFlagCommand)
++                  .remove_if(kSafarium),
+               Item(IDS_CUSTOMIZE_TOUCH_BAR)
+                   .tag(IDC_CUSTOMIZE_TOUCH_BAR)
+                   .action(@selector(toggleTouchBarCustomizationPalette:))
+@@ -342,8 +353,10 @@
+                   .command_id(IDC_ZOOM_MINUS),
+               Item().is_separator(),
+               Item(IDS_MEDIA_ROUTER_MENU_ITEM_TITLE)
+-                  .command_id(IDC_ROUTE_MEDIA),
+-              Item().is_separator(),
++                  .command_id(IDC_ROUTE_MEDIA)
++                  .remove_if(kSafarium),
++              Item().is_separator()
++                  .remove_if(kSafarium),
+               Item(IDS_DEVELOPER_MENU_MAC)
+                   .tag(IDC_DEVELOPER_MENU)
+                   .submenu({
+@@ -547,11 +560,13 @@
+                   .is_alternate()
+                   .key_equivalent(@"", NSEventModifierFlagOption),
+               Item(IDS_GROUP_TAB_MAC)
+-                  .command_id(IDC_WINDOW_GROUP_TAB),
++                  .command_id(IDC_WINDOW_GROUP_TAB)
++                  .remove_if(kSafarium),
+               Item(IDS_GROUP_TARGET_TAB_MAC)
+                   .command_id(IDC_GROUP_TARGET_TAB)
+                   .is_alternate()
+-                  .key_equivalent(@"", NSEventModifierFlagOption),
++                  .key_equivalent(@"", NSEventModifierFlagOption)
++                  .remove_if(kSafarium),
+               Item(IDS_TAB_CXMENU_CLOSEOTHERTABS)
+                   .command_id(IDC_WINDOW_CLOSE_OTHER_TABS),
+               Item(is_rtl ? IDS_TAB_CXMENU_CLOSETABSTOLEFT
+@@ -563,9 +578,11 @@
+               Item(IDS_MOVE_TAB_TO_NEW_WINDOW)
+                   .command_id(IDC_MOVE_TAB_TO_NEW_WINDOW),
+               Item(IDS_TAB_CXMENU_ADD_TAB_TO_NEW_SPLIT)
+-                  .command_id(IDC_NEW_SPLIT_TAB),
++                  .command_id(IDC_NEW_SPLIT_TAB)
++                  .remove_if(kSafarium),
+               Item(IDS_SEARCH_TABS)
+-                  .command_id(IDC_TAB_SEARCH),
++                  .command_id(IDC_TAB_SEARCH)
++                  .remove_if(kSafarium),
+               Item().is_separator(),
+           })
+           .Build();
+diff --git a/chrome/browser/ui/webui/settings/settings_clear_browsing_data_handler.cc b/chrome/browser/ui/webui/settings/settings_clear_browsing_data_handler.cc
+index 3bb00569eb..950dedcf22 100644
+--- a/chrome/browser/ui/webui/settings/settings_clear_browsing_data_handler.cc
++++ b/chrome/browser/ui/webui/settings/settings_clear_browsing_data_handler.cc
+@@ -88,7 +88,11 @@ void NotifyBrowserViewCustomEvent(tabs::TabInterface* tab,
+   ui::TrackedElement* const browser_element =
+       ui::ElementTracker::GetElementTracker()->GetUniqueElement(
+           kBrowserViewElementId, context);
+-  CHECK(browser_element);
++  // Safarium's native window has no BrowserView element (the event only
++  // drives Chrome's in-product help).
++  if (!browser_element) {
++    return;
++  }
+   ui::ElementTracker::GetFrameworkDelegate()->NotifyCustomEvent(browser_element,
+                                                                 event_type);
+ }
+-- 
+2.54.0 (Apple Git-157)
+
