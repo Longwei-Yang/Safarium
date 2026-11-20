@@ -1,0 +1,53 @@
+From 5715ba558c6fbdf4f12ae022103c14887f912865 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:48:06 -0500
+Subject: [PATCH 21/26] Safarium: open pages in the existing window, not a new
+ one
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+WebUIBrowserWindow::IsOnCurrentWorkspace() returned false (stub), so
+ProfileBrowserCollection::FindTabbedBrowser() never found a Safarium
+window and every "show this page in the profile's browser" path
+(Settings' Edit…/Manage… buttons, ShowSingletonTab(Profile*),
+ShowSettingsSubPageForProfile, links from other apps) opened a new
+window. Return true as BrowserView does on macOS; IsVisibleOnScreen()
+asks the widget, also as BrowserView does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/webui_browser_window.cc       | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 70ab4f9104..0a62640839 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -555,13 +555,19 @@ gfx::NativeWindow WebUIBrowserWindow::GetNativeWindow() const {
+ }
+ 
+ bool WebUIBrowserWindow::IsOnCurrentWorkspace() const {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return false;
++  // As BrowserView on macOS. Returning false made every "find this
++  // profile's tabbed browser" lookup (ProfileBrowserCollection::
++  // FindTabbedBrowser) skip the window, so pages opened from elsewhere
++  // (Settings, the Dock, other apps) each got a new window.
++  return true;
+ }
+ 
+ bool WebUIBrowserWindow::IsVisibleOnScreen() const {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return false;
++#if BUILDFLAG(IS_MAC)
++  return widget_ && widget_->IsVisibleOnScreen();
++#else
++  return IsOnCurrentWorkspace();
++#endif
+ }
+ 
+ void WebUIBrowserWindow::SetTopControlsShownRatio(
+-- 
+2.54.0 (Apple Git-157)
+

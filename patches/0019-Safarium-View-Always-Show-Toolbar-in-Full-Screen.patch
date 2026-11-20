@@ -1,0 +1,216 @@
+From 67390bf1261a3c86cce4987777c7cdb3eafb15f2 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:26:37 -0500
+Subject: [PATCH 19/26] Safarium: View > Always Show Toolbar in Full Screen
+
+The menu item is back and works with Safarium's NSToolbar, like
+Safari's: off, the toolbar slides down with the menu bar at the top of
+the screen; on (the default, Chrome's pref kShowFullscreenToolbar), it
+stays. ViewsNSWindowDelegate adds AutoHideToolbar in
+-window:willUseFullScreenPresentationOptions: for windows that ask for
+it (BrowserNativeWidgetWindow.autoHidesToolbarInFullScreen). AppKit only
+reads this when entering full screen, so a change made while in full
+screen applies the next time. The menu shows the pref's checkmark.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |  4 +---
+ .../safarium_tab_bar_controller.cc            |  7 ++++++
+ .../safarium_tab_bar_controller.h             |  2 ++
+ .../safarium_tab_bar_host_mac.mm              | 22 +++++++++++++++++++
+ .../webui_browser/webui_browser_window_mac.mm |  8 +++++++
+ .../browser_native_widget_window_mac.h        |  4 ++++
+ .../browser_native_widget_window_mac.mm       |  1 +
+ .../app_shim/views_nswindow_delegate.mm       | 16 ++++++++++++++
+ 8 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index b6fe91d867..e065fcf62b 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -302,10 +302,8 @@
+               Item(IDS_BOOKMARK_BAR_ALWAYS_SHOW_MAC)
+                   .command_id(IDC_SHOW_BOOKMARK_BAR)
+                   .remove_if(is_pwa || kSafarium),
+-              // Safarium's native toolbar doesn't read this setting.
+               Item(IDS_TOGGLE_FULLSCREEN_TOOLBAR_MAC)
+-                  .command_id(IDC_TOGGLE_FULLSCREEN_TOOLBAR)
+-                  .remove_if(kSafarium),
++                  .command_id(IDC_TOGGLE_FULLSCREEN_TOOLBAR),
+               Item(IDS_CONTEXT_MENU_SHOW_FULL_URLS)
+                   .command_id(IDC_SHOW_FULL_URLS)
+                   .remove_if(kSafarium),
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index 7f3fe20008..172e356941 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -222,6 +222,10 @@ TabBarController::TabBarController(
+       prefs::kShowHomeButton,
+       base::BindRepeating(&TabBarController::PushState,
+                           base::Unretained(this)));
++  pref_change_registrar_.Add(
++      prefs::kShowFullscreenToolbar,
++      base::BindRepeating(&TabBarController::PushState,
++                          base::Unretained(this)));
+ }
+ 
+ TabBarController::~TabBarController() = default;
+@@ -235,6 +239,9 @@ BarState TabBarController::BuildState() const {
+   BarState state;
+   state.show_home_button =
+       browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kShowHomeButton);
++  state.always_show_toolbar_in_full_screen =
++      browser_->GetProfile()->GetPrefs()->GetBoolean(
++          prefs::kShowFullscreenToolbar);
+   TabStripModel* model = browser_->GetTabStripModel();
+   state.active_index = model->active_index();
+   for (int i = 0; i < model->count(); ++i) {
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index dc7a3d1543..077ac5b092 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -63,6 +63,8 @@ struct BarState {
+   double load_progress = 0;
+   // Settings > Appearance > Show home button (the toolbar's Home item).
+   bool show_home_button = false;
++  // View > Always Show Toolbar in Full Screen (pref kShowFullscreenToolbar).
++  bool always_show_toolbar_in_full_screen = true;
+ };
+ 
+ // Implemented by the platform view (AppKit on Mac).
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index d77b063917..859e1ee241 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -5155,6 +5155,7 @@ @implementation SafariumToolbarController {
+   BOOL _verticalTabs;
+   BOOL _contentFullscreen;  // A page element (video) is full screen.
+   BOOL _showHome;
++  BOOL _alwaysShowToolbarInFullScreen;
+   BOOL _homeItemSynced;   // Initial toolbar/pref reconciliation done.
+   BOOL _syncingHomeItem;  // We are adding/removing the Home item ourselves.
+ }
+@@ -5311,12 +5312,28 @@ - (void)installInWindow:(NSWindow*)window {
+                  name:NSWindowDidExitFullScreenNotification
+                object:window];
+   [self applyWindowChrome];
++  [self applyFullScreenToolbarMode];
+ }
+ 
+ - (void)windowDidChangeFullscreen:(NSNotification*)notification {
+   _sidebar.needsLayout = YES;
+ }
+ 
++// View > Always Show Toolbar in Full Screen, as in Safari: when it is off the
++// toolbar slides down with the menu bar at the top of the screen instead of
++// staying on screen. AppKit reads this as the window enters full screen
++// (ViewsNSWindowDelegate -window:willUseFullScreenPresentationOptions:), so
++// a change made while in full screen applies the next time.
++- (void)applyFullScreenToolbarMode {
++  NSWindow* window = _window;
++  if ([window isKindOfClass:[BrowserNativeWidgetWindow class]]) {
++    static_cast<BrowserNativeWidgetWindow*>(window)
++        .autoHidesToolbarInFullScreen = !_alwaysShowToolbarInFullScreen;
++  }
++}
++
++
++
+ // Horizontal tabs: the NSToolbar (tabs, address, buttons) on top. Vertical
+ // tabs: no toolbar; the content view runs to the window's top edge (the
+ // sidebar sits under the traffic lights, the page uses the full height).
+@@ -6178,6 +6195,11 @@ - (void)updateState:(const safarium::BarState&)state {
+   _isLoading = state.is_loading;
+   _showHome = state.show_home_button;
+   [self syncHomeItem:_showHome];
++  if (_alwaysShowToolbarInFullScreen !=
++      state.always_show_toolbar_in_full_screen) {
++    _alwaysShowToolbarInFullScreen = state.always_show_toolbar_in_full_screen;
++    [self applyFullScreenToolbarMode];
++  }
+   NSMutableArray<SafariumOverviewTab*>* tabs = [NSMutableArray array];
+   for (size_t i = 0; i < state.tabs.size(); ++i) {
+     const safarium::TabItem& t = state.tabs[i];
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index 409c2e0f6a..86d25c294a 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -95,6 +95,14 @@ void ValidateUserInterfaceItem(
+     // This allows menu items like "Close Tabs" to be enabled when the browser
+     // has open tabs, which in turn enables the "Close Tabs" keyboard shortcut.
+     result->enable = chrome::IsCommandEnabled(browser_, command);
++    // Checkmark for View > Always Show Toolbar in Full Screen (Safarium's
++    // native toolbar follows the same pref).
++    if (command == IDC_TOGGLE_FULLSCREEN_TOOLBAR) {
++      result->set_toggle_state = true;
++      result->new_toggle_state =
++          browser_->GetProfile()->GetPrefs()->GetBoolean(
++              prefs::kShowFullscreenToolbar);
++    }
+   }
+ 
+   // For our ValidateUserInterfaceItem() to be called we must register the
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+index e71a3ed14a..5ab451e308 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+@@ -11,6 +11,10 @@ REMOTE_COCOA_APP_SHIM_EXPORT
+ @interface BrowserNativeWidgetWindow : NativeWidgetMacNSWindow
+ // Opts into AppKit's window corner radius and traffic light placement.
+ @property(nonatomic) BOOL usesSystemTitlebarMetrics;
++// Safarium: the NSToolbar slides away with the menu bar in full screen
++// (View > Always Show Toolbar in Full Screen off). Read when the window
++// enters full screen.
++@property(nonatomic) BOOL autoHidesToolbarInFullScreen;
+ // When set to `YES`, the traffic lights will always be shown. When set to `NO`,
+ // the traffic lights follow the default AppKit behavior.
+ - (void)setAlwaysShowTrafficLights:(BOOL)alwaysShow;
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+index 0c751944bd..442d4aa2df 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -169,6 +169,7 @@ @implementation BrowserNativeWidgetWindow
+ 
+ @synthesize thinTitlebarViewController = _thinTitlebarViewController;
+ @synthesize usesSystemTitlebarMetrics = _usesSystemTitlebarMetrics;
++@synthesize autoHidesToolbarInFullScreen = _autoHidesToolbarInFullScreen;
+ 
+ // NSWindow (PrivateAPI) overrides.
+ 
+diff --git a/components/remote_cocoa/app_shim/views_nswindow_delegate.mm b/components/remote_cocoa/app_shim/views_nswindow_delegate.mm
+index cffae62856..78c304da19 100644
+--- a/components/remote_cocoa/app_shim/views_nswindow_delegate.mm
++++ b/components/remote_cocoa/app_shim/views_nswindow_delegate.mm
+@@ -14,6 +14,7 @@
+ #include "base/mac/mac_util.h"
+ #include "base/task/single_thread_task_runner.h"
+ #import "components/remote_cocoa/app_shim/bridged_content_view.h"
++#import "components/remote_cocoa/app_shim/browser_native_widget_window_mac.h"
+ #import "components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h"
+ #include "components/remote_cocoa/app_shim/native_widget_ns_window_fullscreen_controller.h"
+ #include "components/remote_cocoa/app_shim/native_widget_ns_window_host_helper.h"
+@@ -424,6 +425,21 @@ - (void)windowDidExitFullScreen:(NSNotification*)notification {
+   _parent->fullscreen_controller().OnWindowDidExitFullscreen();
+ }
+ 
++// Safarium: hide the toolbar with the menu bar when the window asks for it
++// (AppKit only honors this when entering full screen).
++- (NSApplicationPresentationOptions)window:(NSWindow*)window
++      willUseFullScreenPresentationOptions:
++          (NSApplicationPresentationOptions)proposedOptions {
++  if ([window isKindOfClass:[BrowserNativeWidgetWindow class]] &&
++      static_cast<BrowserNativeWidgetWindow*>(window)
++          .autoHidesToolbarInFullScreen &&
++      window.toolbar.visible) {
++    return proposedOptions | NSApplicationPresentationAutoHideToolbar |
++           NSApplicationPresentationAutoHideMenuBar;
++  }
++  return proposedOptions;
++}
++
+ // Safarium: custom full screen transitions (see
+ // ViewsNSWindowFullScreenAnimator). nil keeps AppKit's own.
+ - (NSArray<NSWindow*>*)customWindowsToEnterFullScreenForWindow:
+-- 
+2.54.0 (Apple Git-157)
+

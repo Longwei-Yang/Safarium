@@ -28,7 +28,7 @@ The interface and its animations will keep being refined.
 
 **Compact tab bar.** Tabs share one row with the address field, as in Safari's compact layout. The current tab is the address field. Tabs show hover cards, can be dragged to reorder, and can be torn off into a new window.
 
-**Vertical tabs.** Settings › Appearance › Tab position moves the tabs into a left sidebar. Drag the sidebar's right edge to resize it. The window controls and toolbar buttons sit at its top.
+**Vertical tabs.** View › Show Tabs Vertically, or Settings › Tabs, moves the tabs into a left sidebar. Drag the sidebar's right edge to resize it. The window controls and toolbar buttons sit at its top.
 
 ![Vertical tabs](docs/screenshots/vertical.png)
 
@@ -42,7 +42,17 @@ The interface and its animations will keep being refined.
 
 **Full screen video.** A video goes into its own full-screen space and returns to where you were, the desktop or a full-screen browser window.
 
-**Passwords, autofill and bookmarks.** Safarium offers to save passwords and addresses after you submit a form, fills them in later, and confirms new bookmarks (⌘D), each with a bubble under the address field. Right-click a page to make a QR code for it.
+**Bookmarks.** ⌘D opens Safari's Add Bookmark panel from the address field: pick a folder, edit the title, then Add. Nothing is saved if you cancel. On a page that is already bookmarked the panel edits or removes that bookmark.
+
+**Passwords and autofill.** Safarium offers to save passwords and addresses after you submit a form and fills them in later, with a bubble under the address field. Right-click a page to make a QR code for it.
+
+**Settings.** Safarium › Settings… opens a native settings window with General, Tabs, AutoFill and Advanced panes. Show All Settings… opens Chromium's full settings in a tab.
+
+**Full screen.** In the compact layout, View › Always Show Toolbar in Full Screen keeps the tab bar visible in full screen; otherwise it slides down when you move to the top of the screen. The vertical sidebar always stays.
+
+**Reopen your last session.** History › Reopen All Windows from Last Session brings back the windows and tabs from before you quit, or from before a crash.
+
+**Downloads on quit.** Quitting or closing the last window while a download is in progress asks first.
 
 **New Tab shortcuts.** The New Tab page holds up to 20 shortcuts.
 

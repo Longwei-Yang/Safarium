@@ -1,0 +1,84 @@
+From aca5c69ca76e9032a7efec79da98c0ce526c45ec Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:52:06 -0500
+Subject: [PATCH 22/26] Safarium: full-screen toolbar option only for the
+ compact layout
+
+Vertical tabs have no toolbar and the sidebar always stays in full
+screen (as Safari's sidebar does), so View > Always Show Toolbar in Full
+Screen is disabled there (checkmark kept), and the Settings window's
+checkbox is disabled too, with a note that it applies to the compact
+layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_settings_window_mac.mm           | 23 ++++++++++++++++++-
+ .../webui_browser/webui_browser_window_mac.mm |  9 ++++++--
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm b/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm
+index 7177d2ce4c..51fc52e590 100644
+--- a/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm
+@@ -606,6 +606,27 @@ - (NSViewController*)tabsPane {
+   NSButton* toolbar = [self checkbox:@"Always show the toolbar in full screen"
+                                 pref:prefs::kShowFullscreenToolbar
+                              service:prefs];
++  // Vertical tabs have no toolbar; the sidebar always stays in full screen.
++  NSView* toolbarNote =
++      Indented(Note(@"Applies to the compact layout. In the vertical layout "
++                    @"the sidebar stays in full screen."));
++  __weak NSButton* weakToolbar = toolbar;
++  void (^updateToolbarOption)(void) = ^{
++    const bool isVertical = prefs->GetBoolean(prefs::kVerticalTabsEnabled);
++    weakToolbar.enabled =
++        !isVertical &&
++        prefs->IsUserModifiablePreference(prefs::kShowFullscreenToolbar);
++  };
++  [self bindPref:prefs::kVerticalTabsEnabled
++         service:prefs
++         control:nil
++         refresh:updateToolbarOption
++          action:nil];
++  [self bindPref:prefs::kShowFullscreenToolbar
++         service:prefs
++         control:nil
++         refresh:updateToolbarOption
++          action:nil];
+ 
+   return Pane(@"Tabs", @[
+     @[ Label(@"Tab layout:"),
+@@ -614,7 +635,7 @@ - (NSViewController*)tabsPane {
+          vertical, Indented(Note(@"Tabs and toolbar buttons in a sidebar."))
+        ]) ],
+     @[ Label(@"Tab previews:"), Column(@[ preview, memory ]) ],
+-    @[ Label(@"Full screen:"), toolbar ],
++    @[ Label(@"Full screen:"), Column(@[ toolbar, toolbarNote ]) ],
+   ]);
+ }
+ 
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index 86d25c294a..8aa0103aee 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -98,10 +98,15 @@ void ValidateUserInterfaceItem(
+     // Checkmark for View > Always Show Toolbar in Full Screen (Safarium's
+     // native toolbar follows the same pref).
+     if (command == IDC_TOGGLE_FULLSCREEN_TOOLBAR) {
++      PrefService* prefs = browser_->GetProfile()->GetPrefs();
+       result->set_toggle_state = true;
+       result->new_toggle_state =
+-          browser_->GetProfile()->GetPrefs()->GetBoolean(
+-              prefs::kShowFullscreenToolbar);
++          prefs->GetBoolean(prefs::kShowFullscreenToolbar);
++      // Vertical tabs have no toolbar: the sidebar always stays in full
++      // screen (as Safari's sidebar does), so the option doesn't apply.
++      if (prefs->GetBoolean(prefs::kVerticalTabsEnabled)) {
++        result->enable = false;
++      }
+     }
+   }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

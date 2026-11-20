@@ -1,0 +1,162 @@
+From d44e0a651982eb318fab338de50dc55bb5dc8705 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:26:34 -0500
+Subject: [PATCH 18/26] Safarium: say Safarium instead of Chromium; drop two
+ Settings leftovers
+
+ResourceBundle replaces the product name "Chromium" with "Safarium" in
+localized strings (Settings, dialogs, menus), keeping it where the text
+means the open source project: "The Chromium Authors", "the Chromium
+open source project", "Chromium OS" and the "Chromium <version>" engine
+line on the About page.
+
+Settings > Autofill: no "Loyalty cards" chip under Payments, and the
+"Related Google services" section (only a duplicate Password Manager
+link in Safarium) is hidden.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../autofill_page/autofill_page.html.ts       |  3 +-
+ .../settings/autofill_page/autofill_page.ts   |  3 +
+ .../autofill_page/autofill_page_v2.html.ts    |  3 +-
+ ui/base/BUILD.gn                              |  1 +
+ ui/base/resource/resource_bundle.cc           | 60 ++++++++++++++++++-
+ 5 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts b/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts
+index ca78167fef..1464df63f6 100644
+--- a/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts
++++ b/chrome/browser/resources/settings/autofill_page/autofill_page.html.ts
+@@ -81,7 +81,8 @@ export function getHtml(this: SettingsAutofillPageElement) {
+   <collapsible-autofill-settings-card></collapsible-autofill-settings-card>
+ </settings-section>
+ 
+-<settings-section page-title="$i18n{yourSavedInfoRelatedServicesTitle}">
++<settings-section page-title="$i18n{yourSavedInfoRelatedServicesTitle}"
++    <if expr="pp_if('is_safarium_branded')">hidden</if>>
+   <div route-path="default">
+     <cr-link-row id="passwordManagerButton" label="$i18n{localPasswordManager}"
+         @click="${this.onPasswordManagerRelatedServiceClick_}"
+diff --git a/chrome/browser/resources/settings/autofill_page/autofill_page.ts b/chrome/browser/resources/settings/autofill_page/autofill_page.ts
+index dd4e6ec973..4c21e28fde 100644
+--- a/chrome/browser/resources/settings/autofill_page/autofill_page.ts
++++ b/chrome/browser/resources/settings/autofill_page/autofill_page.ts
+@@ -235,7 +235,10 @@ export class SettingsAutofillPageElement extends
+           },
+           // When the offers and loyalty cards page is enabled, loyalty cards
+           // are shown in that category instead of in payments.
++          // Safarium: no loyalty cards (Google Wallet).
++          // <if expr="not pp_if('is_safarium_branded')">
+           ...(this.isOffersAndLoyaltyCardsEnabled_ ? [] : [loyaltyCardsChip]),
++          // </if>
+         ],
+       },
+       contactInfo: {
+diff --git a/chrome/browser/resources/settings/autofill_page/autofill_page_v2.html.ts b/chrome/browser/resources/settings/autofill_page/autofill_page_v2.html.ts
+index dc710f40df..7073602bae 100644
+--- a/chrome/browser/resources/settings/autofill_page/autofill_page_v2.html.ts
++++ b/chrome/browser/resources/settings/autofill_page/autofill_page_v2.html.ts
+@@ -65,7 +65,8 @@ export function getHtml(this: SettingsAutofillPageV2Element) {
+   <collapsible-autofill-settings-card></collapsible-autofill-settings-card>
+ </settings-section>
+ 
+-<settings-section page-title="$i18n{yourSavedInfoRelatedServicesTitle}">
++<settings-section page-title="$i18n{yourSavedInfoRelatedServicesTitle}"
++    <if expr="pp_if('is_safarium_branded')">hidden</if>>
+   <cr-link-row id="passwordManagerButton" label="$i18n{localPasswordManager}"
+       @click="${this.onPasswordManagerRelatedServiceClick_}"
+       start-icon="cr20:password-manager" external>
+diff --git a/ui/base/BUILD.gn b/ui/base/BUILD.gn
+index 5704ddf8fe..a9c1eae48d 100644
+--- a/ui/base/BUILD.gn
++++ b/ui/base/BUILD.gn
+@@ -506,6 +506,7 @@ component("base") {
+     "//build:blink_buildflags",
+     "//build:branding_buildflags",
+     "//build:is_android_web_view",
++    "//build:safarium_buildflags",
+     "//net",
+     "//third_party/brotli:dec",
+     "//third_party/icu",
+diff --git a/ui/base/resource/resource_bundle.cc b/ui/base/resource/resource_bundle.cc
+index 5c5b1441bc..b278e284c3 100644
+--- a/ui/base/resource/resource_bundle.cc
++++ b/ui/base/resource/resource_bundle.cc
+@@ -38,6 +38,7 @@
+ #include "base/synchronization/lock.h"
+ #include "base/trace_event/typed_macros.h"
+ #include "build/build_config.h"
++#include "build/safarium_buildflags.h"
+ #include "net/filter/gzip_header.h"
+ #include "skia/ext/image_operations.h"
+ #include "third_party/brotli/include/brotli/decode.h"
+@@ -616,8 +617,65 @@ const base::FilePath& ResourceBundle::GetOverriddenPakPath() const {
+   return overridden_pak_path_;
+ }
+ 
++#if BUILDFLAG(SAFARIUM_BRANDING)
++namespace {
++
++// Safarium: Chromium's strings name the product "Chromium" in hundreds of
++// messages. Show "Safarium" instead, except where the text means the open
++// source project itself ("The Chromium Authors", "the Chromium open source
++// project", "Chromium OS", the "Chromium <version>" engine line).
++std::u16string BrandProductName(const std::u16string& str) {
++  static constexpr std::u16string_view kChromium = u"Chromium";
++  if (str.find(kChromium) == std::u16string::npos) {
++    return str;
++  }
++  static constexpr std::u16string_view kKeepBefore[] = {
++      u" Authors", u" OS", u"OS", u" open source", u" project", u" Version",
++      // "Chromium $1": the engine version line on Safarium's About page.
++      u" $",
++  };
++  std::u16string out;
++  size_t pos = 0;
++  while (true) {
++    const size_t hit = str.find(kChromium, pos);
++    if (hit == std::u16string::npos) {
++      out.append(str, pos, std::u16string::npos);
++      break;
++    }
++    out.append(str, pos, hit - pos);
++    // What follows, skipping markup such as the "</a>" of a link.
++    size_t next = hit + kChromium.size();
++    while (next < str.size() && str[next] == u'<') {
++      const size_t close = str.find(u'>', next);
++      if (close == std::u16string::npos) {
++        break;
++      }
++      next = close + 1;
++    }
++    const std::u16string_view rest = std::u16string_view(str).substr(next);
++    bool keep = false;
++    for (std::u16string_view phrase : kKeepBefore) {
++      if (rest.starts_with(phrase)) {
++        keep = true;
++        break;
++      }
++    }
++    out.append(keep ? kChromium : u"Safarium");
++    pos = hit + kChromium.size();
++  }
++  return out;
++}
++
++}  // namespace
++#endif  // BUILDFLAG(SAFARIUM_BRANDING)
++
+ std::u16string ResourceBundle::MaybeMangleLocalizedString(
+-    const std::u16string& str) const {
++    const std::u16string& raw_str) const {
++#if BUILDFLAG(SAFARIUM_BRANDING)
++  const std::u16string str = BrandProductName(raw_str);
++#else
++  const std::u16string& str = raw_str;
++#endif
+   if (!mangle_localized_strings_)
+     return str;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

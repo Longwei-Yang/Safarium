@@ -1,0 +1,832 @@
+From 6b4873d1a76fa9db38e725a32e09120746a59edb Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:37:53 -0500
+Subject: [PATCH 20/26] Safarium: native Settings window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Safarium > Settings… (⌘,) opens a native, Safari-style settings window
+(NSTabViewController, toolbar style) instead of the chrome://settings
+tab. Panes:
+- General: startup (new tab / last session), Home button and the page
+  it opens, download folder and "ask where to save", default browser.
+- Tabs: compact or vertical layout, tab previews and their memory
+  usage, always show the toolbar in full screen.
+- AutoFill: passwords, auto sign-in, addresses, cards, each with Edit…
+  into the existing pages.
+- Advanced: website data, extensions, and Show All Settings… for
+  chrome://settings.
+Each control reads and writes the same pref chrome://settings uses,
+follows changes made elsewhere, and is disabled when a policy sets it.
+The last pane is remembered. One window per profile; it closes when its
+profile goes away.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/app_controller_mac.mm          |   8 +
+ chrome/browser/ui/webui_browser/BUILD.gn      |   2 +
+ .../webui_browser/safarium_settings_window.h  |  20 +
+ .../safarium_settings_window_mac.mm           | 717 ++++++++++++++++++
+ 4 files changed, 747 insertions(+)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_settings_window.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm
+
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 0513dec6f9..39e2c66724 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -109,6 +109,8 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/color_provider_browser_helper.h"
++#include "chrome/browser/ui/webui_browser/safarium_features.h"
++#include "chrome/browser/ui/webui_browser/safarium_settings_window.h"
+ #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "chrome/common/channel_info.h"
+@@ -2102,6 +2104,12 @@ - (IBAction)showPreferencesForProfile:(Profile*)profile {
+     // Failed to load profile, show Profile Picker instead.
+     return;
+   }
++  // Safarium: its own native Settings window ("Show All Settings…" there
++  // opens chrome://settings).
++  if (safarium::IsNativeUIEnabled()) {
++    safarium::ShowSettingsWindow(profile);
++    return;
++  }
+   // Re-use an existing browser, or create a new one.
+   if (BrowserWindowInterface* browser = ActivateBrowser(profile)) {
+     chrome::ShowSettings(browser);
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index a2cf42c9cc..9e00414a5d 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -32,6 +32,7 @@ source_set("webui_browser") {
+   sources = [
+     "browser_elements_webui_browser.h",
+     "find_bar_owner_webui_browser.h",
++    "safarium_settings_window.h",
+     "webui_browser_exclusive_access_context.h",
+     "webui_browser_side_panel_ui.h",
+     "webui_browser_ui.h",
+@@ -113,6 +114,7 @@ source_set("impl") {
+       "safarium_downloads_popover.mm",
+       "safarium_root_view.cc",
+       "safarium_root_view.h",
++      "safarium_settings_window_mac.mm",
+       "safarium_side_panel_header_mac.mm",
+       "safarium_tab_bar_host_mac.mm",
+       "safarium_video_fullscreen.h",
+diff --git a/chrome/browser/ui/webui_browser/safarium_settings_window.h b/chrome/browser/ui/webui_browser/safarium_settings_window.h
+new file mode 100644
+index 0000000000..4a4374a2d8
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_settings_window.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_SETTINGS_WINDOW_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_SETTINGS_WINDOW_H_
++
++class Profile;
++
++namespace safarium {
++
++// Safarium > Settings… (⌘,): a native, Safari-style settings window for the
++// everyday options of `profile`. Each control reads and writes the same
++// Chromium pref chrome://settings uses; "Show All Settings…" opens that page
++// for everything else. Implemented in safarium_settings_window_mac.mm.
++void ShowSettingsWindow(Profile* profile);
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_SETTINGS_WINDOW_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm b/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm
+new file mode 100644
+index 0000000000..7177d2ce4c
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_settings_window_mac.mm
+@@ -0,0 +1,717 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/safarium_settings_window.h"
++
++#import <Cocoa/Cocoa.h>
++
++#include <algorithm>
++#include <memory>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/strings/sys_string_conversions.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/download/download_prefs.h"
++#include "chrome/browser/prefs/session_startup_pref.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_observer.h"
++#include "chrome/browser/shell_integration.h"
++#include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/singleton_tabs.h"
++#include "chrome/common/pref_names.h"
++#include "components/autofill/core/common/autofill_prefs.h"
++#include "components/password_manager/core/common/password_manager_pref_names.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "components/url_formatter/url_fixer.h"
++#include "url/gurl.h"
++
++@class SafariumSettingsController;
++
++namespace {
++
++NSString* const kSelectedPaneKey = @"SafariumSettingsSelectedPane";
++constexpr CGFloat kPaneInset = 24;
++constexpr CGFloat kPaneMinWidth = 560;
++
++// Watches the profile's prefs (and local state) for the window and closes it
++// when the profile goes away.
++class SettingsWindowBridge : public ProfileObserver {
++ public:
++  SettingsWindowBridge(Profile* profile, SafariumSettingsController* controller);
++  SettingsWindowBridge(const SettingsWindowBridge&) = delete;
++  SettingsWindowBridge& operator=(const SettingsWindowBridge&) = delete;
++  ~SettingsWindowBridge() override;
++
++  // Calls the controller's -prefChanged: when `name` changes in `service`.
++  void Watch(PrefService* service, const std::string& name);
++
++  // Checks (or makes) Safarium the default browser, then reports to the
++  // controller's -defaultBrowserStateChanged:.
++  void CheckDefaultBrowser(bool set);
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override;
++
++ private:
++  void OnPrefChanged(const std::string& name);
++  void OnDefaultBrowserState(shell_integration::DefaultWebClientState state);
++
++  __weak SafariumSettingsController* controller_;
++  PrefChangeRegistrar profile_prefs_;
++  PrefChangeRegistrar local_state_;
++  scoped_refptr<shell_integration::DefaultBrowserWorker> default_worker_;
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++  base::WeakPtrFactory<SettingsWindowBridge> weak_factory_{this};
++};
++
++}  // namespace
++
++// One control bound to one pref: `refresh` loads the pref into the control,
++// `action` stores the control's value.
++@interface SafariumPrefBinding : NSObject
++@property(nonatomic, copy) NSString* pref;
++@property(nonatomic, copy) void (^refresh)(void);
++@property(nonatomic, copy) void (^action)(id sender);
++- (void)fire:(id)sender;
++@end
++
++@implementation SafariumPrefBinding
++@synthesize pref = _pref;
++@synthesize refresh = _refresh;
++@synthesize action = _action;
++- (void)fire:(id)sender {
++  if (_action) {
++    _action(sender);
++  }
++}
++@end
++
++// Titles the window after the selected pane, like Safari's Settings.
++@interface SafariumSettingsTabViewController : NSTabViewController
++@end
++
++@implementation SafariumSettingsTabViewController
++- (void)tabView:(NSTabView*)tabView didSelectTabViewItem:(NSTabViewItem*)item {
++  [super tabView:tabView didSelectTabViewItem:item];
++  self.view.window.title = item.label;
++  if (item.identifier) {
++    [NSUserDefaults.standardUserDefaults setObject:item.identifier
++                                            forKey:kSelectedPaneKey];
++  }
++}
++@end
++
++@interface SafariumSettingsController : NSWindowController <NSWindowDelegate>
++- (instancetype)initWithProfile:(Profile*)profile;
++- (void)prefChanged:(NSString*)name;
++- (void)defaultBrowserStateChanged:(shell_integration::DefaultWebClientState)
++                                       state;
++- (void)profileWillBeDestroyed;
++@end
++
++namespace {
++
++// Open settings windows, one per profile.
++NSMutableDictionary<NSValue*, SafariumSettingsController*>* OpenWindows() {
++  static NSMutableDictionary* windows = [NSMutableDictionary dictionary];
++  return windows;
++}
++
++SettingsWindowBridge::SettingsWindowBridge(
++    Profile* profile,
++    SafariumSettingsController* controller)
++    : controller_(controller) {
++  profile_prefs_.Init(profile->GetPrefs());
++  local_state_.Init(g_browser_process->local_state());
++  profile_observation_.Observe(profile);
++}
++
++SettingsWindowBridge::~SettingsWindowBridge() = default;
++
++void SettingsWindowBridge::Watch(PrefService* service,
++                                 const std::string& name) {
++  PrefChangeRegistrar& registrar =
++      service == g_browser_process->local_state() ? local_state_
++                                                  : profile_prefs_;
++  if (registrar.IsObserved(name)) {
++    return;
++  }
++  registrar.Add(name, base::BindRepeating(&SettingsWindowBridge::OnPrefChanged,
++                                          base::Unretained(this)));
++}
++
++void SettingsWindowBridge::CheckDefaultBrowser(bool set) {
++  default_worker_ = base::MakeRefCounted<shell_integration::DefaultBrowserWorker>();
++  auto callback = base::BindOnce(&SettingsWindowBridge::OnDefaultBrowserState,
++                                 weak_factory_.GetWeakPtr());
++  if (set) {
++    default_worker_->StartSetAsDefault(std::move(callback));
++  } else {
++    default_worker_->StartCheckIsDefault(std::move(callback));
++  }
++}
++
++void SettingsWindowBridge::OnProfileWillBeDestroyed(Profile* profile) {
++  profile_observation_.Reset();
++  profile_prefs_.RemoveAll();
++  [controller_ profileWillBeDestroyed];
++}
++
++void SettingsWindowBridge::OnPrefChanged(const std::string& name) {
++  [controller_ prefChanged:base::SysUTF8ToNSString(name)];
++}
++
++void SettingsWindowBridge::OnDefaultBrowserState(
++    shell_integration::DefaultWebClientState state) {
++  [controller_ defaultBrowserStateChanged:state];
++}
++
++NSTextField* Label(NSString* text) {
++  NSTextField* label = [NSTextField labelWithString:text];
++  label.alignment = NSTextAlignmentRight;
++  return label;
++}
++
++NSTextField* Note(NSString* text) {
++  NSTextField* note = [NSTextField wrappingLabelWithString:text];
++  note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
++  note.textColor = NSColor.secondaryLabelColor;
++  note.preferredMaxLayoutWidth = 360;
++  return note;
++}
++
++// Lines a description up with the text of the checkbox or radio above it.
++NSView* Indented(NSView* view) {
++  NSStackView* stack = [NSStackView stackViewWithViews:@[ view ]];
++  stack.edgeInsets = NSEdgeInsetsMake(0, 20, 0, 0);
++  return stack;
++}
++
++NSStackView* Column(NSArray<NSView*>* views) {
++  NSStackView* stack = [NSStackView stackViewWithViews:views];
++  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
++  stack.alignment = NSLayoutAttributeLeading;
++  stack.spacing = 6;
++  return stack;
++}
++
++NSStackView* Row(NSArray<NSView*>* views) {
++  NSStackView* stack = [NSStackView stackViewWithViews:views];
++  stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
++  stack.alignment = NSLayoutAttributeFirstBaseline;
++  stack.spacing = 8;
++  return stack;
++}
++
++// A pane: label/control rows in a grid, labels right-aligned (Safari's
++// layout), sized to fit.
++NSViewController* Pane(NSString* title, NSArray<NSArray<NSView*>*>* rows) {
++  // Pad rows to the same number of columns.
++  NSUInteger columns = 0;
++  for (NSArray<NSView*>* row in rows) {
++    columns = std::max(columns, row.count);
++  }
++  NSMutableArray<NSArray<NSView*>*>* padded = [NSMutableArray array];
++  for (NSArray<NSView*>* row in rows) {
++    NSMutableArray<NSView*>* cells = [row mutableCopy];
++    while (cells.count < columns) {
++      [cells addObject:[NSGridCell emptyContentView]];
++    }
++    [padded addObject:cells];
++  }
++  NSGridView* grid = [NSGridView gridViewWithViews:padded];
++  grid.rowSpacing = 14;
++  grid.columnSpacing = 10;
++  grid.rowAlignment = NSGridRowAlignmentFirstBaseline;
++  [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
++  for (NSInteger i = 0; i < grid.numberOfRows; ++i) {
++    NSView* left = [grid cellAtColumnIndex:0 rowIndex:i].contentView;
++    if (!left) {
++      [grid cellAtColumnIndex:0 rowIndex:i].xPlacement =
++          NSGridCellPlacementNone;
++    }
++  }
++  grid.translatesAutoresizingMaskIntoConstraints = NO;
++
++  NSView* container = [[NSView alloc] initWithFrame:NSZeroRect];
++  [container addSubview:grid];
++  [NSLayoutConstraint activateConstraints:@[
++    [grid.topAnchor constraintEqualToAnchor:container.topAnchor
++                                   constant:kPaneInset],
++    [grid.bottomAnchor constraintEqualToAnchor:container.bottomAnchor
++                                      constant:-kPaneInset],
++    [grid.centerXAnchor constraintEqualToAnchor:container.centerXAnchor],
++    [grid.leadingAnchor
++        constraintGreaterThanOrEqualToAnchor:container.leadingAnchor
++                                    constant:kPaneInset],
++    [container.widthAnchor constraintGreaterThanOrEqualToConstant:kPaneMinWidth],
++  ]];
++  NSViewController* pane = [[NSViewController alloc] init];
++  pane.view = container;
++  pane.title = title;
++  NSSize size = container.fittingSize;
++  size.width = std::max(size.width, kPaneMinWidth);
++  pane.preferredContentSize = size;
++  return pane;
++}
++
++}  // namespace
++
++@implementation SafariumSettingsController {
++  raw_ptr<Profile> _profile;
++  std::unique_ptr<SettingsWindowBridge> _bridge;
++  NSMutableArray<SafariumPrefBinding*>* _bindings;
++  NSTextField* _defaultBrowserStatus;
++  NSButton* _defaultBrowserButton;
++}
++
++- (instancetype)initWithProfile:(Profile*)profile {
++  NSWindow* window = [[NSWindow alloc]
++      initWithContentRect:NSMakeRect(0, 0, kPaneMinWidth, 300)
++                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
++                  backing:NSBackingStoreBuffered
++                    defer:YES];
++  if ((self = [super initWithWindow:window])) {
++    _profile = profile;
++    _bindings = [NSMutableArray array];
++    _bridge = std::make_unique<SettingsWindowBridge>(profile, self);
++    window.delegate = self;
++    window.releasedWhenClosed = NO;
++    window.toolbarStyle = NSWindowToolbarStylePreference;
++    window.identifier = @"SafariumSettingsWindow";
++
++    SafariumSettingsTabViewController* tabs =
++        [[SafariumSettingsTabViewController alloc] init];
++    tabs.tabStyle = NSTabViewControllerTabStyleToolbar;
++    tabs.transitionOptions = NSViewControllerTransitionCrossfade |
++                             NSViewControllerTransitionAllowUserInteraction;
++    struct PaneSpec {
++      NSString* identifier;
++      NSString* symbol;
++      NSViewController* pane;
++    };
++    const PaneSpec panes[] = {
++        {@"general", @"gearshape", [self generalPane]},
++        {@"tabs", @"square.on.square", [self tabsPane]},
++        {@"autofill", @"pencil.and.list.clipboard", [self autofillPane]},
++        {@"advanced", @"gearshape.2", [self advancedPane]},
++    };
++    NSString* selected = [NSUserDefaults.standardUserDefaults
++        stringForKey:kSelectedPaneKey];
++    NSInteger selectedIndex = 0;
++    for (const PaneSpec& spec : panes) {
++      NSTabViewItem* item =
++          [NSTabViewItem tabViewItemWithViewController:spec.pane];
++      item.identifier = spec.identifier;
++      item.label = spec.pane.title;
++      item.image = [NSImage imageWithSystemSymbolName:spec.symbol
++                             accessibilityDescription:spec.pane.title];
++      if ([selected isEqualToString:spec.identifier]) {
++        selectedIndex = tabs.tabViewItems.count;
++      }
++      [tabs addTabViewItem:item];
++    }
++    window.contentViewController = tabs;
++    tabs.selectedTabViewItemIndex = selectedIndex;
++    window.title = tabs.tabViewItems[selectedIndex].label;
++    [window center];
++    _bridge->CheckDefaultBrowser(/*set=*/false);
++  }
++  return self;
++}
++
++// --- Bindings ---------------------------------------------------------------
++
++- (PrefService*)prefs {
++  return _profile ? _profile->GetPrefs() : nullptr;
++}
++
++- (void)bindPref:(const char*)pref
++         service:(PrefService*)service
++         control:(NSControl*)control
++         refresh:(void (^)(void))refresh
++          action:(void (^)(id sender))action {
++  SafariumPrefBinding* binding = [[SafariumPrefBinding alloc] init];
++  binding.pref = @(pref);
++  binding.refresh = refresh;
++  binding.action = action;
++  if (control) {
++    control.target = binding;
++    control.action = @selector(fire:);
++  }
++  [_bindings addObject:binding];
++  _bridge->Watch(service, pref);
++  refresh();
++}
++
++// A checkbox for a boolean pref (disabled when a policy sets it).
++- (NSButton*)checkbox:(NSString*)title
++                 pref:(const char*)pref
++              service:(PrefService*)service {
++  NSButton* box = [NSButton checkboxWithTitle:title target:nil action:nil];
++  std::string name = pref;
++  __weak NSButton* weakBox = box;
++  [self bindPref:pref
++         service:service
++         control:box
++         refresh:^{
++           weakBox.state = service->GetBoolean(name)
++                               ? NSControlStateValueOn
++                               : NSControlStateValueOff;
++           weakBox.enabled = service->IsUserModifiablePreference(name);
++         }
++          action:^(id sender) {
++            service->SetBoolean(name, [sender state] == NSControlStateValueOn);
++          }];
++  return box;
++}
++
++- (void)prefChanged:(NSString*)name {
++  for (SafariumPrefBinding* binding in _bindings) {
++    if ([binding.pref isEqualToString:name] && binding.refresh) {
++      binding.refresh();
++    }
++  }
++}
++
++- (NSButton*)linkButton:(NSString*)title url:(const char*)url {
++  NSButton* button = [NSButton buttonWithTitle:title
++                                        target:self
++                                        action:@selector(openLink:)];
++  button.identifier = @(url);
++  return button;
++}
++
++- (void)openLink:(NSButton*)sender {
++  if (!_profile) {
++    return;
++  }
++  ShowSingletonTab(_profile, GURL(base::SysNSStringToUTF8(sender.identifier)));
++}
++
++// --- General ----------------------------------------------------------------
++
++- (NSViewController*)generalPane {
++  PrefService* prefs = [self prefs];
++
++  // Startup: the two choices Safari offers; URLs stay in All Settings.
++  NSPopUpButton* startup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect
++                                                      pullsDown:NO];
++  [startup addItemsWithTitles:@[
++    @"A new tab", @"All tabs from the last session", @"Specific pages"
++  ]];
++  [startup itemAtIndex:2].enabled = NO;
++  startup.autoenablesItems = NO;
++  __weak NSPopUpButton* weakStartup = startup;
++  [self bindPref:prefs::kRestoreOnStartup
++         service:prefs
++         control:startup
++         refresh:^{
++           const SessionStartupPref pref =
++               SessionStartupPref::GetStartupPref(prefs);
++           NSInteger index = 0;
++           if (pref.type == SessionStartupPref::LAST) {
++             index = 1;
++           } else if (pref.type == SessionStartupPref::URLS ||
++                      pref.type == SessionStartupPref::LAST_AND_URLS) {
++             index = 2;
++           }
++           [weakStartup selectItemAtIndex:index];
++           [weakStartup itemAtIndex:2].hidden = index != 2;
++           weakStartup.enabled = !SessionStartupPref::TypeIsManaged(prefs);
++         }
++          action:^(id sender) {
++            SessionStartupPref pref = SessionStartupPref::GetStartupPref(prefs);
++            pref.type = [sender indexOfSelectedItem] == 1
++                            ? SessionStartupPref::LAST
++                            : SessionStartupPref::DEFAULT;
++            SessionStartupPref::SetStartupPref(prefs, pref);
++          }];
++
++  // Home button and the page it opens.
++  NSButton* showHome = [self checkbox:@"Show Home button in the toolbar"
++                                 pref:prefs::kShowHomeButton
++                              service:prefs];
++  NSPopUpButton* homeKind = [[NSPopUpButton alloc] initWithFrame:NSZeroRect
++                                                       pullsDown:NO];
++  [homeKind addItemsWithTitles:@[ @"New Tab page", @"Homepage:" ]];
++  NSTextField* homePage = [NSTextField textFieldWithString:@""];
++  homePage.placeholderString = @"https://www.example.com";
++  [homePage.widthAnchor constraintEqualToConstant:220].active = YES;
++  __weak NSPopUpButton* weakKind = homeKind;
++  __weak NSTextField* weakHome = homePage;
++  [self bindPref:prefs::kHomePageIsNewTabPage
++         service:prefs
++         control:homeKind
++         refresh:^{
++           const bool ntp = prefs->GetBoolean(prefs::kHomePageIsNewTabPage);
++           [weakKind selectItemAtIndex:ntp ? 0 : 1];
++           weakKind.enabled =
++               prefs->IsUserModifiablePreference(prefs::kHomePageIsNewTabPage);
++           weakHome.enabled =
++               !ntp && prefs->IsUserModifiablePreference(prefs::kHomePage);
++         }
++          action:^(id sender) {
++            prefs->SetBoolean(prefs::kHomePageIsNewTabPage,
++                              [sender indexOfSelectedItem] == 0);
++          }];
++  [self bindPref:prefs::kHomePage
++         service:prefs
++         control:homePage
++         refresh:^{
++           weakHome.stringValue =
++               base::SysUTF8ToNSString(prefs->GetString(prefs::kHomePage));
++         }
++          action:^(id sender) {
++            const std::string text = base::SysNSStringToUTF8([sender stringValue]);
++            if (text.empty()) {
++              return;
++            }
++            const GURL url = url_formatter::FixupURL(text, std::string());
++            if (url.is_valid()) {
++              prefs->SetString(prefs::kHomePage, url.spec());
++            }
++          }];
++
++  // Downloads.
++  NSPopUpButton* folder = [[NSPopUpButton alloc] initWithFrame:NSZeroRect
++                                                     pullsDown:NO];
++  __weak NSPopUpButton* weakFolder = folder;
++  Profile* profile = _profile;
++  [self bindPref:prefs::kDownloadDefaultDirectory
++         service:prefs
++         control:folder
++         refresh:^{
++           DownloadPrefs* downloads = DownloadPrefs::FromBrowserContext(profile);
++           const base::FilePath path = downloads->DownloadPath();
++           NSString* posix = base::SysUTF8ToNSString(path.value());
++           [weakFolder removeAllItems];
++           [weakFolder addItemWithTitle:[NSFileManager.defaultManager
++                                            displayNameAtPath:posix]];
++           NSImage* icon = [NSWorkspace.sharedWorkspace iconForFile:posix];
++           icon.size = NSMakeSize(16, 16);
++           weakFolder.lastItem.image = icon;
++           weakFolder.lastItem.toolTip = posix;
++           [weakFolder.menu addItem:NSMenuItem.separatorItem];
++           [weakFolder addItemWithTitle:@"Other…"];
++           [weakFolder selectItemAtIndex:0];
++           weakFolder.enabled = !downloads->IsDownloadPathManaged();
++         }
++          action:^(id sender) {
++            if ([sender indexOfSelectedItem] == 0) {
++              return;
++            }
++            [sender selectItemAtIndex:0];
++            NSOpenPanel* panel = [NSOpenPanel openPanel];
++            panel.canChooseFiles = NO;
++            panel.canChooseDirectories = YES;
++            panel.canCreateDirectories = YES;
++            panel.prompt = @"Select";
++            [panel beginSheetModalForWindow:[sender window]
++                          completionHandler:^(NSModalResponse result) {
++                            if (result != NSModalResponseOK || !panel.URL) {
++                              return;
++                            }
++                            DownloadPrefs::FromBrowserContext(profile)
++                                ->SetDownloadPath(base::FilePath(
++                                    base::SysNSStringToUTF8(panel.URL.path)));
++                          }];
++          }];
++  NSButton* ask = [self checkbox:@"Ask where to save each file"
++                            pref:prefs::kPromptForDownload
++                         service:prefs];
++
++  // Default browser.
++  _defaultBrowserStatus = [NSTextField labelWithString:@""];
++  _defaultBrowserButton = [NSButton buttonWithTitle:@"Set Default…"
++                                             target:self
++                                             action:@selector(setDefault:)];
++  _defaultBrowserButton.hidden = YES;
++
++  return Pane(@"General", @[
++    @[ Label(@"Safarium opens with:"), startup ],
++    @[ Label(@"Home button:"), Column(@[ showHome, Row(@[ homeKind, homePage ]) ]) ],
++    @[ Label(@"File download location:"), Column(@[ folder, ask ]) ],
++    @[ Label(@"Default web browser:"),
++       Row(@[ _defaultBrowserStatus, _defaultBrowserButton ]) ],
++  ]);
++}
++
++- (void)setDefault:(id)sender {
++  _bridge->CheckDefaultBrowser(/*set=*/true);
++}
++
++- (void)defaultBrowserStateChanged:
++    (shell_integration::DefaultWebClientState)state {
++  const bool isDefault = state == shell_integration::IS_DEFAULT;
++  _defaultBrowserStatus.stringValue =
++      isDefault ? @"Safarium is your default web browser."
++                : @"Safarium is not your default web browser.";
++  _defaultBrowserButton.hidden = isDefault;
++}
++
++// --- Tabs -------------------------------------------------------------------
++
++- (NSViewController*)tabsPane {
++  PrefService* prefs = [self prefs];
++  PrefService* local = g_browser_process->local_state();
++
++  NSButton* compact = [NSButton radioButtonWithTitle:@"Compact"
++                                              target:nil
++                                              action:nil];
++  NSButton* vertical = [NSButton radioButtonWithTitle:@"Vertical"
++                                               target:nil
++                                               action:nil];
++  __weak NSButton* weakCompact = compact;
++  __weak NSButton* weakVertical = vertical;
++  void (^refresh)(void) = ^{
++    const bool on = prefs->GetBoolean(prefs::kVerticalTabsEnabled);
++    weakCompact.state = on ? NSControlStateValueOff : NSControlStateValueOn;
++    weakVertical.state = on ? NSControlStateValueOn : NSControlStateValueOff;
++    const bool editable =
++        prefs->IsUserModifiablePreference(prefs::kVerticalTabsEnabled);
++    weakCompact.enabled = editable;
++    weakVertical.enabled = editable;
++  };
++  [self bindPref:prefs::kVerticalTabsEnabled
++         service:prefs
++         control:compact
++         refresh:refresh
++          action:^(id sender) {
++            prefs->SetBoolean(prefs::kVerticalTabsEnabled, false);
++          }];
++  [self bindPref:prefs::kVerticalTabsEnabled
++         service:prefs
++         control:vertical
++         refresh:refresh
++          action:^(id sender) {
++            prefs->SetBoolean(prefs::kVerticalTabsEnabled, true);
++          }];
++
++  NSButton* preview =
++      [self checkbox:@"Show a preview of the page when hovering over a tab"
++                pref:prefs::kHoverCardImagesEnabled
++             service:local];
++  NSButton* memory = [self checkbox:@"Show memory usage in tab previews"
++                               pref:prefs::kHoverCardMemoryUsageEnabled
++                            service:local];
++  NSButton* toolbar = [self checkbox:@"Always show the toolbar in full screen"
++                                pref:prefs::kShowFullscreenToolbar
++                             service:prefs];
++
++  return Pane(@"Tabs", @[
++    @[ Label(@"Tab layout:"),
++       Column(@[
++         compact, Indented(Note(@"Tabs share the toolbar with the address field.")),
++         vertical, Indented(Note(@"Tabs and toolbar buttons in a sidebar."))
++       ]) ],
++    @[ Label(@"Tab previews:"), Column(@[ preview, memory ]) ],
++    @[ Label(@"Full screen:"), toolbar ],
++  ]);
++}
++
++// --- AutoFill ---------------------------------------------------------------
++
++- (NSViewController*)autofillPane {
++  PrefService* prefs = [self prefs];
++  NSButton* passwords = [self
++      checkbox:@"Passwords"
++          pref:password_manager::prefs::kCredentialsEnableService
++       service:prefs];
++  NSButton* autoSignIn =
++      [self checkbox:@"Sign in automatically with saved passwords"
++                pref:password_manager::prefs::kCredentialsEnableAutosignin
++             service:prefs];
++  NSButton* addresses =
++      [self checkbox:@"Addresses and contact info"
++                pref:autofill::prefs::kAutofillProfileEnabled
++             service:prefs];
++  NSButton* cards = [self checkbox:@"Credit and debit cards"
++                              pref:autofill::prefs::kAutofillCreditCardEnabled
++                           service:prefs];
++
++  NSStackView* indented = Row(@[ autoSignIn ]);
++  indented.edgeInsets = NSEdgeInsetsMake(0, 20, 0, 0);
++  NSView* empty = [NSGridCell emptyContentView];
++  return Pane(@"AutoFill", @[
++    @[ Label(@"Fill in and save:"), passwords,
++       [self linkButton:@"Edit…" url:"chrome://password-manager/passwords"] ],
++    @[ empty, indented ],
++    @[ empty, addresses,
++       [self linkButton:@"Edit…" url:"chrome://settings/addresses"] ],
++    @[ empty, cards,
++       [self linkButton:@"Edit…" url:"chrome://settings/payments"] ],
++    @[ empty, Note(@"Safarium offers to save these when you submit a form, "
++                   @"and fills them in on later visits. They stay on this "
++                   @"Mac.") ],
++  ]);
++}
++
++// --- Advanced ---------------------------------------------------------------
++
++- (NSViewController*)advancedPane {
++  NSButton* all = [NSButton buttonWithTitle:@"Show All Settings…"
++                                     target:self
++                                     action:@selector(showAllSettings:)];
++  return Pane(@"Advanced", @[
++    @[ Label(@"Website data:"),
++       [self linkButton:@"Manage Website Data…"
++                    url:"chrome://settings/content/all"] ],
++    @[ Label(@"Extensions:"),
++       [self linkButton:@"Manage Extensions…" url:"chrome://extensions"] ],
++    @[ Label(@"All settings:"),
++       Column(@[ all, Note(@"Privacy, security, languages, accessibility, "
++                           @"site permissions and the rest of Safarium's "
++                           @"settings.") ]) ],
++  ]);
++}
++
++- (void)showAllSettings:(id)sender {
++  if (_profile) {
++    chrome::ShowSettingsSubPageForProfile(_profile, std::string());
++  }
++}
++
++// --- Lifetime ---------------------------------------------------------------
++
++- (void)profileWillBeDestroyed {
++  [self.window close];
++}
++
++- (void)windowWillClose:(NSNotification*)notification {
++  _bindings = nil;
++  _bridge.reset();
++  if (_profile) {
++    [OpenWindows() removeObjectForKey:[NSValue valueWithPointer:_profile]];
++  }
++  _profile = nullptr;
++}
++
++@end
++
++namespace safarium {
++
++void ShowSettingsWindow(Profile* profile) {
++  if (!profile) {
++    return;
++  }
++  profile = profile->GetOriginalProfile();
++  NSValue* key = [NSValue valueWithPointer:profile];
++  SafariumSettingsController* controller = OpenWindows()[key];
++  if (!controller) {
++    controller = [[SafariumSettingsController alloc] initWithProfile:profile];
++    OpenWindows()[key] = controller;
++  }
++  [controller showWindow:nil];
++  [controller.window makeKeyAndOrderFront:nil];
++}
++
++}  // namespace safarium
+-- 
+2.54.0 (Apple Git-157)
+

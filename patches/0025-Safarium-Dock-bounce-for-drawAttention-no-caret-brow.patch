@@ -1,0 +1,164 @@
+From 584cab4843f108321cddff85e3121ac82ce181e1 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:37:33 -0500
+Subject: [PATCH 25/26] Safarium: Dock bounce for drawAttention; no caret
+ browsing
+
+- WebUIBrowserWindow::FlashFrame asks AppKit for a critical attention
+  request (Dock icon bounces until Safarium is activated); views'
+  NativeWidgetMac::FlashFrame is a stub, so Chrome itself never bounced.
+  Reached by an extension's windows.update({drawAttention: true}).
+- Caret browsing removed, as in Safari: no F7 shortcut, and the
+  Settings > Accessibility toggle is hidden.
+- The Mac window's command handling runs History > Reopen All Windows
+  from Last Session (previous commit) and enables it only when
+  safarium::CanReopenLastSession().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../settings/a11y_page/a11y_page.html.ts      |  1 +
+ chrome/browser/ui/BUILD.gn                    |  1 +
+ chrome/browser/ui/accelerator_table.cc        |  4 ++-
+ .../ui/webui_browser/webui_browser_window.cc  |  3 ++-
+ .../ui/webui_browser/webui_browser_window.h   |  2 ++
+ .../webui_browser/webui_browser_window_mac.mm | 25 +++++++++++++++++++
+ 6 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+index 268321d753..177d688b1c 100644
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+@@ -63,6 +63,7 @@ export function getHtml(this: SettingsA11yPageElement) {
+         label="$i18n{focusHighlightLabel}">
+     </settings-toggle-button>
+     <settings-toggle-button class="hr"
++        <if expr="pp_if('is_safarium_branded')">hidden</if>
+         pref-key="settings.a11y.caretbrowsing.enabled"
+         @change="${this.onA11yCaretBrowsingChange_}"
+         label="$i18n{caretBrowsingTitle}"
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 12b7437780..b06d9d99fd 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1058,6 +1058,7 @@ source_set("accelerator_table") {
+   public_deps = [ "//ui/actions:actions_headers" ]
+   deps = [
+     "//build:branding_buildflags",
++    "//build:safarium_buildflags",
+     "//chrome/app:command_ids",
+     "//chrome/browser/ui/actions:command_id_to_action_id",
+     "//printing/buildflags",
+diff --git a/chrome/browser/ui/accelerator_table.cc b/chrome/browser/ui/accelerator_table.cc
+index bac5cc57cf..bf97cc5ea4 100644
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -15,6 +15,7 @@
+ #include "base/notreached.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "build/safarium_buildflags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/actions/command_id_to_action_id.h"
+ #include "printing/buildflags/buildflags.h"
+@@ -47,7 +48,8 @@ constexpr AcceleratorMapping kAcceleratorMap[] = {
+ //      item with the appropriate modifier.
+ //   2) Update GetShortcutsNotPresentInMainMenu() in
+ //      global_keyboard_shortcuts_mac.mm.
+-#if !BUILDFLAG(IS_CHROMEOS)
++// Safarium: no caret browsing (F7); Safari has none either.
++#if !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(SAFARIUM_BRANDING)
+     {ui::VKEY_F7, ui::EF_NONE, IDC_CARET_BROWSING_TOGGLE},
+ #endif
+     {ui::VKEY_ESCAPE, ui::EF_NONE, IDC_CLOSE_FIND_OR_STOP},
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index f9339ab86a..1bfaa246d3 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -537,12 +537,13 @@ bool WebUIBrowserWindow::IsActive() const {
+   return widget_->IsActive();
+ }
+ 
++#if !BUILDFLAG(IS_MAC)
+ void WebUIBrowserWindow::FlashFrame(bool flash) {
+-  // Bounces the Dock icon when a background tab needs attention.
+   if (widget_) {
+     widget_->FlashFrame(flash);
+   }
+ }
++#endif  // !BUILDFLAG(IS_MAC)
+ 
+ ui::ZOrderLevel WebUIBrowserWindow::GetZOrderLevel() const {
+   return widget_ ? widget_->GetZOrderLevel() : ui::ZOrderLevel::kNormal;
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 1a3e630688..cf5ed26075 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -329,6 +329,8 @@ class WebUIBrowserWindow : public BrowserWindow,
+   // Anchors for Chrome's autofill bubbles (save address / card), which Safarium
+   // points at its address field. The handler is destroyed first.
+   std::unique_ptr<safarium::BubbleAnchors> safarium_bubble_anchors_;
++  // Pending Dock attention request (FlashFrame, macOS), 0 if none.
++  long safarium_attention_request_ = 0;
+   std::unique_ptr<autofill::AutofillBubbleHandler> autofill_bubble_handler_;
+ 
+   // A mapping between accelerators and Chrome command IDs as defined in
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index 8aa0103aee..ad0878fabd 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -17,6 +17,7 @@
+ #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
+ #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
+ #include "chrome/browser/ui/webui_browser/safarium_features.h"
++#include "chrome/browser/ui/webui_browser/safarium_session_restore.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "components/prefs/pref_service.h"
+@@ -60,6 +61,21 @@ bool ShouldHandleKeyboardEvent(const input::NativeWebKeyboardEvent& event) {
+ 
+ }  // namespace
+ 
++void WebUIBrowserWindow::FlashFrame(bool flash) {
++  // "Draw attention" (an extension's windows.update drawAttention): bounce
++  // the Dock icon until Safarium is activated, like a window flashing until
++  // it gets focus. Views' NativeWidgetMac::FlashFrame is a stub, so ask
++  // AppKit directly.
++  if (safarium_attention_request_) {
++    [NSApp cancelUserAttentionRequest:safarium_attention_request_];
++    safarium_attention_request_ = 0;
++  }
++  if (flash && !NSApp.active) {
++    safarium_attention_request_ =
++        [NSApp requestUserAttention:NSCriticalRequest];
++  }
++}
++
+ bool WebUIBrowserWindow::HandleKeyboardEvent(
+     const input::NativeWebKeyboardEvent& event) {
+   if (!ShouldHandleKeyboardEvent(event)) {
+@@ -95,6 +111,9 @@ void ValidateUserInterfaceItem(
+     // This allows menu items like "Close Tabs" to be enabled when the browser
+     // has open tabs, which in turn enables the "Close Tabs" keyboard shortcut.
+     result->enable = chrome::IsCommandEnabled(browser_, command);
++    if (command == IDC_SAFARIUM_REOPEN_LAST_SESSION) {
++      result->enable = safarium::CanReopenLastSession(browser_);
++    }
+     // Checkmark for View > Always Show Toolbar in Full Screen (Safarium's
+     // native toolbar follows the same pref).
+     if (command == IDC_TOGGLE_FULLSCREEN_TOOLBAR) {
+@@ -165,6 +184,12 @@ bool ExecuteCommand(int32_t command,
+       return false;
+     }
+ 
++    // Safarium's own History > Reopen All Windows from Last Session.
++    if (command == IDC_SAFARIUM_REOPEN_LAST_SESSION) {
++      safarium::ReopenLastSession(browser_);
++      return true;
++    }
++
+     // Actually Execute the specific command with |browser_|.
+     // This facilitates commands initiated from keyboard shortcuts.
+     chrome::ExecuteCommandWithDisposition(browser_, command,
+-- 
+2.54.0 (Apple Git-157)
+

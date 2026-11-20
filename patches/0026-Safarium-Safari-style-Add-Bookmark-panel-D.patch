@@ -1,0 +1,497 @@
+From 03fa7444e587cb069d0d536fc08e6a784e7b0b76 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:50:18 -0500
+Subject: [PATCH 26/26] =?UTF-8?q?Safarium:=20Safari-style=20Add=20Bookmark?=
+ =?UTF-8?q?=20panel=20(=E2=8C=98D)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+⌘D (and Bookmarks > Bookmark This Tab) now opens a native popover from
+the address field, or to the right of the current tab's row in the
+vertical sidebar: "Add this page to: [folder]", the title, Cancel / Add.
+The folder menu lists every bookmark folder, indented, with the
+bookmarks-bar folder first.
+
+Chrome adds the bookmark before asking the window to show its bubble,
+so the panel keeps it only on Add (applying the title and folder);
+Cancel, Escape or a click elsewhere removes it again. For a page that is
+already bookmarked the panel edits that bookmark ("This page is in:",
+Remove Bookmark / Done). ⌘D while the panel is open keeps it. Chrome's
+bubble remains the fallback where the panel has no anchor (page full
+screen).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/webui_browser/BUILD.gn      |   2 +
+ .../webui_browser/safarium_bookmark_panel.h   |  32 +++
+ .../safarium_bookmark_panel_mac.mm            | 263 ++++++++++++++++++
+ .../ui/webui_browser/safarium_root_view.cc    |   6 +
+ .../ui/webui_browser/safarium_root_view.h     |   2 +
+ .../safarium_tab_bar_controller.cc            |   4 +
+ .../safarium_tab_bar_controller.h             |   3 +
+ .../safarium_tab_bar_host_mac.mm              |  28 ++
+ .../ui/webui_browser/webui_browser_window.cc  |   6 +
+ 9 files changed, 346 insertions(+)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_bookmark_panel.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_bookmark_panel_mac.mm
+
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index c2eb2994f7..bec1fdcc44 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -110,6 +110,8 @@ source_set("impl") {
+   deps = []
+   if (is_mac) {
+     sources += [
++      "safarium_bookmark_panel.h",
++      "safarium_bookmark_panel_mac.mm",
+       "safarium_bubble_anchors.cc",
+       "safarium_bubble_anchors.h",
+       "safarium_downloads_popover.h",
+diff --git a/chrome/browser/ui/webui_browser/safarium_bookmark_panel.h b/chrome/browser/ui/webui_browser/safarium_bookmark_panel.h
+new file mode 100644
+index 0000000000..5fdcc4fed5
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_bookmark_panel.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Safarium: Safari-style Add Bookmark panel (⌘D). Chrome has already added
++// the bookmark when the panel opens (chrome::BookmarkCurrentTab); the panel
++// keeps it only when the user presses Add, after applying the chosen title
++// and folder. Cancel, Escape or clicking elsewhere takes it out again. For a
++// page that was already bookmarked the panel edits that bookmark instead.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_BOOKMARK_PANEL_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_BOOKMARK_PANEL_H_
++
++#import <AppKit/AppKit.h>
++
++class GURL;
++class Profile;
++
++namespace safarium {
++
++// Shows the panel next to `anchor` (the address field, or the current tab's
++// row in the vertical sidebar) on `edge`. Returns false if there is no
++// bookmark for `url` to show.
++bool ShowBookmarkPanel(NSView* anchor,
++                       NSRectEdge edge,
++                       Profile* profile,
++                       const GURL& url,
++                       bool already_bookmarked);
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_BOOKMARK_PANEL_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_bookmark_panel_mac.mm b/chrome/browser/ui/webui_browser/safarium_bookmark_panel_mac.mm
+new file mode 100644
+index 0000000000..d965557511
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_bookmark_panel_mac.mm
+@@ -0,0 +1,263 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "chrome/browser/ui/webui_browser/safarium_bookmark_panel.h"
++
++#include <string>
++
++#include "base/location.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/sys_string_conversions.h"
++#include "chrome/browser/bookmarks/bookmark_model_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/bookmarks/browser/bookmark_model.h"
++#include "components/bookmarks/browser/bookmark_node.h"
++#include "components/bookmarks/browser/bookmark_utils.h"
++#include "components/bookmarks/common/bookmark_metrics.h"
++#include "url/gurl.h"
++
++using bookmarks::BookmarkModel;
++using bookmarks::BookmarkNode;
++
++namespace {
++
++constexpr CGFloat kPanelWidth = 320;
++constexpr CGFloat kInset = 16;
++
++NSImage* FolderSymbol(NSString* name) {
++  return [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
++}
++
++}  // namespace
++
++// Owns the popover's content and decides what happens to the bookmark when
++// the popover closes.
++@interface SafariumBookmarkPanel : NSViewController <NSPopoverDelegate>
++- (instancetype)initWithModel:(BookmarkModel*)model
++                         node:(const BookmarkNode*)node
++            alreadyBookmarked:(BOOL)alreadyBookmarked;
++- (void)showRelativeToView:(NSView*)anchor edge:(NSRectEdge)edge;
++- (BOOL)isOpen;
++@end
++
++namespace {
++// The open panel, if any (one at a time, like Safari's).
++__weak SafariumBookmarkPanel* g_open_panel = nil;
++}  // namespace
++
++@implementation SafariumBookmarkPanel {
++  base::WeakPtr<BookmarkModel> _model;
++  int64_t _nodeId;
++  BOOL _alreadyBookmarked;
++  BOOL _decided;  // Add/Done/Remove was pressed.
++  NSPopover* _popover;
++  NSPopUpButton* _folders;
++  NSTextField* _title;
++}
++
++- (instancetype)initWithModel:(BookmarkModel*)model
++                         node:(const BookmarkNode*)node
++            alreadyBookmarked:(BOOL)alreadyBookmarked {
++  if ((self = [super initWithNibName:nil bundle:nil])) {
++    _model = model->AsWeakPtr();
++    _nodeId = node->id();
++    _alreadyBookmarked = alreadyBookmarked;
++  }
++  return self;
++}
++
++- (const BookmarkNode*)node {
++  return _model ? bookmarks::GetBookmarkNodeByID(_model.get(), _nodeId)
++                : nullptr;
++}
++
++// Every folder the bookmark can go in, permanent folders first, children
++// indented under their parents (as in Safari's "Add this page to" menu).
++- (void)addFolder:(const BookmarkNode*)folder
++           symbol:(NSString*)symbol
++           indent:(NSInteger)indent {
++  NSMenuItem* item = [[NSMenuItem alloc]
++      initWithTitle:base::SysUTF16ToNSString(folder->GetTitle())
++             action:nil
++      keyEquivalent:@""];
++  item.image = FolderSymbol(symbol);
++  if (@available(macOS 27.0, *)) {
++    item.preferredImageVisibility = NSMenuItemImageVisibilityVisible;
++  }
++  item.indentationLevel = indent;
++  item.tag = static_cast<NSInteger>(folder->id());
++  [_folders.menu addItem:item];
++  for (const auto& child : folder->children()) {
++    if (child->is_folder()) {
++      [self addFolder:child.get() symbol:@"folder" indent:indent + 1];
++    }
++  }
++}
++
++- (void)loadView {
++  const BookmarkNode* node = [self node];
++  BookmarkModel* model = _model.get();
++
++  NSTextField* header = [NSTextField
++      labelWithString:_alreadyBookmarked ? @"This page is in:"
++                                         : @"Add this page to:"];
++  _folders = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
++  _folders.menu.autoenablesItems = NO;
++  [self addFolder:model->bookmark_bar_node() symbol:@"star" indent:0];
++  [_folders.menu addItem:NSMenuItem.separatorItem];
++  [self addFolder:model->other_node() symbol:@"book" indent:0];
++  if (model->mobile_node()->IsVisible()) {
++    [self addFolder:model->mobile_node() symbol:@"iphone" indent:0];
++  }
++  [_folders selectItemWithTag:static_cast<NSInteger>(node->parent()->id())];
++  [_folders setContentHuggingPriority:NSLayoutPriorityDefaultLow
++                       forOrientation:NSLayoutConstraintOrientationHorizontal];
++  NSStackView* top = [NSStackView stackViewWithViews:@[ header, _folders ]];
++  top.spacing = 8;
++
++  _title = [NSTextField
++      textFieldWithString:base::SysUTF16ToNSString(node->GetTitle())];
++  _title.placeholderString = @"Title";
++  _title.lineBreakMode = NSLineBreakByTruncatingTail;
++  _title.cell.scrollable = YES;
++
++  NSView* spacer = [[NSView alloc] initWithFrame:NSZeroRect];
++  [spacer setContentHuggingPriority:1
++                     forOrientation:NSLayoutConstraintOrientationHorizontal];
++  NSMutableArray<NSView*>* buttons = [NSMutableArray array];
++  if (_alreadyBookmarked) {
++    [buttons addObject:[NSButton buttonWithTitle:@"Remove Bookmark"
++                                          target:self
++                                          action:@selector(remove:)]];
++  }
++  [buttons addObject:spacer];
++  if (!_alreadyBookmarked) {
++    NSButton* cancel = [NSButton buttonWithTitle:@"Cancel"
++                                          target:self
++                                          action:@selector(cancel:)];
++    cancel.keyEquivalent = @"\e";
++    [buttons addObject:cancel];
++  }
++  NSButton* confirm =
++      [NSButton buttonWithTitle:_alreadyBookmarked ? @"Done" : @"Add"
++                         target:self
++                         action:@selector(confirm:)];
++  confirm.keyEquivalent = @"\r";
++  [buttons addObject:confirm];
++  NSStackView* buttonRow = [NSStackView stackViewWithViews:buttons];
++  buttonRow.spacing = 8;
++
++  NSStackView* stack =
++      [NSStackView stackViewWithViews:@[ top, _title, buttonRow ]];
++  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
++  stack.alignment = NSLayoutAttributeLeading;
++  stack.spacing = 10;
++  stack.edgeInsets = NSEdgeInsetsMake(kInset, kInset, kInset, kInset);
++  [stack.widthAnchor constraintEqualToConstant:kPanelWidth].active = YES;
++  for (NSView* row in @[ top, _title, buttonRow ]) {
++    [row.widthAnchor constraintEqualToAnchor:stack.widthAnchor
++                                    constant:-2 * kInset]
++        .active = YES;
++  }
++  self.view = stack;
++  self.preferredContentSize = stack.fittingSize;
++}
++
++- (void)showRelativeToView:(NSView*)anchor edge:(NSRectEdge)edge {
++  _popover = [[NSPopover alloc] init];
++  _popover.contentViewController = self;
++  _popover.behavior = NSPopoverBehaviorTransient;
++  _popover.animates = YES;
++  _popover.delegate = self;
++  [_popover showRelativeToRect:anchor.bounds ofView:anchor preferredEdge:edge];
++  g_open_panel = self;
++  [self.view.window makeFirstResponder:_title];
++  [_title selectText:nil];
++}
++
++// Add (new bookmark) / Done (existing one): keep it with the chosen title
++// and folder.
++- (void)confirm:(id)sender {
++  _decided = YES;
++  const BookmarkNode* node = [self node];
++  BookmarkModel* model = _model.get();
++  if (node && model) {
++    const std::u16string title = base::SysNSStringToUTF16(_title.stringValue);
++    if (!title.empty() && title != node->GetTitle()) {
++      model->SetTitle(node, title, bookmarks::metrics::BookmarkEditSource::kUser);
++    }
++    const BookmarkNode* folder = bookmarks::GetBookmarkNodeByID(
++        model, _folders.selectedItem.tag);
++    if (folder && folder->is_folder() && folder != node->parent()) {
++      model->Move(node, folder, folder->children().size());
++    }
++  }
++  [_popover close];
++}
++
++- (void)cancel:(id)sender {
++  [_popover close];  // -popoverDidClose: takes the new bookmark out.
++}
++
++- (void)remove:(id)sender {
++  _decided = YES;
++  const BookmarkNode* node = [self node];
++  if (node && _model) {
++    bookmarks::RemoveAllBookmarks(_model.get(), node->url(), FROM_HERE);
++  }
++  [_popover close];
++}
++
++// NSPopoverDelegate. Closing without Add (Cancel, Escape, a click elsewhere,
++// the window closing) leaves no new bookmark behind, as in Safari. An
++// existing bookmark is left as it was.
++- (void)popoverDidClose:(NSNotification*)notification {
++  if (!_decided && !_alreadyBookmarked) {
++    _decided = YES;
++    const BookmarkNode* node = [self node];
++    if (node && _model) {
++      _model->Remove(node, bookmarks::metrics::BookmarkEditSource::kUser,
++                     FROM_HERE);
++    }
++  }
++  _popover.contentViewController = nil;
++  _popover = nil;
++}
++
++- (BOOL)isOpen {
++  return _popover.shown;
++}
++
++@end
++
++namespace safarium {
++
++bool ShowBookmarkPanel(NSView* anchor,
++                       NSRectEdge edge,
++                       Profile* profile,
++                       const GURL& url,
++                       bool already_bookmarked) {
++  if (!anchor.window || anchor.hiddenOrHasHiddenAncestor || !profile) {
++    return false;
++  }
++  BookmarkModel* model = BookmarkModelFactory::GetForBrowserContext(profile);
++  const BookmarkNode* node =
++      model ? model->GetMostRecentlyAddedUserNodeForURL(url) : nullptr;
++  if (!node) {
++    return false;
++  }
++  // ⌘D again while the panel is open: keep the open panel (Chrome has not
++  // added anything new, the page is already bookmarked).
++  if (SafariumBookmarkPanel* open = g_open_panel; open && [open isOpen]) {
++    return true;
++  }
++  SafariumBookmarkPanel* panel =
++      [[SafariumBookmarkPanel alloc] initWithModel:model
++                                              node:node
++                                 alreadyBookmarked:already_bookmarked];
++  [panel showRelativeToView:anchor edge:edge];
++  return true;
++}
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.cc b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+index 47ab9d550b..5120215b41 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.cc
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+@@ -307,6 +307,12 @@ void SafariumRootView::Layout(PassKey) {
+   bar_view_->UpdateViewport();
+ }
+ 
++bool SafariumRootView::ShowBookmarkPanel(const GURL& url,
++                                         bool already_bookmarked) {
++  return bar_view_ && !content_fullscreen_ &&
++         bar_view_->ShowBookmarkPanel(url, already_bookmarked);
++}
++
+ void SafariumRootView::FocusAddressField() {
+   if (bar_view_) {
+     bar_view_->FocusAddressField();
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.h b/chrome/browser/ui/webui_browser/safarium_root_view.h
+index 43f424fa0e..85fd8e9f48 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.h
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.h
+@@ -110,6 +110,8 @@ class SafariumRootView : public views::View,
+ 
+   void SetActiveContents(content::WebContents* contents);
+   void FocusAddressField();
++  // See TabBarView::ShowBookmarkPanel().
++  bool ShowBookmarkPanel(const GURL& url, bool already_bookmarked);
+   // A page element (e.g. a video) is full screen: only the page shows (no
+   // toolbar, sidebar or side panel) until it leaves.
+   void SetContentFullscreen(bool fullscreen);
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index 172e356941..eedd01cb0c 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -230,6 +230,10 @@ TabBarController::TabBarController(
+ 
+ TabBarController::~TabBarController() = default;
+ 
++bool TabBarView::ShowBookmarkPanel(const GURL& url, bool already_bookmarked) {
++  return false;
++}
++
+ void TabBarController::SetView(TabBarView* view) {
+   view_ = view;
+   PushState();
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index 077ac5b092..4f0bdeb476 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -80,6 +80,9 @@ class TabBarView {
+   // A page element (e.g. a video) is full screen: the page takes the whole
+   // screen and the toolbar steps aside until it leaves.
+   virtual void SetContentFullscreen(bool fullscreen) {}
++  // ⌘D: Safari-style Add Bookmark panel from the address field (the current
++  // tab's row in the vertical sidebar). False if it can't be shown there.
++  virtual bool ShowBookmarkPanel(const GURL& url, bool already_bookmarked);
+   // Tab overview thumbnails (only while SetWantsThumbnails(true)).
+   virtual void ThumbnailChanged(int64_t tab_id, const gfx::ImageSkia& image) {}
+   // Hover card for `tab_id` (see TabBarController::SetHoverCardTab).
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 859e1ee241..0f42309efd 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/extensions/extension_context_menu_model.h"
+ #include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
++#import "chrome/browser/ui/webui_browser/safarium_bookmark_panel.h"
+ #import "chrome/browser/ui/webui_browser/safarium_downloads_popover.h"
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+@@ -268,6 +269,9 @@ - (void)setVertical:(BOOL)vertical;
+ - (void)setController:(safarium::TabBarController*)controller;
+ - (void)updateState:(const safarium::BarState&)state;
+ - (void)focusAddressField;
++// ⌘D panel (see safarium_bookmark_panel.h).
++- (BOOL)showBookmarkPanelForURL:(const GURL&)url
++              alreadyBookmarked:(BOOL)alreadyBookmarked;
+ - (void)addressFieldEditingChanged;
+ - (void)addressFieldTextChanged;
+ // Press / drag / release on a tab. `cell` is the SafariumTabCell, or nil
+@@ -2450,6 +2454,25 @@ - (void)addressFieldTextChanged {
+   return gfx::ScreenRectFromNSRect([window convertRectToScreen:bounds]);
+ }
+ 
++- (BOOL)showBookmarkPanelForURL:(const GURL&)url
++              alreadyBookmarked:(BOOL)alreadyBookmarked {
++  if (!_controller) {
++    return NO;
++  }
++  [self layoutSubtreeIfNeeded];
++  // The current tab's pill is the address field; in the sidebar the panel
++  // opens to the right of that row (where address suggestions appear).
++  NSView* anchor = _activeCell;
++  if (!anchor.window || anchor.hiddenOrHasHiddenAncestor) {
++    anchor = _addressField;
++  }
++  const NSRectEdge edge =
++      _vertical ? NSRectEdgeMaxX
++                : (anchor.isFlipped ? NSRectEdgeMaxY : NSRectEdgeMinY);
++  return safarium::ShowBookmarkPanel(anchor, edge, _controller->GetProfile(),
++                                     url, alreadyBookmarked);
++}
++
+ - (void)focusAddressField {
+   // Defer so pending tab-strip updates (which may end editing on a tab
+   // switch) are applied first.
+@@ -6760,6 +6783,11 @@ void UpdateState(const BarState& state) override {
+ 
+   void FocusAddressField() override { [tab_view_ focusAddressField]; }
+ 
++  bool ShowBookmarkPanel(const GURL& url, bool already_bookmarked) override {
++    return [tab_view_ showBookmarkPanelForURL:url
++                            alreadyBookmarked:already_bookmarked];
++  }
++
+   void SetVerticalSidebar(gfx::NativeView sidebar) override {
+     [toolbar_ setVerticalSidebar:static_cast<SafariumSidebarView*>(
+                                      sidebar.GetNativeNSView())];
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 1bfaa246d3..cdb691183c 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -1196,6 +1196,12 @@ void WebUIBrowserWindow::ShowIntentPickerBubble(
+ 
+ void WebUIBrowserWindow::ShowBookmarkBubble(const GURL& url,
+                                             bool already_bookmarked) {
++  // Safarium: Safari's Add Bookmark panel; Chrome's bubble only where the
++  // panel has no place (e.g. page full screen).
++  if (safarium_root_ &&
++      safarium_root_->ShowBookmarkPanel(url, already_bookmarked)) {
++    return;
++  }
+   if (!safarium_bubble_anchors_) {
+     NOTIMPLEMENTED_LOG_ONCE();
+     return;
+-- 
+2.54.0 (Apple Git-157)
+

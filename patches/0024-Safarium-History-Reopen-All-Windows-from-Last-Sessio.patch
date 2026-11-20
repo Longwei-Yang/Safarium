@@ -1,0 +1,189 @@
+From 605ad5f58cd502c3fdd413db610b70944952e0d2 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:37:31 -0500
+Subject: [PATCH 24/26] Safarium: History > Reopen All Windows from Last
+ Session
+
+Safarium shows no "Restore pages?" prompt after a crash (Chrome anchors
+it to its app menu). Instead, as in Safari, History > Reopen All Windows
+from Last Session restores the previous run's windows
+(SessionRestore::RestoreSessionAfterCrash; a lone New Tab page is
+replaced). It is available once per run, after a crash or a normal quit,
+unless startup already reopened the last session. Before this there was
+no way back to the tabs after a crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/app/chrome_command_ids.h               |  2 +
+ chrome/app/generated_resources.grd            |  3 ++
+ .../browser/ui/cocoa/history_menu_bridge.mm   |  1 +
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |  3 ++
+ chrome/browser/ui/webui_browser/BUILD.gn      |  2 +
+ .../webui_browser/safarium_session_restore.cc | 54 +++++++++++++++++++
+ .../webui_browser/safarium_session_restore.h  | 20 +++++++
+ 7 files changed, 85 insertions(+)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_session_restore.cc
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_session_restore.h
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index a51ef6d687..0d18213ffa 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -54,6 +54,8 @@
+ #define IDC_SELECT_LAST_TAB             34026
+ #define IDC_DUPLICATE_TAB               34027
+ #define IDC_RESTORE_TAB                 34028
++// Safarium: History > Reopen All Windows from Last Session.
++#define IDC_SAFARIUM_REOPEN_LAST_SESSION 34068
+ #define IDC_SHOW_AS_TAB                 34029
+ #define IDC_FULLSCREEN                  34030
+ #define IDC_EXIT                        34031
+diff --git a/chrome/app/generated_resources.grd b/chrome/app/generated_resources.grd
+index f703674d0f..467f0c5da6 100644
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -15017,6 +15017,9 @@ Please help our engineers fix this problem. Tell us what happened right before y
+           Task Manager
+         </message>
+         <!-- History menu -->
++        <message name="IDS_SAFARIUM_REOPEN_LAST_SESSION_MAC" desc="In Title Case: Safarium's History menu item that reopens the windows of the previous run (Safari's command)." translateable="false">
++          Reopen All Windows from Last Session
++        </message>
+         <message name="IDS_HISTORY_HOME_MAC" desc="In Title Case: The Mac menu item for home in the history menu." meaning="'home' as in an internet location, a 'home page'">
+           Home
+         </message>
+diff --git a/chrome/browser/ui/cocoa/history_menu_bridge.mm b/chrome/browser/ui/cocoa/history_menu_bridge.mm
+index 5e4555fc42..5f0d3ac788 100644
+--- a/chrome/browser/ui/cocoa/history_menu_bridge.mm
++++ b/chrome/browser/ui/cocoa/history_menu_bridge.mm
+@@ -774,6 +774,7 @@
+     case kVisitedTitle:
+     case kShowFullSeparator:
+     case IDC_SHOW_HISTORY:
++    case IDC_SAFARIUM_REOPEN_LAST_SESSION:  // Safarium.
+       return !profile_->IsOffTheRecord();
+   }
+ 
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index e065fcf62b..c61a2ffe74 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -394,6 +394,9 @@
+                   .command_id(IDC_BACK),
+               Item(IDS_HISTORY_FORWARD_MAC)
+                   .command_id(IDC_FORWARD),
++              Item(IDS_SAFARIUM_REOPEN_LAST_SESSION_MAC)
++                  .command_id(IDC_SAFARIUM_REOPEN_LAST_SESSION)
++                  .remove_if(is_pwa || !kSafarium),
+               Item().is_separator()
+                   .tag(HistoryMenuBridge::kRecentlyClosedSeparator)
+                   .remove_if(is_pwa),
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index 9e00414a5d..c2eb2994f7 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -32,6 +32,7 @@ source_set("webui_browser") {
+   sources = [
+     "browser_elements_webui_browser.h",
+     "find_bar_owner_webui_browser.h",
++    "safarium_session_restore.h",
+     "safarium_settings_window.h",
+     "webui_browser_exclusive_access_context.h",
+     "webui_browser_side_panel_ui.h",
+@@ -101,6 +102,7 @@ source_set("impl") {
+   sources += [
+     "safarium_features.cc",
+     "safarium_features.h",
++    "safarium_session_restore.cc",
+     "safarium_tab_bar_controller.cc",
+     "safarium_tab_bar_controller.h",
+   ]
+diff --git a/chrome/browser/ui/webui_browser/safarium_session_restore.cc b/chrome/browser/ui/webui_browser/safarium_session_restore.cc
+new file mode 100644
+index 0000000000..e97da5e670
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_session_restore.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/safarium_session_restore.h"
++
++#include <set>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/prefs/session_startup_pref.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/exit_type_service.h"
++#include "chrome/browser/sessions/session_restore.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++
++namespace safarium {
++
++namespace {
++
++// Profiles whose last session was reopened this run.
++std::set<const Profile*>& Reopened() {
++  static base::NoDestructor<std::set<const Profile*>> reopened;
++  return *reopened;
++}
++
++}  // namespace
++
++bool CanReopenLastSession(BrowserWindowInterface* browser) {
++  if (!browser) {
++    return false;
++  }
++  Profile* profile = browser->GetProfile();
++  if (profile->IsOffTheRecord() || Reopened().contains(profile)) {
++    return false;
++  }
++  // Startup already reopened the last session ("Safarium opens with: All
++  // tabs from the last session"), unless the last run crashed, in which case
++  // startup opened a new tab instead.
++  const bool crashed =
++      ExitTypeService::GetLastSessionExitType(profile) == ExitType::kCrashed;
++  return crashed ||
++         !SessionStartupPref::GetStartupPref(profile).ShouldRestoreLastSession();
++}
++
++void ReopenLastSession(BrowserWindowInterface* browser) {
++  if (!CanReopenLastSession(browser)) {
++    return;
++  }
++  Reopened().insert(browser->GetProfile());
++  // Restores the previous run's windows; a lone New Tab page is replaced.
++  SessionRestore::RestoreSessionAfterCrash(browser);
++}
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_session_restore.h b/chrome/browser/ui/webui_browser/safarium_session_restore.h
+new file mode 100644
+index 0000000000..291b896ec2
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_session_restore.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_SESSION_RESTORE_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_SESSION_RESTORE_H_
++
++class BrowserWindowInterface;
++
++namespace safarium {
++
++// History > Reopen All Windows from Last Session (Safari's command; Safarium
++// shows no "Restore pages?" prompt after a crash). Available once per run,
++// unless startup already reopened the last session.
++bool CanReopenLastSession(BrowserWindowInterface* browser);
++void ReopenLastSession(BrowserWindowInterface* browser);
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_SESSION_RESTORE_H_
+-- 
+2.54.0 (Apple Git-157)
+
