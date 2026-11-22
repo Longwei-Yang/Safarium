@@ -1,0 +1,909 @@
+From c2a2f8ab898b6e138ba258a3b1145634b012649f Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:47:25 -0500
+Subject: [PATCH 29/35] =?UTF-8?q?Safarium:=20update=20from=20GitHub=20rele?=
+ =?UTF-8?q?ases=20(Check=20for=20Updates=E2=80=A6)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Safarium > Check for Updates… reads the latest GitHub release
+(v<version>-fix<N>) and compares it with SafariumBuild, which the
+packaging script now stamps into Info.plist along with SafariumTag and
+SafariumCommit. A newer release shows its notes with Install Update /
+Remind Me Later / Skip This Version. Installing downloads the DMG with a
+progress panel, checks the SHA-256 GitHub publishes for it, mounts it and
+stages the app, then checks the staged app's bundle id, tag and code
+signature. Safarium quits normally; a detached script waits for it to
+exit, swaps the app in place (keeping the old one until the copy
+succeeded) and relaunches it with --restore-last-session and this run's
+own switches.
+
+Packaged builds also check once a day (first a minute after launch) and
+stay quiet unless a release the user hasn't skipped is out. Holding
+Option turns the item into Install Local Build…, which installs the
+newest *-local-*.dmg from ~/chromium/dist for builds that aren't
+released. Test overrides: defaults SafariumUpdateFeedURL and
+SafariumLocalUpdateDirectory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/app/generated_resources.grd            |   6 +
+ chrome/browser/app_controller_mac.mm          |  18 +
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |  11 +
+ chrome/browser/ui/webui_browser/BUILD.gn      |   3 +
+ .../ui/webui_browser/safarium_updater.h       |  32 +
+ .../ui/webui_browser/safarium_updater_mac.mm  | 712 ++++++++++++++++++
+ 6 files changed, 782 insertions(+)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_updater.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_updater_mac.mm
+
+diff --git a/chrome/app/generated_resources.grd b/chrome/app/generated_resources.grd
+index 467f0c5da6..8bd0a69f63 100644
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -15017,6 +15017,12 @@ Please help our engineers fix this problem. Tell us what happened right before y
+           Task Manager
+         </message>
+         <!-- History menu -->
++        <message name="IDS_SAFARIUM_CHECK_FOR_UPDATES_MAC" desc="In Title Case: Safarium's app menu item that checks GitHub for a newer release." translateable="false">
++          Check for Updates...
++        </message>
++        <message name="IDS_SAFARIUM_INSTALL_LOCAL_BUILD_MAC" desc="In Title Case: Safarium's app menu alternate (Option key) that installs a locally packaged build." translateable="false">
++          Install Local Build...
++        </message>
+         <message name="IDS_SAFARIUM_REOPEN_LAST_SESSION_MAC" desc="In Title Case: Safarium's History menu item that reopens the windows of the previous run (Safari's command)." translateable="false">
+           Reopen All Windows from Last Session
+         </message>
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 39e2c66724..f0fe82f02c 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -111,6 +111,7 @@
+ #include "chrome/browser/ui/views/color_provider_browser_helper.h"
+ #include "chrome/browser/ui/webui_browser/safarium_features.h"
+ #include "chrome/browser/ui/webui_browser/safarium_settings_window.h"
++#include "chrome/browser/ui/webui_browser/safarium_updater.h"
+ #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "chrome/common/channel_info.h"
+@@ -1305,6 +1306,11 @@ - (void)applicationDidFinishLaunching:(NSNotification*)notify {
+ 
+   [self setUpdateCheckInterval];
+ 
++  // Safarium: daily check for a newer GitHub release (packaged builds).
++  if (safarium::IsNativeUIEnabled()) {
++    safarium::StartAutomaticUpdateChecks();
++  }
++
+   // If enabled, keep Chrome alive when apps are open instead of quitting all
+   // apps.
+   _quitWithAppsController = new QuitWithAppsController();
+@@ -1667,6 +1673,9 @@ - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
+     enable = canOpenNewBrowser;
+   } else if (action == @selector(orderFrontStandardAboutPanel:)) {
+     enable = canOpenNewBrowser;
++  } else if (action == @selector(checkForSafariumUpdates:) ||
++             action == @selector(installSafariumLocalBuild:)) {
++    enable = YES;
+   } else if (action == @selector(toggleConfirmToQuit:)) {
+     [self updateConfirmToQuitPrefMenuItem:static_cast<NSMenuItem*>(item)];
+     enable = [self shouldEnableConfirmToQuitPrefMenuItem];
+@@ -2118,6 +2127,15 @@ - (IBAction)showPreferencesForProfile:(Profile*)profile {
+   }
+ }
+ 
++// Safarium > Check for Updates… / Install Local Build… (Option key).
++- (IBAction)checkForSafariumUpdates:(id)sender {
++  safarium::CheckForUpdates();
++}
++
++- (IBAction)installSafariumLocalBuild:(id)sender {
++  safarium::InstallLocalBuild();
++}
++
+ - (IBAction)orderFrontStandardAboutPanel:(id)sender {
+   // Asynchronously load profile first if needed.
+   app_controller_mac::RunInLastProfileSafely(
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index c61a2ffe74..936f3d4300 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -57,6 +57,17 @@
+                   .tag(IDC_ABOUT)
+                   .target(app_delegate)
+                   .action(@selector(orderFrontStandardAboutPanel:)),
++              // Safarium: its own updater (safarium_updater.h).
++              Item(IDS_SAFARIUM_CHECK_FOR_UPDATES_MAC)
++                  .target(app_delegate)
++                  .action(@selector(checkForSafariumUpdates:))
++                  .remove_if(is_pwa || !BUILDFLAG(SAFARIUM_BRANDING)),
++              Item(IDS_SAFARIUM_INSTALL_LOCAL_BUILD_MAC)
++                  .target(app_delegate)
++                  .action(@selector(installSafariumLocalBuild:))
++                  .is_alternate()
++                  .key_equivalent(@"", NSEventModifierFlagOption)
++                  .remove_if(is_pwa || !BUILDFLAG(SAFARIUM_BRANDING)),
+               Item().is_separator(),
+               Item(IDS_PREFERENCES)
+                   .tag(IDC_OPTIONS)
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index bec1fdcc44..43d02d059b 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -121,6 +121,8 @@ source_set("impl") {
+       "safarium_settings_window_mac.mm",
+       "safarium_side_panel_header_mac.mm",
+       "safarium_tab_bar_host_mac.mm",
++      "safarium_updater.h",
++      "safarium_updater_mac.mm",
+       "safarium_video_fullscreen.h",
+       "safarium_video_fullscreen_mac.mm",
+       "webui_browser_window_mac.mm",
+@@ -131,6 +133,7 @@ source_set("impl") {
+       "//components/download/public/common:public",
+       "//components/history/core/common",
+       "//components/prefs",
++      "//crypto",
+       "//ui/menus",
+     ]
+   }
+diff --git a/chrome/browser/ui/webui_browser/safarium_updater.h b/chrome/browser/ui/webui_browser/safarium_updater.h
+new file mode 100644
+index 0000000000..a2250bebc0
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_updater.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Safarium: updates the app from its GitHub releases. A release is tagged
++// v<Chromium version>-fix<N>; the packaging script stamps the app's
++// Info.plist with SafariumBuild (N), SafariumTag and SafariumCommit. The
++// updater downloads the newer release's DMG, checks its SHA-256, stages the
++// app, quits Safarium and lets a small script swap the app in place and
++// relaunch it with the previous session restored.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_UPDATER_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_UPDATER_H_
++
++namespace safarium {
++
++// Safarium > Check for Updates…: reports the result either way.
++void CheckForUpdates();
++
++// Background checks: shortly after launch, then once a day. Only for
++// packaged builds (stamped with SafariumTag); silent unless a newer release
++// that the user hasn't skipped is out.
++void StartAutomaticUpdateChecks();
++
++// Safarium > Install Local Build… (Option key): installs the newest
++// *-local-*.dmg from ~/chromium/dist (defaults key
++// SafariumLocalUpdateDirectory), for builds that aren't released.
++void InstallLocalBuild();
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_UPDATER_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_updater_mac.mm b/chrome/browser/ui/webui_browser/safarium_updater_mac.mm
+new file mode 100644
+index 0000000000..bc7ac7414f
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_updater_mac.mm
+@@ -0,0 +1,712 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "chrome/browser/ui/webui_browser/safarium_updater.h"
++
++#import <AppKit/AppKit.h>
++
++#include <array>
++#include <string>
++#include <vector>
++
++#include "base/apple/foundation_util.h"
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/sys_string_conversions.h"
++#include "chrome/browser/lifetime/application_lifetime.h"
++#include "chrome/common/chrome_switches.h"
++#include "crypto/hash.h"
++
++namespace {
++
++NSString* const kDefaultFeedURL =
++    @"https://api.github.com/repos/Longwei-Yang/Safarium/releases/latest";
++// NSUserDefaults keys.
++NSString* const kFeedURLKey = @"SafariumUpdateFeedURL";  // Testing override.
++NSString* const kLastCheckKey = @"SafariumLastUpdateCheck";
++NSString* const kSkippedTagKey = @"SafariumSkippedUpdateTag";
++NSString* const kLocalDirectoryKey = @"SafariumLocalUpdateDirectory";
++
++constexpr NSTimeInterval kCheckInterval = 24 * 60 * 60;
++constexpr NSTimeInterval kFirstCheckDelay = 60;
++
++// A release version: Chromium's version, then Safarium's fix number.
++struct Version {
++  std::vector<int> chromium;
++  int fix = 0;
++  bool valid = false;
++};
++
++Version ParseTag(NSString* tag) {
++  Version v;
++  NSRegularExpression* re = [NSRegularExpression
++      regularExpressionWithPattern:@"^v?([0-9]+(?:\\.[0-9]+)*)-fix([0-9]+)$"
++                           options:0
++                             error:nil];
++  NSTextCheckingResult* m =
++      tag ? [re firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)]
++          : nil;
++  if (!m) {
++    return v;
++  }
++  for (NSString* part in [[tag substringWithRange:[m rangeAtIndex:1]]
++           componentsSeparatedByString:@"."]) {
++    v.chromium.push_back(part.intValue);
++  }
++  v.fix = [tag substringWithRange:[m rangeAtIndex:2]].intValue;
++  v.valid = true;
++  return v;
++}
++
++// The running app, from the values the packaging script stamped.
++Version InstalledVersion() {
++  NSDictionary* info = NSBundle.mainBundle.infoDictionary;
++  Version v;
++  for (NSString* part in [info[@"CFBundleShortVersionString"]
++           componentsSeparatedByString:@"."]) {
++    v.chromium.push_back(part.intValue);
++  }
++  v.fix = [info[@"SafariumBuild"] intValue];
++  v.valid = true;
++  return v;
++}
++
++bool IsNewer(const Version& a, const Version& b) {
++  if (a.chromium != b.chromium) {
++    return a.chromium > b.chromium;
++  }
++  return a.fix > b.fix;
++}
++
++NSString* InstalledDescription() {
++  NSDictionary* info = NSBundle.mainBundle.infoDictionary;
++  NSString* tag = info[@"SafariumTag"];
++  NSString* commit = info[@"SafariumCommit"];
++  const int fix = [info[@"SafariumBuild"] intValue];
++  if ([tag isEqualToString:@"local"]) {
++    return [NSString stringWithFormat:@"a local build (%@, based on fix%d)",
++                                      commit ?: @"?", fix];
++  }
++  if (tag.length) {
++    return [NSString stringWithFormat:@"Safarium fix%d", fix];
++  }
++  return @"a development build";
++}
++
++NSString* ShortName(NSString* tag) {
++  const Version v = ParseTag(tag);
++  return v.valid ? [NSString stringWithFormat:@"fix%d", v.fix] : tag;
++}
++
++NSURL* UpdateDirectory() {
++  NSURL* caches = [NSFileManager.defaultManager
++      URLsForDirectory:NSCachesDirectory
++             inDomains:NSUserDomainMask]
++                      .firstObject;
++  NSURL* dir = [[caches URLByAppendingPathComponent:NSBundle.mainBundle
++                                                        .bundleIdentifier]
++      URLByAppendingPathComponent:@"Update"];
++  [NSFileManager.defaultManager createDirectoryAtURL:dir
++                         withIntermediateDirectories:YES
++                                          attributes:nil
++                                               error:nil];
++  return dir;
++}
++
++// Runs a tool and returns its exit status (standard output in `output`).
++int Run(NSString* path, NSArray<NSString*>* args, NSString** output) {
++  NSTask* task = [[NSTask alloc] init];
++  task.executableURL = [NSURL fileURLWithPath:path];
++  task.arguments = args;
++  NSPipe* pipe = [NSPipe pipe];
++  task.standardOutput = pipe;
++  task.standardError = [NSFileHandle fileHandleWithNullDevice];
++  if (![task launchAndReturnError:nil]) {
++    return -1;
++  }
++  NSData* data = [pipe.fileHandleForReading readDataToEndOfFile];
++  [task waitUntilExit];
++  if (output) {
++    *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
++  }
++  return task.terminationStatus;
++}
++
++NSString* Sha256Hex(NSURL* file) {
++  NSFileHandle* handle = [NSFileHandle fileHandleForReadingFromURL:file
++                                                             error:nil];
++  if (!handle) {
++    return nil;
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  while (true) {
++    @autoreleasepool {
++      NSData* chunk = [handle readDataUpToLength:1 << 20 error:nil];
++      if (!chunk.length) {
++        break;
++      }
++      hasher.Update(base::apple::NSDataToSpan(chunk));
++    }
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  return base::SysUTF8ToNSString(base::ToLowerASCII(base::HexEncode(digest)));
++}
++
++}  // namespace
++
++// One check / download / install at a time.
++@interface SafariumUpdater : NSObject <NSURLSessionDownloadDelegate>
+++ (instancetype)shared;
++- (void)checkUserInitiated:(BOOL)userInitiated;
++- (void)startAutomaticChecks;
++- (void)installLocalBuild;
++@end
++
++@implementation SafariumUpdater {
++  BOOL _busy;
++  NSTimer* _timer;
++  NSURLSession* _session;
++  NSString* _tag;          // The release being installed.
++  NSString* _sha256;       // Its expected digest (may be nil).
++  NSPanel* _progressPanel;
++  NSProgressIndicator* _progress;
++  NSTextField* _progressLabel;
++}
++
+++ (instancetype)shared {
++  static SafariumUpdater* updater = [[SafariumUpdater alloc] init];
++  return updater;
++}
++
++// --- Checking -----------------------------------------------------------------
++
++- (void)startAutomaticChecks {
++  if (_timer || ![NSBundle.mainBundle.infoDictionary[@"SafariumTag"] length]) {
++    return;  // Development builds aren't stamped and don't check on their own.
++  }
++  __weak SafariumUpdater* weakSelf = self;
++  dispatch_after(
++      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kFirstCheckDelay * NSEC_PER_SEC)),
++      dispatch_get_main_queue(), ^{
++        [weakSelf automaticCheckIfDue];
++      });
++  _timer = [NSTimer scheduledTimerWithTimeInterval:60 * 60
++                                           repeats:YES
++                                             block:^(NSTimer* timer) {
++                                               [weakSelf automaticCheckIfDue];
++                                             }];
++}
++
++- (void)automaticCheckIfDue {
++  NSDate* last = [NSUserDefaults.standardUserDefaults objectForKey:kLastCheckKey];
++  if (last && -last.timeIntervalSinceNow < kCheckInterval) {
++    return;
++  }
++  [self checkUserInitiated:NO];
++}
++
++- (void)checkUserInitiated:(BOOL)userInitiated {
++  if (_busy) {
++    if (userInitiated && _progressPanel) {
++      [_progressPanel makeKeyAndOrderFront:nil];
++    }
++    return;
++  }
++  _busy = YES;
++  NSString* feed =
++      [NSUserDefaults.standardUserDefaults stringForKey:kFeedURLKey] ?:
++      kDefaultFeedURL;
++  NSMutableURLRequest* request =
++      [NSMutableURLRequest requestWithURL:[NSURL URLWithString:feed]];
++  [request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
++  [request setValue:@"Safarium-Updater" forHTTPHeaderField:@"User-Agent"];
++  request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
++  request.timeoutInterval = 30;
++  __weak SafariumUpdater* weakSelf = self;
++  [[NSURLSession.sharedSession
++      dataTaskWithRequest:request
++        completionHandler:^(NSData* data, NSURLResponse* response,
++                            NSError* error) {
++          NSDictionary* release = nil;
++          if (data && [(NSHTTPURLResponse*)response statusCode] == 200) {
++            id json = [NSJSONSerialization JSONObjectWithData:data
++                                                      options:0
++                                                        error:nil];
++            release = [json isKindOfClass:NSDictionary.class] ? json : nil;
++          }
++          dispatch_async(dispatch_get_main_queue(), ^{
++            [weakSelf didFetchRelease:release
++                        userInitiated:userInitiated
++                                error:error];
++          });
++        }] resume];
++}
++
++- (void)didFetchRelease:(NSDictionary*)release
++          userInitiated:(BOOL)userInitiated
++                  error:(NSError*)error {
++  _busy = NO;
++  NSString* tag = release[@"tag_name"];
++  const Version available = ParseTag(tag);
++  if (!available.valid) {
++    if (userInitiated) {
++      [self showMessage:@"Safarium can't check for updates right now."
++                   info:error.localizedDescription
++                            ?: @"The release information couldn't be read. "
++                               @"Check your internet connection and try again."];
++    }
++    return;
++  }
++  [NSUserDefaults.standardUserDefaults setObject:[NSDate date]
++                                          forKey:kLastCheckKey];
++  if (!IsNewer(available, InstalledVersion())) {
++    if (userInitiated) {
++      [self showMessage:@"Safarium is up to date."
++                   info:[NSString stringWithFormat:
++                                      @"You have %@. The latest release is %@.",
++                                      InstalledDescription(), ShortName(tag)]];
++    }
++    return;
++  }
++  if (!userInitiated &&
++      [[NSUserDefaults.standardUserDefaults stringForKey:kSkippedTagKey]
++          isEqualToString:tag]) {
++    return;
++  }
++  NSDictionary* dmg = nil;
++  for (NSDictionary* asset in release[@"assets"]) {
++    if ([asset[@"name"] hasSuffix:@"-arm64.dmg"]) {
++      dmg = asset;
++      break;
++    }
++  }
++  NSURL* url = [NSURL URLWithString:dmg[@"browser_download_url"] ?: @""];
++  if (!url.scheme) {
++    if (userInitiated) {
++      [self showMessage:@"This update can't be installed automatically."
++                   info:@"The release has no disk image to download."];
++    }
++    return;
++  }
++  NSString* digest = dmg[@"digest"];
++  NSString* sha256 = [digest hasPrefix:@"sha256:"]
++                         ? [digest substringFromIndex:7].lowercaseString
++                         : nil;
++  [self offerRelease:release tag:tag url:url sha256:sha256];
++}
++
++- (void)offerRelease:(NSDictionary*)release
++                 tag:(NSString*)tag
++                 url:(NSURL*)url
++              sha256:(NSString*)sha256 {
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.messageText = @"A new version of Safarium is available!";
++  alert.informativeText = [NSString
++      stringWithFormat:@"Safarium %@ is now available. You have %@. "
++                       @"Would you like to install it now?",
++                       ShortName(tag), InstalledDescription()];
++  NSString* notes = release[@"body"];
++  if (notes.length) {
++    NSAttributedStringMarkdownParsingOptions* options =
++        [[NSAttributedStringMarkdownParsingOptions alloc] init];
++    options.interpretedSyntax =
++        NSAttributedStringMarkdownInterpretedSyntaxInlineOnlyPreservingWhitespace;
++    NSAttributedString* parsed =
++        [[NSAttributedString alloc] initWithMarkdownString:notes
++                                                   options:options
++                                                   baseURL:nil
++                                                     error:nil];
++    NSMutableAttributedString* text = [[NSMutableAttributedString alloc]
++        initWithAttributedString:parsed ?: [[NSAttributedString alloc]
++                                               initWithString:notes]];
++    const NSRange all = NSMakeRange(0, text.length);
++    [text addAttribute:NSForegroundColorAttributeName
++                 value:NSColor.labelColor
++                 range:all];
++    // The parser marks **bold** / `code` as intents; give them fonts.
++    [text addAttribute:NSFontAttributeName
++                 value:[NSFont systemFontOfSize:12]
++                 range:all];
++    [parsed enumerateAttribute:NSInlinePresentationIntentAttributeName
++                       inRange:NSMakeRange(0, parsed.length)
++                       options:0
++                    usingBlock:^(NSNumber* value, NSRange range, BOOL* stop) {
++                      const NSUInteger intent = value.unsignedIntegerValue;
++                      if (intent & NSInlinePresentationIntentStronglyEmphasized) {
++                        [text addAttribute:NSFontAttributeName
++                                     value:[NSFont boldSystemFontOfSize:12]
++                                     range:range];
++                      } else if (intent & NSInlinePresentationIntentCode) {
++                        [text addAttribute:NSFontAttributeName
++                                     value:[NSFont monospacedSystemFontOfSize:11
++                                                     weight:NSFontWeightRegular]
++                                     range:range];
++                      }
++                    }];
++    NSScrollView* scroll =
++        [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 420, 200)];
++    scroll.hasVerticalScroller = YES;
++    scroll.borderType = NSBezelBorder;
++    NSTextView* view =
++        [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 420, 200)];
++    view.editable = NO;
++    view.textContainerInset = NSMakeSize(6, 6);
++    [view.textStorage setAttributedString:text];
++    view.autoresizingMask = NSViewWidthSizable;
++    scroll.documentView = view;
++    alert.accessoryView = scroll;
++  }
++  [alert addButtonWithTitle:@"Install Update"];
++  [alert addButtonWithTitle:@"Remind Me Later"];
++  [alert addButtonWithTitle:@"Skip This Version"];
++  [NSApp activate];
++  const NSModalResponse response = [alert runModal];
++  if (response == NSAlertThirdButtonReturn) {
++    [NSUserDefaults.standardUserDefaults setObject:tag forKey:kSkippedTagKey];
++    return;
++  }
++  if (response != NSAlertFirstButtonReturn) {
++    return;
++  }
++  [self downloadTag:tag url:url sha256:sha256];
++}
++
++// --- Downloading --------------------------------------------------------------
++
++- (void)downloadTag:(NSString*)tag url:(NSURL*)url sha256:(NSString*)sha256 {
++  _busy = YES;
++  _tag = tag;
++  _sha256 = sha256;
++  [self showProgress:[NSString stringWithFormat:@"Downloading Safarium %@…",
++                                                ShortName(tag)]];
++  _session = [NSURLSession
++      sessionWithConfiguration:NSURLSessionConfiguration
++                                   .ephemeralSessionConfiguration
++                      delegate:self
++                 delegateQueue:NSOperationQueue.mainQueue];
++  [[_session downloadTaskWithURL:url] resume];
++}
++
++- (void)URLSession:(NSURLSession*)session
++                 downloadTask:(NSURLSessionDownloadTask*)task
++                 didWriteData:(int64_t)written
++            totalBytesWritten:(int64_t)total
++    totalBytesExpectedToWrite:(int64_t)expected {
++  if (expected > 0) {
++    _progress.indeterminate = NO;
++    _progress.doubleValue = 100.0 * total / expected;
++  }
++}
++
++- (void)URLSession:(NSURLSession*)session
++                 downloadTask:(NSURLSessionDownloadTask*)task
++    didFinishDownloadingToURL:(NSURL*)location {
++  // The file at `location` is deleted when this returns: move it now.
++  NSURL* dmg = [UpdateDirectory() URLByAppendingPathComponent:@"Update.dmg"];
++  [NSFileManager.defaultManager removeItemAtURL:dmg error:nil];
++  NSInteger status = [(NSHTTPURLResponse*)task.response statusCode];
++  if (status != 200 ||
++      ![NSFileManager.defaultManager moveItemAtURL:location
++                                             toURL:dmg
++                                             error:nil]) {
++    [self fail:@"The update couldn't be downloaded."];
++    return;
++  }
++  [self prepareDisk:dmg expectedTag:_tag sha256:_sha256];
++}
++
++- (void)URLSession:(NSURLSession*)session
++                    task:(NSURLSessionTask*)task
++    didCompleteWithError:(NSError*)error {
++  if (error && error.code != NSURLErrorCancelled) {
++    [self fail:[NSString stringWithFormat:@"The update couldn't be downloaded. %@",
++                                          error.localizedDescription]];
++  }
++  [session finishTasksAndInvalidate];
++  if (session == _session) {
++    _session = nil;
++  }
++}
++
++// --- Staging and installing ---------------------------------------------------
++
++// Checks the disk image and copies its app next to it, off the main thread.
++- (void)prepareDisk:(NSURL*)dmg
++        expectedTag:(NSString*)expectedTag
++             sha256:(NSString*)sha256 {
++  _progress.indeterminate = YES;
++  [_progress startAnimation:nil];
++  _progressLabel.stringValue = @"Verifying update…";
++  NSString* bundleId = NSBundle.mainBundle.bundleIdentifier;
++  __weak SafariumUpdater* weakSelf = self;
++  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++    NSString* problem = nil;
++    NSURL* staged = [UpdateDirectory() URLByAppendingPathComponent:@"Safarium.app"];
++    if (sha256 && ![Sha256Hex(dmg) isEqualToString:sha256]) {
++      problem = @"The downloaded file is damaged (its checksum doesn't match "
++                @"the release).";
++    }
++    NSURL* mount = [UpdateDirectory() URLByAppendingPathComponent:@"Mount"];
++    if (!problem) {
++      [NSFileManager.defaultManager createDirectoryAtURL:mount
++                             withIntermediateDirectories:YES
++                                              attributes:nil
++                                                   error:nil];
++      if (Run(@"/usr/bin/hdiutil",
++              @[ @"attach", @"-quiet", @"-nobrowse", @"-readonly",
++                 @"-mountpoint", mount.path, dmg.path ],
++              nil) != 0) {
++        problem = @"The update's disk image couldn't be opened.";
++      }
++    }
++    if (!problem) {
++      [NSFileManager.defaultManager removeItemAtURL:staged error:nil];
++      NSURL* app = [mount URLByAppendingPathComponent:@"Safarium.app"];
++      if (Run(@"/usr/bin/ditto", @[ app.path, staged.path ], nil) != 0) {
++        problem = @"The update couldn't be copied.";
++      }
++      Run(@"/usr/bin/hdiutil", @[ @"detach", @"-quiet", mount.path ], nil);
++    }
++    if (!problem) {
++      NSDictionary* info = [NSDictionary
++          dictionaryWithContentsOfURL:
++              [staged URLByAppendingPathComponent:@"Contents/Info.plist"]];
++      if (![info[@"CFBundleIdentifier"] isEqualToString:bundleId] ||
++          (expectedTag && ![info[@"SafariumTag"] isEqualToString:expectedTag])) {
++        problem = @"The downloaded app isn't the expected Safarium release.";
++      } else if (Run(@"/usr/bin/codesign",
++                     @[ @"--verify", @"--deep", @"--strict", staged.path ],
++                     nil) != 0) {
++        problem = @"The downloaded app's code signature isn't valid.";
++      }
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++      if (problem) {
++        [weakSelf fail:problem];
++      } else {
++        [weakSelf installStagedApp:staged];
++      }
++    });
++  });
++}
++
++// Quits Safarium; a detached script waits for it to exit, swaps the app in
++// place (keeping the old one until the copy succeeded) and relaunches it with
++// the previous session.
++- (void)installStagedApp:(NSURL*)staged {
++  NSString* target = NSBundle.mainBundle.bundlePath;
++  NSString* parent = target.stringByDeletingLastPathComponent;
++  if (![NSFileManager.defaultManager isWritableFileAtPath:parent]) {
++    [self fail:[NSString stringWithFormat:
++                             @"Safarium can't replace itself in “%@”. Quit "
++                             @"Safarium and replace it with the copy in the "
++                             @"update folder.",
++                             parent]];
++    [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[ staged ]];
++    return;
++  }
++  NSURL* script = [UpdateDirectory() URLByAppendingPathComponent:@"install.sh"];
++  NSString* body =
++      @"#!/bin/sh\n"
++      @"# Safarium update: wait for the app to quit, swap it, relaunch.\n"
++      @"PID=$1; STAGED=$2; TARGET=$3; LOG=$4; shift 4\n"
++      @"i=0\n"
++      @"while kill -0 \"$PID\" 2>/dev/null; do\n"
++      @"  sleep 0.5; i=$((i+1))\n"
++      @"  [ $i -gt 1200 ] && { echo \"$(date) gave up: still running\" >> "
++      @"\"$LOG\"; exit 1; }\n"
++      @"done\n"
++      @"OLD=\"$TARGET.previous-update\"\n"
++      @"rm -rf \"$OLD\"\n"
++      @"if ! mv \"$TARGET\" \"$OLD\"; then echo \"$(date) can't move old app\" "
++      @">> \"$LOG\"; open -n \"$TARGET\" --args \"$@\"; exit 1; fi\n"
++      @"if ditto \"$STAGED\" \"$TARGET\"; then\n"
++      @"  xattr -dr com.apple.quarantine \"$TARGET\" 2>/dev/null\n"
++      @"  rm -rf \"$OLD\" \"$STAGED\"\n"
++      @"  echo \"$(date) installed\" >> \"$LOG\"\n"
++      @"else\n"
++      @"  rm -rf \"$TARGET\"; mv \"$OLD\" \"$TARGET\"\n"
++      @"  echo \"$(date) copy failed, kept the old app\" >> \"$LOG\"\n"
++      @"fi\n"
++      @"open -n \"$TARGET\" --args \"$@\"\n";
++  if (![body writeToURL:script atomically:YES encoding:NSUTF8StringEncoding
++                  error:nil]) {
++    [self fail:@"The update couldn't be prepared."];
++    return;
++  }
++  // Relaunch with this run's own switches (e.g. --user-data-dir), not its
++  // URLs (the restored session has those pages) nor the switches Chromium
++  // adds itself (about:flags, the file alias), and restore the previous
++  // session, as Chromium does after its own updates.
++  NSMutableArray<NSString*>* relaunch = [NSMutableArray array];
++  const auto& argv = base::CommandLine::ForCurrentProcess()->argv();
++  bool in_flags = false;
++  for (size_t i = 1; i < argv.size(); ++i) {
++    const std::string& arg = argv[i];
++    if (arg == "--flag-switches-begin") {
++      in_flags = true;
++    } else if (arg == "--flag-switches-end") {
++      in_flags = false;
++    } else if (!in_flags && base::StartsWith(arg, "--") &&
++               !base::StartsWith(arg, "--file-url-path-alias") &&
++               arg != std::string("--") + switches::kRestoreLastSession) {
++      [relaunch addObject:base::SysUTF8ToNSString(arg)];
++    }
++  }
++  [relaunch addObject:[@"--" stringByAppendingString:@(switches::kRestoreLastSession)]];
++  NSString* log = [UpdateDirectory() URLByAppendingPathComponent:@"install.log"].path;
++  // Double fork through the shell so the script outlives Safarium.
++  NSMutableArray<NSString*>* args = [NSMutableArray arrayWithArray:@[
++    @"-c", @"\"$0\" \"$@\" </dev/null >/dev/null 2>&1 &", @"/bin/sh",
++    script.path, @(getpid()).stringValue, staged.path, target, log
++  ]];
++  [args addObjectsFromArray:relaunch];
++  NSTask* task = [[NSTask alloc] init];
++  task.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
++  task.arguments = args;
++  if (![task launchAndReturnError:nil]) {
++    [self fail:@"The update couldn't be started."];
++    return;
++  }
++  [task waitUntilExit];
++  _progressLabel.stringValue = @"Installing… Safarium will reopen.";
++  [_progressPanel orderOut:nil];
++  _progressPanel = nil;
++  _busy = NO;
++  chrome::AttemptUserExit();
++}
++
++// --- Local builds -------------------------------------------------------------
++
++- (void)installLocalBuild {
++  if (_busy) {
++    return;
++  }
++  NSString* dir =
++      [NSUserDefaults.standardUserDefaults stringForKey:kLocalDirectoryKey] ?:
++      [NSHomeDirectory() stringByAppendingPathComponent:@"chromium/dist"];
++  NSURL* newest = nil;
++  NSDate* newestDate = nil;
++  for (NSURL* url in [NSFileManager.defaultManager
++           contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir]
++         includingPropertiesForKeys:@[ NSURLContentModificationDateKey ]
++                            options:NSDirectoryEnumerationSkipsHiddenFiles
++                              error:nil]) {
++    if (![url.lastPathComponent containsString:@"-local-"] ||
++        ![url.pathExtension isEqualToString:@"dmg"]) {
++      continue;
++    }
++    NSDate* date = nil;
++    [url getResourceValue:&date forKey:NSURLContentModificationDateKey error:nil];
++    if (!newestDate || [date compare:newestDate] == NSOrderedDescending) {
++      newest = url;
++      newestDate = date;
++    }
++  }
++  if (!newest) {
++    [self showMessage:@"No local build found."
++                 info:[NSString stringWithFormat:
++                                    @"Package one with package-safarium.sh; "
++                                    @"Safarium looks for *-local-*.dmg in %@.",
++                                    dir]];
++    return;
++  }
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.messageText = @"Install this local build?";
++  alert.informativeText = [NSString
++      stringWithFormat:@"%@\nBuilt %@.\nYou have %@. Safarium will quit and "
++                       @"reopen with your windows.",
++                       newest.lastPathComponent,
++                       [NSDateFormatter
++                           localizedStringFromDate:newestDate
++                                         dateStyle:NSDateFormatterMediumStyle
++                                         timeStyle:NSDateFormatterShortStyle],
++                       InstalledDescription()];
++  [alert addButtonWithTitle:@"Install and Relaunch"];
++  [alert addButtonWithTitle:@"Cancel"];
++  if ([alert runModal] != NSAlertFirstButtonReturn) {
++    return;
++  }
++  _busy = YES;
++  [self showProgress:@"Preparing local build…"];
++  [self prepareDisk:newest expectedTag:nil sha256:nil];
++}
++
++// --- UI -----------------------------------------------------------------------
++
++- (void)showProgress:(NSString*)text {
++  if (!_progressPanel) {
++    _progressPanel = [[NSPanel alloc]
++        initWithContentRect:NSMakeRect(0, 0, 360, 92)
++                  styleMask:NSWindowStyleMaskTitled
++                    backing:NSBackingStoreBuffered
++                      defer:NO];
++    _progressPanel.title = @"Software Update";
++    _progressPanel.releasedWhenClosed = NO;
++    NSView* content = _progressPanel.contentView;
++    _progressLabel = [NSTextField labelWithString:@""];
++    _progressLabel.frame = NSMakeRect(20, 56, 320, 18);
++    [content addSubview:_progressLabel];
++    _progress = [[NSProgressIndicator alloc]
++        initWithFrame:NSMakeRect(20, 28, 230, 20)];
++    _progress.indeterminate = YES;
++    _progress.minValue = 0;
++    _progress.maxValue = 100;
++    [_progress startAnimation:nil];
++    [content addSubview:_progress];
++    NSButton* cancel = [NSButton buttonWithTitle:@"Cancel"
++                                          target:self
++                                          action:@selector(cancel:)];
++    cancel.frame = NSMakeRect(262, 22, 84, 30);
++    [content addSubview:cancel];
++    [_progressPanel center];
++  }
++  _progressLabel.stringValue = text;
++  [_progressPanel makeKeyAndOrderFront:nil];
++}
++
++- (void)cancel:(id)sender {
++  [_session invalidateAndCancel];
++  _session = nil;
++  [_progressPanel orderOut:nil];
++  _progressPanel = nil;
++  _busy = NO;
++}
++
++- (void)fail:(NSString*)message {
++  [_session invalidateAndCancel];
++  _session = nil;
++  [_progressPanel orderOut:nil];
++  _progressPanel = nil;
++  _busy = NO;
++  [self showMessage:@"Safarium couldn't install the update." info:message];
++}
++
++- (void)showMessage:(NSString*)message info:(NSString*)info {
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.messageText = message;
++  alert.informativeText = info ?: @"";
++  [NSApp activate];
++  [alert runModal];
++}
++
++@end
++
++namespace safarium {
++
++void CheckForUpdates() {
++  [[SafariumUpdater shared] checkUserInitiated:YES];
++}
++
++void StartAutomaticUpdateChecks() {
++  [[SafariumUpdater shared] startAutomaticChecks];
++}
++
++void InstallLocalBuild() {
++  [[SafariumUpdater shared] installLocalBuild];
++}
++
++}  // namespace safarium
+-- 
+2.54.0 (Apple Git-157)
+

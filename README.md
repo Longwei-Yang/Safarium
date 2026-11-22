@@ -44,7 +44,7 @@ The interface and its animations will keep being refined.
 
 **Bookmarks.** ⌘D opens Safari's Add Bookmark panel from the address field: pick a folder, edit the title, then Add. Nothing is saved if you cancel. On a page that is already bookmarked the panel edits or removes that bookmark.
 
-**Passwords and autofill.** Safarium offers to save passwords and addresses after you submit a form and fills them in later, with a bubble under the address field. Right-click a page to make a QR code for it.
+**Passwords and autofill.** Safarium offers to save passwords and addresses after you submit a form and fills them in later, with a bubble centered over the page. Right-click a page to make a QR code for it.
 
 **Settings.** Safarium › Settings… opens a native settings window with General, Tabs, AutoFill and Advanced panes. Show All Settings… opens Chromium's full settings in a tab.
 
@@ -53,6 +53,10 @@ The interface and its animations will keep being refined.
 **Reopen your last session.** History › Reopen All Windows from Last Session brings back the windows and tabs from before you quit, or from before a crash.
 
 **Downloads on quit.** Quitting or closing the last window while a download is in progress asks first.
+
+**Site permissions.** When a site asks for your location, notifications, camera, microphone or similar, Safarium shows Chrome's permission prompt centered over the page. Chrome's other popups (saving passwords and addresses, zoom, QR code, sharing, extension dialogs) appear there too.
+
+**Updates.** Safarium › Check for Updates… looks for a newer release here on GitHub, shows its notes and installs it: the DMG is downloaded and checked against the SHA-256 GitHub publishes, then Safarium quits, replaces itself and reopens with your windows and tabs. Safarium also checks once a day and only speaks up when there is something new; "Skip This Version" silences one release.
 
 **New Tab shortcuts.** The New Tab page holds up to 20 shortcuts.
 
@@ -74,11 +78,11 @@ Safarium runs on Apple silicon Macs with macOS 26 or later. It is built and test
 
    Right-click › Open no longer bypasses this check on macOS 15 and later.
 
-To update, quit Safarium and replace the app with the one from the newer DMG, then repeat step 3 for the new copy. Bookmarks, history, passwords and extensions are stored in `~/Library/Application Support/Safarium` and are kept. macOS may ask once more for permission to use the "Safarium Safe Storage" keychain item.
+To update, use Safarium › Check for Updates… (from the first release that has it, fix6 on). For older copies, quit Safarium and replace the app with the one from the newer DMG, then repeat step 3 for the new copy. Bookmarks, history, passwords and extensions are stored in `~/Library/Application Support/Safarium` and are kept. macOS may ask once more for permission to use the "Safarium Safe Storage" keychain item.
 
 ## Limitations
 
-- No automatic updates. Each release is a new DMG, and Chromium security fixes arrive only with a new Safarium build.
+- Updates come from Safarium's own updater (Check for Updates…), which needs Safarium to be in a folder you can write to, such as Applications. Chromium security fixes arrive only with a new Safarium build.
 - No Google account sign-in or sync, since the build has no Google API keys. For the same reason page translation, Google Lens and the "AI in Chrome" features are left out.
 - No Cast.
 - Apple silicon only.
@@ -107,6 +111,8 @@ autoninja -C out/Release chrome
 # 4. Package an ad hoc signed DMG into ~/chromium/dist.
 SAFARIUM_SRC="$PWD" /path/to/Safarium/scripts/package-safarium.sh
 ```
+
+The script stamps the app for the updater: without `SAFARIUM_TAG` the DMG is a local build (`…-local-<commit>.dmg`, based on the newest `-fixN` tag of this repository), which Safarium › Install Local Build… (hold Option in the Safarium menu) installs from `~/chromium/dist`. A release is packaged with `SAFARIUM_TAG=v<version>-fix<N>`.
 
 `build/args.gn` builds the branded, standalone release app with proprietary codecs (H.264/AAC playback). With a Developer ID you can sign and notarize through Chromium's `sign_chrome.py --identity <ID> --notarize` instead of the packaging script.
 

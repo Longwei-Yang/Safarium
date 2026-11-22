@@ -1,0 +1,112 @@
+From 54b47e208cdb50dc64c1211c4c5023f832467b9d Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:55:43 -0500
+Subject: [PATCH 31/35] Safarium: permission prompts no longer crash, and show
+ up
+
+A site asking for a permission (location, notifications, camera...)
+crashed Safarium: the stub location bar's chip anchor pointed at a
+location icon element that the native UI doesn't have, so the prompt
+fell back to bubble_anchor_util::GetPageInfoAnchorRect(), which
+dereferenced the missing BrowserView (crash report 2026-11-22,
+views::View::GetMirroredXInView).
+
+- WebUIStubLocationBar::GetAnchorOrNull() falls back to the address
+  field (kLocationBarElementId), so prompts hang from it.
+- WebUIStubLocationBar::IsDrawn() is false in the native UI, so requests
+  made with a user gesture get the bubble instead of an invisible
+  location-bar chip (they used to wait forever).
+- bubble_anchor_util: no BrowserView dereference without one; the page
+  info rect falls back to the active page's top leading corner.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/views/bubble_anchor_util_views.cc        | 15 +++++++++++++++
+ .../ui/webui_browser/webui_stub_location_bar.cc | 17 +++++++++++++++--
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/ui/views/bubble_anchor_util_views.cc b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+index 97995fe36d..5122e49bb5 100644
+--- a/chrome/browser/ui/views/bubble_anchor_util_views.cc
++++ b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/ui/bubble_anchor_util.h"
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/location_bar/location_bar_override_data.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/app_menu_button.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.h"
+@@ -125,6 +126,11 @@ AnchorConfiguration GetPageInfoAnchorConfiguration(
+     if (anchor == Anchor::kLocationBar && chip_anchor) {
+       return *chip_anchor;
+     }
++    // The branches below need a BrowserView (WebUI browser / Safarium has
++    // none): no anchor, so callers fall back to GetPageInfoAnchorRect().
++    if (!browser_view) {
++      return {};
++    }
+   }
+ 
+   if (anchor == Anchor::kLocationBar) {
+@@ -280,6 +286,15 @@ gfx::Rect GetPageInfoAnchorRect(BrowserWindowInterface* browser) {
+         base::NotFatalUntil::M162);
+ 
+   BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  if (!browser_view) {
++    // Windows without a BrowserView (WebUI browser / Safarium): the top
++    // leading corner of the active page.
++    if (content::WebContents* contents =
++            browser->GetTabStripModel()->GetActiveWebContents()) {
++      return GetContentsTopLeadingRect(contents);
++    }
++    return gfx::Rect();
++  }
+   // Get position in view (taking RTL UI into account).
+   int x_within_browser_view = browser_view->GetMirroredXInView(
+       bubble_anchor_util::kNoToolbarLeftOffset);
+diff --git a/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc b/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
+index 4d17c35698..ab943f463f 100644
+--- a/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
++++ b/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/permissions/chip/permission_dashboard_controller.h"
+ #include "chrome/browser/ui/views/permissions/chip/webui_permission_dashboard.h"
++#include "chrome/browser/ui/webui_browser/safarium_features.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_window.h"
+ #include "ui/views/bubble/bubble_border.h"
+ 
+@@ -113,8 +114,14 @@ WebUIStubLocationBar::GetChipAnchor() {
+ }
+ 
+ ui::TrackedElement* WebUIStubLocationBar::GetAnchorOrNull() {
+-  return BrowserElements::From(window_->browser())
+-      ->GetElement(kLocationIconElementId);
++  BrowserElements* elements = BrowserElements::From(window_->browser());
++  if (ui::TrackedElement* icon = elements->GetElement(kLocationIconElementId)) {
++    return icon;
++  }
++  // Safarium's native toolbar has no location icon element; its address
++  // field is registered as the location bar (permission prompts and other
++  // page-info bubbles hang from it).
++  return elements->GetElement(kLocationBarElementId);
+ }
+ 
+ BrowserWindowInterface* WebUIStubLocationBar::GetBrowser() {
+@@ -142,6 +149,12 @@ bool WebUIStubLocationBar::IsVisible() const {
+ }
+ 
+ bool WebUIStubLocationBar::IsDrawn() const {
++  // Safarium's native UI draws no Chrome location bar: say so, so permission
++  // prompts use the bubble (anchored to the address field) instead of a
++  // location-bar chip nobody can see.
++  if (safarium::IsNativeUIEnabled()) {
++    return false;
++  }
+   NOTIMPLEMENTED();
+   return true;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,46 @@
+From 3c10eaa29a27f70e5e0969bba9b1be7dd9dc2d13 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:58:04 -0500
+Subject: [PATCH 32/35] Safarium: permission prompts centered over the page
+
+At the user's request, in windows without a BrowserView (Safarium)
+permission prompts float centered over the page (no anchor, FLOAT
+arrow, anchor rect = page center) instead of hanging from the address
+field.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/views/bubble_anchor_util_views.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/chrome/browser/ui/views/bubble_anchor_util_views.cc b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+index 5122e49bb5..6ebe14c14f 100644
+--- a/chrome/browser/ui/views/bubble_anchor_util_views.cc
++++ b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+@@ -202,6 +202,11 @@ AnchorConfiguration GetPermissionPromptBubbleAnchorConfiguration(
+   }
+ 
+   BrowserWindowInterface* browser = GetBrowserForWebContents(web_contents);
++  // Windows without a BrowserView (WebUI browser / Safarium): the prompt
++  // floats centered over the page (see GetPermissionPromptBubbleAnchorRect).
++  if (browser && !BrowserView::GetBrowserViewForBrowser(browser)) {
++    return {views::BubbleAnchor(), std::nullopt, views::BubbleBorder::FLOAT};
++  }
+   if (browser) {
+     // Overridden location bars are handled above, so use the window's own
+     // location bar. This includes non-tab WebUIs embedded in the window (e.g.
+@@ -271,6 +276,11 @@ gfx::Rect GetPermissionPromptBubbleAnchorRect(
+   if (!browser) {
+     return GetContentsTopLeadingRect(web_contents);
+   }
++  if (!BrowserView::GetBrowserViewForBrowser(browser)) {
++    // Safarium: the center of the page.
++    return gfx::Rect(web_contents->GetContainerBounds().CenterPoint(),
++                     gfx::Size());
++  }
+   return GetPageInfoAnchorRect(browser);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

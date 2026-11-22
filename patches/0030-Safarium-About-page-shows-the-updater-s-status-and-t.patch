@@ -1,0 +1,422 @@
+From 169fae09602b46d4bb902f3bd8647381ab1a42eb Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:36:46 -0500
+Subject: [PATCH 30/35] Safarium: About page shows the updater's status and the
+ Safarium version
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The About page (chrome://settings/help) still said "Automatic updates are
+unavailable in this build": Safarium builds compiled out its update
+status because Chromium's own updater is off. Safarium now has its own,
+so the page listens again and VersionUpdater::Create returns a Safarium
+updater backed by the shared release check (safarium_update_check.h,
+also the base of the menu's Check for Updates…):
+- checking, then "Safarium is up to date" with the check mark;
+- "Safarium fix<N> is available. Choose Safarium › Check for Updates…
+  to install it." when GitHub has a newer release;
+- "Safarium couldn't check for updates…" when the feed can't be read;
+- nothing for unstamped development builds.
+The version line now starts with the Safarium version: "Safarium fix5 ·
+Chromium Version …" or "Local build <commit>, based on fix5 · …".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/resources/settings/BUILD.gn    |   4 +-
+ chrome/browser/ui/webui/help/BUILD.gn         |   5 +
+ .../ui/webui/help/version_updater_mac.mm      |  64 +++++++++
+ chrome/browser/ui/webui/settings/BUILD.gn     |   1 +
+ .../settings_localized_strings_provider.cc    |  10 ++
+ chrome/browser/ui/webui_browser/BUILD.gn      |  14 ++
+ .../ui/webui_browser/safarium_update_check.h  |  40 ++++++
+ .../safarium_update_check_mac.mm              | 130 ++++++++++++++++++
+ 8 files changed, 267 insertions(+), 1 deletion(-)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_update_check.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_update_check_mac.mm
+
+diff --git a/chrome/browser/resources/settings/BUILD.gn b/chrome/browser/resources/settings/BUILD.gn
+index 50f784ee2e..6e7260a525 100644
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -15,7 +15,9 @@ build_webui("build") {
+   grd_prefix = "settings"
+   if (is_safarium_branded) {
+     preprocessor_defines = [ "is_safarium_branded=true" ]
+-    if (!enable_updater) {
++    # Safarium has its own updater on macOS (safarium_updater.h); the About
++    # page shows its status like Chrome's.
++    if (!enable_updater && !is_mac) {
+       preprocessor_defines += [ "safarium_without_updater=true" ]
+     }
+   }
+diff --git a/chrome/browser/ui/webui/help/BUILD.gn b/chrome/browser/ui/webui/help/BUILD.gn
+index 8caf9fbbae..b6c3290678 100644
+--- a/chrome/browser/ui/webui/help/BUILD.gn
++++ b/chrome/browser/ui/webui/help/BUILD.gn
+@@ -2,6 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//build/config/chrome_build.gni")
+ import("//chrome/common/features.gni")
+ 
+ source_set("help") {
+@@ -44,6 +45,7 @@ source_set("help") {
+     sources = [ "version_updater_mac.mm" ]
+     deps += [
+       "//base:i18n",
++      "//build:safarium_buildflags",
+       "//chrome/app:branded_strings",
+       "//chrome/app:generated_resources_grit",
+       "//chrome/browser/updater",
+@@ -51,6 +53,9 @@ source_set("help") {
+       "//ui/base",
+     ]
+     frameworks = [ "Foundation.framework" ]
++    if (is_safarium_branded) {
++      deps += [ "//chrome/browser/ui/webui_browser:safarium_update_check" ]
++    }
+   }
+ 
+   if (is_win) {
+diff --git a/chrome/browser/ui/webui/help/version_updater_mac.mm b/chrome/browser/ui/webui/help/version_updater_mac.mm
+index 57648956fa..97259feabe 100644
+--- a/chrome/browser/ui/webui/help/version_updater_mac.mm
++++ b/chrome/browser/ui/webui/help/version_updater_mac.mm
+@@ -24,6 +24,10 @@
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+ #include "base/version.h"
++#include "build/safarium_buildflags.h"
++#if BUILDFLAG(SAFARIUM_BRANDING)
++#include "chrome/browser/ui/webui_browser/safarium_update_check.h"
++#endif
+ #include "chrome/browser/updater/updater.h"
+ #include "chrome/browser/upgrade_detector/upgrade_detector.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -131,7 +135,67 @@ void CheckForUpdate(StatusCallback status_callback,
+ 
+ }  // namespace
+ 
++#if BUILDFLAG(SAFARIUM_BRANDING)
++namespace {
++
++// Safarium's own updater (safarium_updater.h) installs releases from
++// GitHub; the About page shows what it finds and points to Check for
++// Updates…, which shows the notes and installs.
++class SafariumVersionUpdater : public VersionUpdater {
++ public:
++  SafariumVersionUpdater() = default;
++  SafariumVersionUpdater(const SafariumVersionUpdater&) = delete;
++  SafariumVersionUpdater& operator=(const SafariumVersionUpdater&) = delete;
++  ~SafariumVersionUpdater() override = default;
++
++  void CheckForUpdate(StatusCallback status_callback,
++                      PromoteCallback promote_callback) override {
++    if (!safarium::IsStampedBuild()) {
++      // Development builds don't update.
++      status_callback.Run(DISABLED, 0, false, false, std::string(), 0,
++                          std::u16string());
++      return;
++    }
++    status_callback.Run(CHECKING, 0, false, false, std::string(), 0,
++                        std::u16string());
++    safarium::CheckLatestRelease(base::BindOnce(
++        [](StatusCallback status_callback,
++           const safarium::ReleaseCheck& check) {
++          switch (check.result) {
++            case safarium::ReleaseCheck::Result::kUpToDate:
++              status_callback.Run(UPDATED, 0, false, false, std::string(), 0,
++                                  std::u16string());
++              break;
++            case safarium::ReleaseCheck::Result::kAvailable:
++              status_callback.Run(
++                  DEFERRED, 0, false, false, check.latest_tag, 0,
++                  base::UTF8ToUTF16(
++                      "Safarium " + check.latest_name +
++                      " is available. Choose Safarium \u203a Check for "
++                      "Updates\u2026 to install it."));
++              break;
++            case safarium::ReleaseCheck::Result::kFailed:
++              status_callback.Run(
++                  FAILED_HTTP, 0, false, false, std::string(), 0,
++                  u"Safarium couldn't check for updates. Check your internet "
++                  u"connection and try again.");
++              break;
++          }
++        },
++        status_callback));
++  }
++  void PromoteUpdater() override {}
++};
++
++}  // namespace
++
++std::unique_ptr<VersionUpdater> VersionUpdater::Create(
++    content::WebContents* /* web_contents */) {
++  return base::WrapUnique(new SafariumVersionUpdater());
++}
++#else
+ std::unique_ptr<VersionUpdater> VersionUpdater::Create(
+     content::WebContents* /* web_contents */) {
+   return base::WrapUnique(new VersionUpdaterMac());
+ }
++#endif  // BUILDFLAG(SAFARIUM_BRANDING)
+diff --git a/chrome/browser/ui/webui/settings/BUILD.gn b/chrome/browser/ui/webui/settings/BUILD.gn
+index b9387f8680..52ad22278c 100644
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -400,6 +400,7 @@ source_set("impl") {
+       "mac_system_settings_handler.cc",
+       "settings_utils_mac.mm",
+     ]
++    deps += [ "//chrome/browser/ui/webui_browser:safarium_update_check" ]
+   }
+ 
+   if (is_win) {
+diff --git a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+index f5a305d793..90ffc677a8 100644
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -20,6 +20,9 @@
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+ #include "build/safarium_buildflags.h"
++#if BUILDFLAG(SAFARIUM_BRANDING) && BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/webui_browser/safarium_update_check.h"
++#endif
+ #include "chrome/browser/autofill/personal_data_manager_factory.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browser_process_platform_part.h"
+@@ -372,6 +375,13 @@ void AddAboutStrings(content::WebUIDataSource* html_source, Profile* profile) {
+ #if BUILDFLAG(SAFARIUM_BRANDING)
+   browser_version = l10n_util::GetStringFUTF16(
+       IDS_SAFARIUM_ABOUT_CHROMIUM_VERSION, browser_version);
++#if BUILDFLAG(IS_MAC)
++  // "Safarium fix5 · Chromium Version …" (packaged builds).
++  if (const std::string safarium = safarium::InstalledSafariumVersion();
++      !safarium.empty()) {
++    browser_version = base::UTF8ToUTF16(safarium) + u" \u00b7 " + browser_version;
++  }
++#endif
+ #endif
+   html_source->AddString("aboutBrowserVersion", browser_version);
+   html_source->AddString(
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index 43d02d059b..f858c0cf07 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -10,6 +10,19 @@ source_set("headers") {
+   sources = [ "webui_browser.h" ]
+ }
+ 
++# Safarium's release check (base only), shared by the updater and the About
++# page.
++if (is_mac) {
++  source_set("safarium_update_check") {
++    sources = [
++      "safarium_update_check.h",
++      "safarium_update_check_mac.mm",
++    ]
++    deps = [ "//base" ]
++    frameworks = [ "Foundation.framework" ]
++  }
++}
++
+ # Safarium: the element position a page reports before asking for full
+ # screen (bound for renderers in chrome_content_browser_client).
+ source_set("safarium_fullscreen_host") {
+@@ -133,6 +146,7 @@ source_set("impl") {
+       "//components/download/public/common:public",
+       "//components/history/core/common",
+       "//components/prefs",
++      ":safarium_update_check",
+       "//crypto",
+       "//ui/menus",
+     ]
+diff --git a/chrome/browser/ui/webui_browser/safarium_update_check.h b/chrome/browser/ui/webui_browser/safarium_update_check.h
+new file mode 100644
+index 0000000000..3071376236
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_update_check.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Safarium: which release this app is, and whether GitHub has a newer one.
++// Shared by the updater (safarium_updater.h) and the About page. The
++// packaging script stamps Info.plist with SafariumBuild (the fix number),
++// SafariumTag (v<version>-fix<N>, or "local") and SafariumCommit.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_UPDATE_CHECK_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_UPDATE_CHECK_H_
++
++#include <string>
++
++#include "base/functional/callback_forward.h"
++
++namespace safarium {
++
++struct ReleaseCheck {
++  enum class Result { kUpToDate, kAvailable, kFailed };
++  Result result = Result::kFailed;
++  std::string latest_tag;   // v160.0.8167.0-fix6
++  std::string latest_name;  // fix6
++};
++
++// Reads the latest GitHub release (defaults key SafariumUpdateFeedURL
++// overrides the feed, for testing) and compares it with this app. Calls
++// `done` on the calling sequence.
++void CheckLatestRelease(base::OnceCallback<void(const ReleaseCheck&)> done);
++
++// This app as people should see it: "Safarium fix5", "Local build
++// c2a2f8ab89, based on fix5", or "" for an unstamped development build.
++std::string InstalledSafariumVersion();
++
++// True for builds the packaging script stamped (they check for updates).
++bool IsStampedBuild();
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_UPDATE_CHECK_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_update_check_mac.mm b/chrome/browser/ui/webui_browser/safarium_update_check_mac.mm
+new file mode 100644
+index 0000000000..d7a994ef69
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_update_check_mac.mm
+@@ -0,0 +1,130 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/safarium_update_check.h"
++
++#import <Foundation/Foundation.h>
++
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++
++namespace safarium {
++
++namespace {
++
++NSString* const kDefaultFeedURL =
++    @"https://api.github.com/repos/Longwei-Yang/Safarium/releases/latest";
++
++struct Version {
++  std::vector<int> chromium;
++  int fix = 0;
++  bool valid = false;
++};
++
++Version ParseTag(NSString* tag) {
++  Version v;
++  NSRegularExpression* re = [NSRegularExpression
++      regularExpressionWithPattern:@"^v?([0-9]+(?:\\.[0-9]+)*)-fix([0-9]+)$"
++                           options:0
++                             error:nil];
++  NSTextCheckingResult* m =
++      tag ? [re firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)]
++          : nil;
++  if (!m) {
++    return v;
++  }
++  for (NSString* part in [[tag substringWithRange:[m rangeAtIndex:1]]
++           componentsSeparatedByString:@"."]) {
++    v.chromium.push_back(part.intValue);
++  }
++  v.fix = [tag substringWithRange:[m rangeAtIndex:2]].intValue;
++  v.valid = true;
++  return v;
++}
++
++Version Installed() {
++  NSDictionary* info = NSBundle.mainBundle.infoDictionary;
++  Version v;
++  for (NSString* part in [info[@"CFBundleShortVersionString"]
++           componentsSeparatedByString:@"."]) {
++    v.chromium.push_back(part.intValue);
++  }
++  v.fix = [info[@"SafariumBuild"] intValue];
++  v.valid = true;
++  return v;
++}
++
++bool IsNewer(const Version& a, const Version& b) {
++  return a.chromium != b.chromium ? a.chromium > b.chromium : a.fix > b.fix;
++}
++
++}  // namespace
++
++bool IsStampedBuild() {
++  return [NSBundle.mainBundle.infoDictionary[@"SafariumTag"] length] > 0;
++}
++
++std::string InstalledSafariumVersion() {
++  NSDictionary* info = NSBundle.mainBundle.infoDictionary;
++  NSString* tag = info[@"SafariumTag"];
++  const int fix = [info[@"SafariumBuild"] intValue];
++  if ([tag isEqualToString:@"local"]) {
++    return base::SysNSStringToUTF8([NSString
++        stringWithFormat:@"Local build %@, based on fix%d",
++                         info[@"SafariumCommit"] ?: @"?", fix]);
++  }
++  if (tag.length) {
++    return base::SysNSStringToUTF8(
++        [NSString stringWithFormat:@"Safarium fix%d", fix]);
++  }
++  return std::string();
++}
++
++void CheckLatestRelease(base::OnceCallback<void(const ReleaseCheck&)> done) {
++  NSString* feed =
++      [NSUserDefaults.standardUserDefaults stringForKey:@"SafariumUpdateFeedURL"]
++          ?: kDefaultFeedURL;
++  NSMutableURLRequest* request =
++      [NSMutableURLRequest requestWithURL:[NSURL URLWithString:feed]];
++  [request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
++  [request setValue:@"Safarium-Updater" forHTTPHeaderField:@"User-Agent"];
++  request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
++  request.timeoutInterval = 30;
++  scoped_refptr<base::SequencedTaskRunner> reply =
++      base::SequencedTaskRunner::GetCurrentDefault();
++  __block base::OnceCallback<void(const ReleaseCheck&)> callback =
++      std::move(done);
++  [[NSURLSession.sharedSession
++      dataTaskWithRequest:request
++        completionHandler:^(NSData* data, NSURLResponse* response,
++                            NSError* error) {
++          ReleaseCheck check;
++          NSDictionary* release = nil;
++          if (data && [(NSHTTPURLResponse*)response statusCode] == 200) {
++            id json = [NSJSONSerialization JSONObjectWithData:data
++                                                      options:0
++                                                        error:nil];
++            release = [json isKindOfClass:NSDictionary.class] ? json : nil;
++          }
++          NSString* tag = release[@"tag_name"];
++          const Version latest = ParseTag(tag);
++          if (latest.valid) {
++            check.latest_tag = base::SysNSStringToUTF8(tag);
++            check.latest_name = base::SysNSStringToUTF8(
++                [NSString stringWithFormat:@"fix%d", latest.fix]);
++            check.result = IsNewer(latest, Installed())
++                               ? ReleaseCheck::Result::kAvailable
++                               : ReleaseCheck::Result::kUpToDate;
++          }
++          reply->PostTask(FROM_HERE,
++                          base::BindOnce(std::move(callback), check));
++        }] resume];
++}
++
++}  // namespace safarium
+-- 
+2.54.0 (Apple Git-157)
+

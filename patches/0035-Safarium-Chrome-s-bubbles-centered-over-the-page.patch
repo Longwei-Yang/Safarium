@@ -1,0 +1,136 @@
+From 21dbf3c4ae53e43174b59cabaeb42eac09ac0ed8 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:23:29 -0500
+Subject: [PATCH 35/35] Safarium: Chrome's bubbles centered over the page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+At the user's request, Chrome's popup bubbles in Safarium no longer hang
+from the address field: they float centered over the page.
+
+- views: new view property kCenterAnchoredBubblesKey. A bubble whose
+  anchor view has it is laid out with a FLOAT arrow (no arrow), centered
+  over the anchor's GetAnchorBoundsInScreen().
+- Safarium's AddressFieldAnchor (kLocationBarElementId, also what
+  safarium::BubbleAnchors returns) sets it and reports the page's bounds.
+
+Covers every bubble routed there: save password / address, storage
+pressure, extension dialogs, zoom, translate, QR code, sharing, and the
+rest. Verified with permission, storage, extension and save-password
+bubbles. Safarium's own native ⌘D panel and Downloads popover keep their
+Safari-style placement.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 22 ++++++++++---------
+ .../bubble/bubble_dialog_delegate_view.cc     | 13 +++++++++++
+ ui/views/view_class_properties.cc             |  1 +
+ ui/views/view_class_properties.h              |  6 +++++
+ 4 files changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index ac179a080a..50cc930779 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -6677,8 +6677,9 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+ BEGIN_METADATA(VerticalSidebarView)
+ END_METADATA
+ 
+-// Stands in for Chrome's location bar (kLocationBarElementId) so bubbles that
+-// anchor there (save password, zoom, find) point at the address field.
++// Stands in for Chrome's location bar (kLocationBarElementId). Bubbles that
++// anchor there (save password, zoom, extension dialogs...) float centered over
++// the page (user's choice, 2026-11-22).
+ class AddressFieldAnchor : public views::View {
+   METADATA_HEADER(AddressFieldAnchor, views::View)
+ 
+@@ -6686,23 +6687,24 @@ - (NSArray*)itemsForSharingServicePickerToolbarItem:
+   AddressFieldAnchor(SafariumTabBarView* tab_view, views::View* page_view)
+       : tab_view_(tab_view), page_view_(page_view) {
+     SetProperty(views::kElementIdentifierKey, kLocationBarElementId);
++    // Chrome's bubbles that anchor here float centered over the page.
++    SetProperty(views::kCenterAnchoredBubblesKey, true);
+     SetCanProcessEventsWithinSubtree(false);
+   }
+   AddressFieldAnchor(const AddressFieldAnchor&) = delete;
+   AddressFieldAnchor& operator=(const AddressFieldAnchor&) = delete;
+   ~AddressFieldAnchor() override = default;
+ 
++  // The page: bubbles are centered over it (kCenterAnchoredBubblesKey). The
++  // address field if there is no page view.
+   gfx::Rect GetAnchorBoundsInScreen() const override {
+-    gfx::Rect bounds = [tab_view_ addressFieldScreenBounds];
+-    if (bounds.IsEmpty()) {
+-      // Toolbar hidden (e.g. full screen): the top center of the page.
+-      if (const views::View* page = page_view_.view()) {
+-        const gfx::Rect page_bounds = page->GetBoundsInScreen();
+-        bounds = gfx::Rect(page_bounds.CenterPoint().x(), page_bounds.y(), 1,
+-                           1);
++    if (const views::View* page = page_view_.view()) {
++      const gfx::Rect page_bounds = page->GetBoundsInScreen();
++      if (!page_bounds.IsEmpty()) {
++        return page_bounds;
+       }
+     }
+-    return bounds;
++    return [tab_view_ addressFieldScreenBounds];
+   }
+ 
+  private:
+diff --git a/ui/views/bubble/bubble_dialog_delegate_view.cc b/ui/views/bubble/bubble_dialog_delegate_view.cc
+index 6a020f5987..2fd2d9ec7a 100644
+--- a/ui/views/bubble/bubble_dialog_delegate_view.cc
++++ b/ui/views/bubble/bubble_dialog_delegate_view.cc
+@@ -1067,6 +1067,19 @@ template VIEWS_EXPORT void BubbleDialogDelegate::BubbleUmaLogger::LogMetric<
+                      base::TimeDelta value) const;
+ 
+ gfx::Rect BubbleDialogDelegate::GetBubbleBounds() {
++  // Anchors that ask for it (kCenterAnchoredBubblesKey) get the bubble
++  // centered over their bounds, without an arrow.
++  if (const View* anchor_view = GetAnchorView();
++      anchor_view && anchor_view->GetProperty(kCenterAnchoredBubblesKey)) {
++    if (arrow() != BubbleBorder::FLOAT) {
++      SetArrowWithoutResizing(BubbleBorder::FLOAT);
++    }
++    return GetBubbleFrameView()->GetUpdatedWindowBounds(
++        GetAnchorRect(), BubbleBorder::FLOAT,
++        GetWidget()->client_view()->GetPreferredSize({}),
++        /*adjust_to_fit_available_bounds=*/false);
++  }
++
+   // The argument rect has its origin at the bubble's arrow anchor point;
+   // its size is the preferred size of the bubble's client view (this view).
+   bool anchor_minimized = anchor_widget() && anchor_widget()->IsMinimized();
+diff --git a/ui/views/view_class_properties.cc b/ui/views/view_class_properties.cc
+index 84b699955f..8683eb36c0 100644
+--- a/ui/views/view_class_properties.cc
++++ b/ui/views/view_class_properties.cc
+@@ -53,6 +53,7 @@ DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(LayoutAlignment, kTableHorizAlignKey)
+ DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(LayoutAlignment, kTableVertAlignKey)
+ DEFINE_UI_CLASS_PROPERTY_KEY(bool, kViewIgnoredByLayoutKey, false)
+ DEFINE_UI_CLASS_PROPERTY_KEY(bool, kViewDoesNotLayOutChildren, false)
++DEFINE_UI_CLASS_PROPERTY_KEY(bool, kCenterAnchoredBubblesKey, false)
+ DEFINE_UI_CLASS_PROPERTY_KEY(ui::ElementIdentifier,
+                              kElementIdentifierKey,
+                              ui::ElementIdentifier())
+diff --git a/ui/views/view_class_properties.h b/ui/views/view_class_properties.h
+index 10eaa09f8f..c56719f916 100644
+--- a/ui/views/view_class_properties.h
++++ b/ui/views/view_class_properties.h
+@@ -103,6 +103,12 @@ VIEWS_EXPORT extern const ui::ClassProperty<bool>* const
+ VIEWS_EXPORT extern const ui::ClassProperty<bool>* const
+     kViewDoesNotLayOutChildren;
+ 
++// When set on a bubble's anchor view, the bubble floats centered over the
++// anchor's bounds (GetAnchorBoundsInScreen) without an arrow, instead of
++// pointing at the anchor (Safarium: Chrome's bubbles centered over the page).
++VIEWS_EXPORT extern const ui::ClassProperty<bool>* const
++    kCenterAnchoredBubblesKey;
++
+ // Tag for the view associated with ui::ElementTracker.
+ VIEWS_EXPORT extern const ui::ClassProperty<ui::ElementIdentifier>* const
+     kElementIdentifierKey;
+-- 
+2.54.0 (Apple Git-157)
+

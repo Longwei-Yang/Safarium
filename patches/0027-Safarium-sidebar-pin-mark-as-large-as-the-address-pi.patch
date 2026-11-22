@@ -1,0 +1,60 @@
+From ee2ea94d8721d1d6e8061a570016da133c0772f2 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:55:28 -0500
+Subject: [PATCH 27/35] Safarium: sidebar pin mark as large as the address
+ pill's icons
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The pin on pinned sidebar rows was drawn by an image view that shrank
+it to about half size. It is now drawn unscaled at the page menu (≡)
+icon's size and weight, in the same 16 pt slot 8 pt from the row's
+edge, so it lines up with the ≡ of the current tab.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 0f42309efd..5cee4125f7 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -652,8 +652,11 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _separator.wantsLayer = YES;
+     [self addSubview:_separator];
+ 
++    // Same size and weight as the address pill's page menu (≡) and reload
++    // icons, drawn at its natural size (an image view would shrink it).
+     _pinView = [NSImageView imageViewWithImage:Symbol(@"pin.fill", 12,
+-                                                      NSFontWeightRegular)];
++                                                      NSFontWeightMedium)];
++    _pinView.imageScaling = NSImageScaleNone;
+     _pinView.contentTintColor = NSColor.secondaryLabelColor;
+     _pinView.hidden = YES;
+     _pinView.accessibilityElement = NO;
+@@ -701,12 +704,14 @@ - (void)layout {
+       vertical ? kTabCloseInset : kTabCloseInset + kIconSize + 4;
+   CGFloat trailingReserve = 10;
+   if (!_pinView.hidden) {
+-    const NSSize pin = _pinView.intrinsicContentSize;
+-    _pinView.frame =
+-        NSMakeRect(b.size.width - 12 - pin.width,
+-                   floor((b.size.height - pin.height) / 2), pin.width,
+-                   pin.height);
+-    trailingReserve += pin.width + 6;
++    // The same slot as the current tab's ≡ button (8 pt from the edge), so
++    // the two icons line up down the sidebar.
++    const NSSize pin = _pinView.image.size;
++    const CGFloat height = MAX(kIconSize, pin.height);
++    _pinView.frame = NSMakeRect(b.size.width - 8 - kIconSize,
++                                floor((b.size.height - height) / 2), kIconSize,
++                                height);
++    trailingReserve += kIconSize + 6;
+   }
+   CGFloat maxTitle = MAX(0, b.size.width - leadingReserve - trailingReserve -
+                                 kIconSize - 6);
+-- 
+2.54.0 (Apple Git-157)
+

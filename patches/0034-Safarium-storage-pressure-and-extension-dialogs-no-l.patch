@@ -1,0 +1,84 @@
+From b917e9cdf511ec5e1e72b773374ddf29628a5201 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:11:31 -0500
+Subject: [PATCH 34/35] Safarium: storage-pressure and extension dialogs no
+ longer crash
+
+Both looked up Chrome's BrowserView to find the toolbar and crashed in
+windows without one:
+- StoragePressureBubbleView::ShowBubble ("Free up space to continue",
+  shown when the disk is nearly full and a site writes storage).
+- extensions ShowDialog(browser, ...) (e.g. the external-install error).
+They now use ToolbarButtonProvider::From(), which is the ToolbarView for
+Chrome's windows and safarium::BubbleAnchors (address field) in Safarium;
+the storage bubble falls back to that anchor when there is no app menu.
+Verified with a temporary hook (removed): both show under the address
+field, no crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/extensions/extension_dialog_utils_views.cc |  6 ++++--
+ .../views/storage/storage_pressure_bubble_view.cc | 15 ++++++++++-----
+ 2 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/browser/ui/extensions/extension_dialog_utils_views.cc b/chrome/browser/ui/extensions/extension_dialog_utils_views.cc
+index e59ca9ea38..5ffaa397c8 100644
+--- a/chrome/browser/ui/extensions/extension_dialog_utils_views.cc
++++ b/chrome/browser/ui/extensions/extension_dialog_utils_views.cc
+@@ -6,7 +6,6 @@
+ #include "chrome/browser/ui/extensions/extension_dialog_utils.h"
+ #include "chrome/browser/ui/views/extensions/extension_view_utils.h"
+ #include "chrome/browser/ui/views/extensions/extensions_container_views.h"
+-#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
+ #include "components/constrained_window/constrained_window_views.h"
+ #include "content/public/browser/web_contents.h"
+@@ -103,8 +102,11 @@ void ShowDialog(ExtensionsContainerViews* container,
+ 
+ void ShowDialog(BrowserWindowInterface* browser,
+                 std::unique_ptr<ui::DialogModel> dialog_model) {
++  // ToolbarButtonProvider::From() also covers windows without a BrowserView
++  // (Safarium registers safarium::BubbleAnchors); the BrowserView lookup
++  // crashed there.
+   ToolbarButtonProvider* toolbar_button_provider =
+-      BrowserView::GetBrowserViewForBrowser(browser)->toolbar_button_provider();
++      ToolbarButtonProvider::From(browser);
+   CHECK(toolbar_button_provider);
+ 
+   views::BubbleAnchor anchor =
+diff --git a/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc b/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc
+index d5a5fa8724..e921370aaf 100644
+--- a/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc
++++ b/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc
+@@ -11,7 +11,6 @@
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/storage_pressure_bubble.h"
+ #include "chrome/browser/ui/views/chrome_layout_provider.h"
+-#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -44,10 +43,16 @@ void StoragePressureBubbleView::ShowBubble(const url::Origin& origin) {
+     return;
+   }
+ 
+-  auto* browser_view = BrowserView::GetBrowserViewForBrowser(bwi);
+-  auto* control = browser_view->toolbar_button_provider()->GetAppMenuControl();
+-  views::BubbleAnchor anchor =
+-      control ? control->GetAnchor() : views::BubbleAnchor();
++  // The window's toolbar (Chrome's ToolbarView, or Safarium's
++  // safarium::BubbleAnchors, which has no app menu and anchors to the address
++  // field). Windows without a BrowserView used to crash here.
++  ToolbarButtonProvider* provider = ToolbarButtonProvider::From(bwi);
++  if (!provider) {
++    return;
++  }
++  auto* control = provider->GetAppMenuControl();
++  views::BubbleAnchor anchor = control ? control->GetAnchor()
++                                       : provider->GetBubbleAnchor(std::nullopt);
+   StoragePressureBubbleView* bubble =
+       new StoragePressureBubbleView(anchor, bwi, origin);
+   views::BubbleDialogDelegateView::CreateBubble(bubble)->Show();
+-- 
+2.54.0 (Apple Git-157)
+

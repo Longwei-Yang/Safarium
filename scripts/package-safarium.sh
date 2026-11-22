@@ -32,13 +32,29 @@ echo "== re-sign ad-hoc without hardened runtime"
 mkdir -p "$WORK/stage"
 ditto --noextattr --noqtn "$APP" "$WORK/stage/Safarium.app"
 xattr -cr "$WORK/stage/Safarium.app"
+# Identity for Safarium's updater (safarium_updater.h): a release passes
+# SAFARIUM_TAG=v<version>-fix<N>; anything else is a local build, based on
+# the newest released fix and named *-local-<commit>.dmg.
+COMMIT=$(git -C "$SRC" rev-parse --short=10 HEAD)
+if [[ -n ${SAFARIUM_TAG:-} ]]; then
+  [[ $SAFARIUM_TAG =~ '-fix([0-9]+)$' ]] || { echo "SAFARIUM_TAG must end in -fix<N>"; exit 1; }
+  FIX=${match[1]}; TAG=$SAFARIUM_TAG; SUFFIX=""
+else
+  FIX=${SAFARIUM_BASE_FIX:-$(git -C "${SAFARIUM_REPO:-${0:A:h:h}}" tag -l 'v*-fix*' 2>/dev/null | sed -E 's/.*-fix//' | sort -n | tail -1)}
+  FIX=${FIX:-0}; TAG=local; SUFFIX="-local-$COMMIT"
+fi
+PLIST="$WORK/stage/Safarium.app/Contents/Info.plist"
+plutil -replace SafariumBuild -integer "$FIX" "$PLIST"
+plutil -replace SafariumTag -string "$TAG" "$PLIST"
+plutil -replace SafariumCommit -string "$COMMIT" "$PLIST"
+echo "   $TAG (fix$FIX, $COMMIT)"
 codesign --force --deep --sign - --preserve-metadata=entitlements "$WORK/stage/Safarium.app"
 codesign --verify --deep --strict "$WORK/stage/Safarium.app"
 ln -s /Applications "$WORK/stage/Applications"
 
 echo "== dmg"
 mkdir -p "$DIST"
-DMG="$DIST/Safarium-$VERSION-arm64.dmg"
+DMG="$DIST/Safarium-$VERSION-arm64$SUFFIX.dmg"
 rm -f "$DMG"
 hdiutil create -quiet -volname Safarium -srcfolder "$WORK/stage" -fs HFS+ -format ULMO "$DMG"
 shasum -a 256 "$DMG"

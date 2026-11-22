@@ -1,0 +1,40 @@
+From e313060a1ee2852a974e04eafbd40e34bd05fcb9 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:01:53 -0500
+Subject: [PATCH 33/35] Safarium: closing a pinned tab no longer crashes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closing a pinned tab (⌘W / File > Close Tab) hit CHECK(browser_view) in
+chrome::CloseTab, which wanted Chrome's "press ⌘W again" toast. Windows
+without a BrowserView can't show that toast, so the tab now just closes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/browser_commands.cc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/ui/browser_commands.cc b/chrome/browser/ui/browser_commands.cc
+index ff1659cca7..b8a41789a4 100644
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -1514,11 +1514,11 @@ void CloseTab(BrowserWindowInterface* browser) {
+   }
+ 
+   // If all selected tabs are pinned, show a confirmation toast if one isn't
+-  // already shown.
+-  if (all_selected_tabs_pinned &&
++  // already shown. Windows without a BrowserView (WebUI browser / Safarium)
++  // can't show the toast, so the tab just closes (this used to CHECK).
++  BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  if (all_selected_tabs_pinned && browser_view &&
+       toast_controller->GetCurrentToastId() != ToastId::kClosePinnedTab) {
+-    BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
+-    CHECK(browser_view);
+     ui::Accelerator accelerator;
+     CHECK(
+         browser_view->GetAcceleratorForCommandId(IDC_CLOSE_TAB, &accelerator));
+-- 
+2.54.0 (Apple Git-157)
+

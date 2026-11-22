@@ -1,0 +1,35 @@
+From d0792af5459c4997a5c0c3811c1de1576e1d3eb8 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:14:38 -0500
+Subject: [PATCH 28/35] Safarium: keep the Tab Overview zoom-in off the
+ vertical sidebar
+
+Entering Tab Overview scales the whole card grid up so the current card
+covers the page, then back down. The overview view didn't clip, so in
+vertical mode the enlarged neighbouring cards were drawn over the
+sidebar for the first few frames. It now clips to its bounds (the page
+area), as the zoom out's overlay already did.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 5cee4125f7..ac179a080a 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -3404,6 +3404,10 @@ - (instancetype)initWithFrame:(NSRect)frame pageView:(views::View*)pageView {
+   if ((self = [super initWithFrame:frame])) {
+     _pageView.SetView(pageView);
+     self.wantsLayer = YES;
++    // The zoom into the overview scales the whole grid up and back down;
++    // keep it (and the neighbouring cards it enlarges) inside the page area,
++    // off the vertical sidebar, as the zoom out already is.
++    self.layer.masksToBounds = YES;
+     _thumbnails = [NSMutableDictionary dictionary];
+     _tabs = @[];
+     _shown = @[];
+-- 
+2.54.0 (Apple Git-157)
+
