@@ -1,0 +1,45 @@
+From 07dd06d9cbeb5508362ef25a58852c38aae1826e Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:37:56 -0500
+Subject: [PATCH 46/48] Safarium: traffic lights at Safari's position in the
+ compact layout
+
+f774d70974 set usesSystemTitlebarMetrics so Safarium windows use
+AppKit's own traffic light inset and corner radius; 4e1158b41a dropped
+the setter, leaving Chromium's fixed 13pt inset: the traffic lights sat
+6pt left of Safari's (12 vs 18pt from the leading edge via AX, both 18pt
+from the top).
+
+applyWindowChrome now sets it for the compact layout (18/18, same as
+Safari). The vertical layout keeps Chromium's inset: with AppKit's 19pt,
+reload and New Tab no longer fit beside the traffic lights at the
+sidebar's 240pt minimum width and wrap to a third row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/safarium_tab_bar_host_mac.mm        | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 4dd864b252..d0f359e6ba 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -6195,6 +6195,15 @@ - (void)applyWindowChrome {
+   // either way.
+   const BOOL keepFrame = !(window.styleMask & NSWindowStyleMaskFullScreen);
+   const NSRect frame = window.frame;
++  // Compact: AppKit's own traffic light inset and corner radius for a
++  // unified toolbar (18pt from the left and top, as in Safari) instead of
++  // Chromium's fixed 13pt. Vertical keeps Chromium's inset so the sidebar's
++  // first row of buttons fits beside the traffic lights at its 240pt minimum
++  // width. Set before the toolbar changes, which re-lay out the title bar.
++  if ([window isKindOfClass:[BrowserNativeWidgetWindow class]]) {
++    static_cast<BrowserNativeWidgetWindow*>(window).usesSystemTitlebarMetrics =
++        !_verticalTabs;
++  }
+   if (_verticalTabs) {
+     // AppKit supplies the title bar and standard buttons in fullscreen.
+     window.toolbar = nil;
+-- 
+2.54.0 (Apple Git-157)
+

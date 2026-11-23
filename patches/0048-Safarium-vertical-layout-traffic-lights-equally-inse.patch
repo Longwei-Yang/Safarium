@@ -1,0 +1,44 @@
+From 6d66ca6be2f78109e9891e0589f9bba77e8c0a8a Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:46:09 -0500
+Subject: [PATCH 48/48] Safarium: vertical layout traffic lights equally inset
+ (19pt)
+
+In the toolbarless 52pt title bar AppKit's own leading inset is 20pt,
+so MAX(super, (52 - 14) / 2) put the close button 20pt from the left
+but 19pt from the top. Use the centered value alone: 19/19, the same as
+under a unified toolbar (compact layout, Safari).
+
+Tested: vertical AX close frame 18/18 (button 19/19, AX adds 1pt);
+dragging the sidebar edge stops at the 250pt minimum with the first
+button row beside the traffic lights.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../app_shim/browser_native_widget_window_mac.mm           | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+index 442d4aa2df..592cbf9c32 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -76,12 +76,13 @@ - (CGFloat)_minXTitlebarWidgetInset {
+       if (!_inFullScreen && !window.toolbar &&
+           (window.styleMask & NSWindowStyleMaskFullSizeContentView)) {
+         // Keep the taller toolbarless title bar's controls equally inset
+-        // from the leading and top edges of the window.
++        // from the leading and top edges of the window (19pt in the 52pt
++        // title bar, as under a unified toolbar). AppKit's own value here is
++        // 1pt more.
+         const CGFloat buttonWidth =
+             NSWidth([window standardWindowButton:NSWindowCloseButton].frame);
+         if (buttonWidth > 0) {
+-          return MAX([super _minXTitlebarWidgetInset],
+-                     floor(([self _titlebarHeight] - buttonWidth) / 2));
++          return floor(([self _titlebarHeight] - buttonWidth) / 2);
+         }
+       }
+       return [super _minXTitlebarWidgetInset];
+-- 
+2.54.0 (Apple Git-157)
+

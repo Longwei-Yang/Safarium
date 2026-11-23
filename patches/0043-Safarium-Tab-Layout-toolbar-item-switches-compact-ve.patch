@@ -1,0 +1,160 @@
+From 28ebb0b5ec67807bcdc1e24165f909b916f033dc Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:16:32 -0500
+Subject: [PATCH 43/48] Safarium: Tab Layout toolbar item switches
+ compact/vertical tabs
+
+A new optional item, "Tab Layout" (sidebar.left), in Customize Toolbar
+and in the sidebar's edit palette. It flips vertical_tabs.enabled, like
+Settings > Tabs and View > Show Tabs Vertically. The pref changes after
+the click returns, since switching rebuilds the toolbar or sidebar that
+holds the button. Does nothing when the pref is managed.
+
+Tested: toolbar button switches to vertical, the sidebar button switches
+back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_controller.cc            | 20 +++++++++++
+ .../safarium_tab_bar_controller.h             |  4 +++
+ .../safarium_tab_bar_host_mac.mm              | 36 ++++++++++++++++++-
+ 3 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index 67e8c891e3..6c3c8059ad 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -3,6 +3,7 @@
+ #include <utility>
+ 
+ #include "base/strings/escape.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+@@ -761,6 +762,25 @@ void TabBarController::SetShowHomeButton(bool show) {
+   browser_->GetProfile()->GetPrefs()->SetBoolean(prefs::kShowHomeButton, show);
+ }
+ 
++void TabBarController::ToggleVerticalTabs() {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<TabBarController> controller) {
++                       if (!controller) {
++                         return;
++                       }
++                       PrefService* prefs =
++                           controller->browser_->GetProfile()->GetPrefs();
++                       if (prefs->IsUserModifiablePreference(
++                               prefs::kVerticalTabsEnabled)) {
++                         prefs->SetBoolean(
++                             prefs::kVerticalTabsEnabled,
++                             !prefs->GetBoolean(prefs::kVerticalTabsEnabled));
++                       }
++                     },
++                     weak_factory_.GetWeakPtr()));
++}
++
+ Profile* TabBarController::GetProfile() const {
+   return browser_->GetProfile();
+ }
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index 5e44931f80..9754bca708 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -213,6 +213,10 @@ class TabBarController : public TabStripModelObserver,
+   // Mirrors the toolbar's Home item into the show-home-button pref (the user
+   // added or removed it with Customize Toolbar).
+   void SetShowHomeButton(bool show);
++  // Tab Layout toolbar item: switches between the compact tab bar and the
++  // vertical sidebar (pref vertical_tabs.enabled), after the click returns
++  // (the switch rebuilds the toolbar and sidebar holding the button).
++  void ToggleVerticalTabs();
+ 
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(TabStripModel* tab_strip_model,
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 260a74720d..bcb6abe0c7 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -4258,6 +4258,8 @@ - (NSCollectionViewItem*)collectionView:(NSCollectionView*)collectionView
+ NSToolbarItemIdentifier const kShareItem = @"safarium.share";
+ NSToolbarItemIdentifier const kPrintItem = @"safarium.print";
+ NSToolbarItemIdentifier const kOverviewItem = @"safarium.overview";
++NSToolbarItemIdentifier const kTabLayoutItem = @"safarium.tablayout";
++NSString* const kTabLayoutSymbol = @"sidebar.left";
+ 
+ // Plain C strings: a static array of ObjC pointers would need an exit-time
+ // destructor under ARC.
+@@ -5925,6 +5927,20 @@ - (void)saveSidebarItemIdentifiers:(NSArray<NSString*>*)ids {
+     NSButton* button = _sidebarExtensionButtons[identifier];
+     return button ? @[ button ] : @[];
+   }
++  if ([identifier isEqualToString:kTabLayoutItem]) {
++    if (!_sidebarCommandButtons) {
++      _sidebarCommandButtons = [NSMutableDictionary dictionary];
++    }
++    NSButton* button = _sidebarCommandButtons[identifier];
++    if (!button) {
++      button = SidebarItemButton(Symbol(kTabLayoutSymbol, 14,
++                                        NSFontWeightMedium),
++                                 @"Show Tabs in Toolbar", self,
++                                 @selector(toggleTabLayout:));
++      _sidebarCommandButtons[identifier] = button;
++    }
++    return @[ button ];
++  }
+   for (const CommandItemSpec& spec : kCommandItems) {
+     NSString* specId = @(spec.identifier);
+     if (![identifier isEqualToString:specId]) {
+@@ -6018,6 +6034,7 @@ - (NSString*)labelForItem:(NSString*)identifier image:(NSImage**)image {
+       {kDownloadsItem, @"Downloads", @"arrow.down.circle"},
+       {kShareItem, @"Share", @"square.and.arrow.up"},
+       {kOverviewItem, @"Tab Overview", @"square.on.square"},
++      {kTabLayoutItem, @"Tab Layout", kTabLayoutSymbol},
+   };
+   for (const Fixed& f : fixed) {
+     if ([identifier isEqualToString:f.identifier]) {
+@@ -6234,7 +6251,8 @@ - (void)uninstall {
+       [NSMutableOrderedSet orderedSetWithArray:@[
+     kNavItem, kReloadItem, kTabsItem, kNewTabItem, kHomeItem, kDownloadsItem,
+     kHistoryItem, kBookmarksItem, kShareItem, kPrintItem, kOverviewItem,
+-    NSToolbarSpaceItemIdentifier, NSToolbarFlexibleSpaceItemIdentifier
++    kTabLayoutItem, NSToolbarSpaceItemIdentifier,
++    NSToolbarFlexibleSpaceItemIdentifier
+   ]];
+   if (auto* extensions = _controller ? _controller->GetExtensionsContainer()
+                                      : nullptr) {
+@@ -6334,6 +6352,16 @@ - (NSToolbarItem*)toolbar:(NSToolbar*)toolbar
+     item.paletteLabel = @"Tab Overview";
+     return item;
+   }
++  if ([identifier isEqualToString:kTabLayoutItem]) {
++    // Shown in the toolbar only in the compact layout; the vertical layout's
++    // sidebar has its own button (-sidebarButtonsForItem:).
++    NSToolbarItem* item = [self buttonItem:identifier
++                                     label:@"Tab Layout"
++                                    symbol:kTabLayoutSymbol
++                                    action:@selector(toggleTabLayout:)];
++    item.toolTip = @"Show Tabs in Sidebar";
++    return item;
++  }
+   if ([identifier isEqualToString:kShareItem]) {
+     NSSharingServicePickerToolbarItem* item =
+         [[NSSharingServicePickerToolbarItem alloc]
+@@ -6896,6 +6924,12 @@ - (void)runCommand:(id)sender {
+   }
+ }
+ 
++- (void)toggleTabLayout:(id)sender {
++  if (_controller) {
++    _controller->ToggleVerticalTabs();
++  }
++}
++
+ - (void)sidebarBack:(id)sender {
+   if (_controller) {
+     _controller->GoBack();
+-- 
+2.54.0 (Apple Git-157)
+

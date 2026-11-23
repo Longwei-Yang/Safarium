@@ -1,0 +1,77 @@
+From 2726da77a329599477b66946e1efa84f4e0f577a Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:41:38 -0500
+Subject: [PATCH 47/48] Safarium: system traffic lights in the vertical layout
+ too; wider sidebar
+
+The vertical layout now also uses AppKit's traffic light position (19pt
+from the left, 18pt from the top). That needs about 244pt for the
+sidebar's default first row (back/forward, reload/new tab) beside them,
+so the sidebar's minimum width goes from 240 to 250 (saved widths below
+it are clamped) and the default from 250 to 260.
+
+Tested: saved 240 -> 250, first row fits; no saved width -> 260.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../browser/ui/webui_browser/safarium_root_view.cc   |  4 +++-
+ chrome/browser/ui/webui_browser/safarium_root_view.h |  2 +-
+ .../ui/webui_browser/safarium_tab_bar_host_mac.mm    | 12 ++++++------
+ 3 files changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.cc b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+index 9c95a49ee1..d34fefb9f3 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.cc
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.cc
+@@ -24,7 +24,9 @@ namespace safarium {
+ namespace {
+ constexpr int kMinSidePanelWidth = 320;  // Chrome's side panel minimum.
+ constexpr int kResizeAreaWidth = 6;
+-constexpr int kMinSidebarWidth = 240;    // Vertical tabs sidebar.
++// Vertical tabs sidebar. The minimum fits the default first row (back/
++// forward, reload/new tab) beside the traffic lights at AppKit's position.
++constexpr int kMinSidebarWidth = 250;
+ constexpr int kMaxSidebarWidth = 480;
+ 
+ // The panel's separator, in the same color as the sidebar's native edge line
+diff --git a/chrome/browser/ui/webui_browser/safarium_root_view.h b/chrome/browser/ui/webui_browser/safarium_root_view.h
+index 85fd8e9f48..ef2d78ee53 100644
+--- a/chrome/browser/ui/webui_browser/safarium_root_view.h
++++ b/chrome/browser/ui/webui_browser/safarium_root_view.h
+@@ -156,7 +156,7 @@ class SafariumRootView : public views::View,
+   raw_ptr<views::WebView> contents_web_view_ = nullptr;
+   raw_ptr<views::View> side_panel_separator_ = nullptr;
+   raw_ptr<VerticalSidebarView> sidebar_ = nullptr;
+-  int sidebar_width_ = 250;
++  int sidebar_width_ = 260;
+   bool content_fullscreen_ = false;
+   raw_ptr<SidePanelHeaderView> side_panel_header_ = nullptr;
+   raw_ptr<views::View> side_panel_content_ = nullptr;
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index d0f359e6ba..fa44d72319 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -6195,14 +6195,14 @@ - (void)applyWindowChrome {
+   // either way.
+   const BOOL keepFrame = !(window.styleMask & NSWindowStyleMaskFullScreen);
+   const NSRect frame = window.frame;
+-  // Compact: AppKit's own traffic light inset and corner radius for a
+-  // unified toolbar (18pt from the left and top, as in Safari) instead of
+-  // Chromium's fixed 13pt. Vertical keeps Chromium's inset so the sidebar's
+-  // first row of buttons fits beside the traffic lights at its 240pt minimum
+-  // width. Set before the toolbar changes, which re-lay out the title bar.
++  // AppKit's own traffic light inset and corner radius (compact: 18pt from
++  // the left and top, as in Safari; vertical: equally inset in the 52pt
++  // title bar row) instead of Chromium's fixed 13pt. The sidebar's minimum
++  // width (SafariumRootView) leaves room for its default first row beside
++  // them.
+   if ([window isKindOfClass:[BrowserNativeWidgetWindow class]]) {
+     static_cast<BrowserNativeWidgetWindow*>(window).usesSystemTitlebarMetrics =
+-        !_verticalTabs;
++        YES;
+   }
+   if (_verticalTabs) {
+     // AppKit supplies the title bar and standard buttons in fullscreen.
+-- 
+2.54.0 (Apple Git-157)
+

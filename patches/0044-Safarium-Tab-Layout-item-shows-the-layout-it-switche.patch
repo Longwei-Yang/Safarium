@@ -1,0 +1,61 @@
+From 49e5501ca7d2bbe7c6668dc7265c37b5fa891fb5 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:20:57 -0500
+Subject: [PATCH 44/48] Safarium: Tab Layout item shows the layout it switches
+ to
+
+sidebar.left reads as "show sidebar". The item now shows a side bar
+(rectangle.leftthird.inset.filled) in the compact layout's toolbar and a
+top bar (rectangle.topthird.inset.filled) in the vertical sidebar.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/safarium_tab_bar_host_mac.mm     | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index bcb6abe0c7..c70fcebe0e 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -4259,7 +4259,10 @@ - (NSCollectionViewItem*)collectionView:(NSCollectionView*)collectionView
+ NSToolbarItemIdentifier const kPrintItem = @"safarium.print";
+ NSToolbarItemIdentifier const kOverviewItem = @"safarium.overview";
+ NSToolbarItemIdentifier const kTabLayoutItem = @"safarium.tablayout";
+-NSString* const kTabLayoutSymbol = @"sidebar.left";
++// The Tab Layout item shows the layout it switches to: a side bar in the
++// compact layout's toolbar, a top bar in the vertical layout's sidebar.
++NSString* const kToVerticalSymbol = @"rectangle.leftthird.inset.filled";
++NSString* const kToCompactSymbol = @"rectangle.topthird.inset.filled";
+ 
+ // Plain C strings: a static array of ObjC pointers would need an exit-time
+ // destructor under ARC.
+@@ -5933,7 +5936,7 @@ - (void)saveSidebarItemIdentifiers:(NSArray<NSString*>*)ids {
+     }
+     NSButton* button = _sidebarCommandButtons[identifier];
+     if (!button) {
+-      button = SidebarItemButton(Symbol(kTabLayoutSymbol, 14,
++      button = SidebarItemButton(Symbol(kToCompactSymbol, 14,
+                                         NSFontWeightMedium),
+                                  @"Show Tabs in Toolbar", self,
+                                  @selector(toggleTabLayout:));
+@@ -6034,7 +6037,7 @@ - (NSString*)labelForItem:(NSString*)identifier image:(NSImage**)image {
+       {kDownloadsItem, @"Downloads", @"arrow.down.circle"},
+       {kShareItem, @"Share", @"square.and.arrow.up"},
+       {kOverviewItem, @"Tab Overview", @"square.on.square"},
+-      {kTabLayoutItem, @"Tab Layout", kTabLayoutSymbol},
++      {kTabLayoutItem, @"Tab Layout", kToCompactSymbol},
+   };
+   for (const Fixed& f : fixed) {
+     if ([identifier isEqualToString:f.identifier]) {
+@@ -6357,7 +6360,7 @@ - (NSToolbarItem*)toolbar:(NSToolbar*)toolbar
+     // sidebar has its own button (-sidebarButtonsForItem:).
+     NSToolbarItem* item = [self buttonItem:identifier
+                                      label:@"Tab Layout"
+-                                    symbol:kTabLayoutSymbol
++                                    symbol:kToVerticalSymbol
+                                     action:@selector(toggleTabLayout:)];
+     item.toolTip = @"Show Tabs in Sidebar";
+     return item;
+-- 
+2.54.0 (Apple Git-157)
+

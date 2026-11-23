@@ -28,7 +28,7 @@ The interface and its animations will keep being refined.
 
 **Compact tab bar.** Tabs share one row with the address field, as in Safari's compact layout. The current tab is the address field. Tabs show hover cards, can be dragged to reorder, and can be torn off into a new window.
 
-**Vertical tabs.** View › Show Tabs Vertically, or Settings › Tabs, moves the tabs into a left sidebar. Drag the sidebar's right edge to resize it. The window controls and toolbar buttons sit at its top.
+**Vertical tabs.** View › Show Tabs Vertically, Settings › Tabs, or the Tab Layout toolbar button (add it with Customize Toolbar…) moves the tabs into a left sidebar. The window keeps its size and place when you switch; the page takes the room the toolbar or sidebar gives up. Drag the sidebar's right edge to resize it. The window controls and toolbar buttons sit at its top.
 
 ![Vertical tabs](docs/screenshots/vertical.png)
 
@@ -53,6 +53,8 @@ The interface and its animations will keep being refined.
 **Reopen your last session.** History › Reopen All Windows from Last Session brings back the windows and tabs from before you quit, or from before a crash.
 
 **Downloads on quit.** Quitting or closing the last window while a download is in progress asks first.
+
+**Crashed tabs.** If a tab's page crashes, the tab shows Chrome's "Aw, Snap!" page with a Reload button.
 
 **Tab status.** A tab playing sound shows a speaker; click it to mute or unmute the tab. Tabs using the camera, microphone or screen sharing show a red indicator, and picture-in-picture and connected devices have their own icons.
 
@@ -114,7 +116,7 @@ autoninja -C out/Release chrome
 SAFARIUM_SRC="$PWD" /path/to/Safarium/scripts/package-safarium.sh
 ```
 
-The script stamps the app for the updater: without `SAFARIUM_TAG` the DMG is a local build (`…-local-<commit>.dmg`, based on the newest `-fixN` tag of this repository), which Safarium › Install Local Build… (hold Option in the Safarium menu) installs from `~/chromium/dist`. A release is packaged with `SAFARIUM_TAG=v<version>-fix<N>`.
+The script stamps the app for the updater: without `SAFARIUM_TAG` the DMG is a local build (`…-local-<commit>.dmg`, based on the newest `-fixN` tag of your clone of this repository; run `git fetch --tags` first), which Safarium › Install Local Build… (hold Option in the Safarium menu) installs from `~/chromium/dist`. A release is packaged with `SAFARIUM_TAG=v<version>-fix<N>`.
 
 `build/args.gn` builds the branded, standalone release app with proprietary codecs (H.264/AAC playback). With a Developer ID you can sign and notarize through Chromium's `sign_chrome.py --identity <ID> --notarize` instead of the packaging script.
 

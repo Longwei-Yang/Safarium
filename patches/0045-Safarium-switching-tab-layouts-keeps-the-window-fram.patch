@@ -1,0 +1,52 @@
+From a172dc522564582ad5bcea75bc3eabf4cc7f1abd Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:27:37 -0500
+Subject: [PATCH 45/48] Safarium: switching tab layouts keeps the window frame
+
+Removing the toolbar and adding the full-size content view (vertical)
+made AppKit keep the content size and shrink the window: in one test
+1200x846 became 1200x762 and the page got shorter instead of running to
+the top edge. applyWindowChrome now puts the window frame back after
+changing the chrome, outside full screen; the page takes the space the
+toolbar or sidebar gives up, as in Safari. Full screen is unchanged.
+
+Tested (1200x1221 window): compact page 1200x1169, vertical 960x1221,
+frame unchanged over repeated switches; switching in full screen keeps
+full screen and exiting restores the same frame from either layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/safarium_tab_bar_host_mac.mm      | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index c70fcebe0e..4dd864b252 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -6188,6 +6188,13 @@ - (void)applyWindowChrome {
+   if (!window) {
+     return;
+   }
++  // Adding or removing the toolbar and the full-size content view makes
++  // AppKit keep the content size and resize the window. Switching layouts
++  // keeps the window where it is instead (the page gets the space the
++  // toolbar or sidebar gives up), as in Safari. Full screen fills the screen
++  // either way.
++  const BOOL keepFrame = !(window.styleMask & NSWindowStyleMaskFullScreen);
++  const NSRect frame = window.frame;
+   if (_verticalTabs) {
+     // AppKit supplies the title bar and standard buttons in fullscreen.
+     window.toolbar = nil;
+@@ -6212,6 +6219,9 @@ - (void)applyWindowChrome {
+     window.toolbar = _toolbar;
+     _toolbar.visible = !_contentFullscreen;
+   }
++  if (keepFrame && !NSEqualRects(window.frame, frame)) {
++    [window setFrame:frame display:YES];
++  }
+   [self refreshItems];
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
