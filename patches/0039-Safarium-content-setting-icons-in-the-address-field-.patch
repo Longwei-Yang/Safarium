@@ -1,0 +1,885 @@
+From a6d8c8940539dc62809102228f0d096b9d422220 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:29:27 -0500
+Subject: [PATCH 39/41] Safarium: content-setting icons in the address field,
+ native popover
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The location bar hook UpdateContentSettingsIcons() now reaches the tab bar.
+The current page's indicators come from Chrome's ContentSettingImageModel
+(pop-ups blocked, location / notifications / camera / microphone in use or
+blocked, automatic downloads, sound muted…) and sit in the address field,
+right to left from the page menu, after the tab alert; up to three, SF
+Symbols where one fits and Chrome's icon otherwise. Clicking one shows
+Chrome's ContentSettingBubbleModel as a native NSPopover under it: title,
+message, blocked items as links, the allow / block choice, Manage, Done.
+The choice is committed when the popover closes, as Chrome's bubble does;
+it closes when the tab changes.
+
+The hover reload button now appears left of the indicators, so they (and a
+popover anchored to one) never move when the pointer enters the field.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/webui_browser/BUILD.gn      |   4 +
+ .../safarium_content_setting_popover.h        |  30 ++
+ .../safarium_content_setting_popover.mm       | 359 ++++++++++++++++++
+ .../safarium_tab_bar_controller.cc            |  43 +++
+ .../safarium_tab_bar_controller.h             |  29 ++
+ .../safarium_tab_bar_host_mac.mm              | 153 +++++++-
+ .../ui/webui_browser/webui_browser_window.cc  |   6 +
+ .../ui/webui_browser/webui_browser_window.h   |   3 +
+ .../webui_browser/webui_stub_location_bar.cc  |   5 +
+ 9 files changed, 619 insertions(+), 13 deletions(-)
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_content_setting_popover.h
+ create mode 100644 chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm
+
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index c8c59e5b64..2ff4cbfb6d 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -127,6 +127,8 @@ source_set("impl") {
+       "safarium_bookmark_panel_mac.mm",
+       "safarium_bubble_anchors.cc",
+       "safarium_bubble_anchors.h",
++      "safarium_content_setting_popover.h",
++      "safarium_content_setting_popover.mm",
+       "safarium_downloads_popover.h",
+       "safarium_downloads_popover.mm",
+       "safarium_root_view.cc",
+@@ -198,6 +200,8 @@ source_set("impl") {
+     "//chrome/browser/ui/side_panel:side_panel_views_dependent",
+     "//chrome/browser/ui/tabs:tabs_public",
+     "//chrome/browser/ui/tabs/alert:tab_alert",
++    "//chrome/browser/ui:browser_content_setting_bubble_model_delegate",
++    "//chrome/browser/ui/content_settings",
+     "//chrome/browser/ui/tabs/tab_drag_api",
+     "//chrome/browser/ui/tabs/tab_drag_api:impl",
+     "//chrome/browser/ui/tabs/tab_strip_api",
+diff --git a/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h
+new file mode 100644
+index 0000000000..9cca8f0071
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_CONTENT_SETTING_POPOVER_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_CONTENT_SETTING_POPOVER_H_
++
++#import <AppKit/AppKit.h>
++
++#include <memory>
++
++class ContentSettingBubbleModel;
++
++namespace safarium {
++
++// Chrome's content-setting bubble (pop-ups blocked, camera in use, location
++// blocked…) as a native popover under `anchor`, the indicator in the
++// address field. Owns `model` while open and commits its choice when it
++// closes, as Chrome's own bubble does; then runs `on_close`. Opening another
++// one closes this one.
++void ShowContentSettingPopover(std::unique_ptr<ContentSettingBubbleModel> model,
++                               NSView* anchor,
++                               void (^on_close)(void));
++
++// Closes the open content-setting popover, if any (e.g. the tab changed).
++void CloseContentSettingPopover();
++
++}  // namespace safarium
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SAFARIUM_CONTENT_SETTING_POPOVER_H_
+diff --git a/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm
+new file mode 100644
+index 0000000000..c61021be8e
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm
+@@ -0,0 +1,359 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "chrome/browser/ui/webui_browser/safarium_content_setting_popover.h"
++
++#include <utility>
++
++#include "base/strings/sys_string_conversions.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/content_settings/content_setting_bubble_model.h"
++#include "ui/events/event.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/types/event_type.h"
++#include "ui/gfx/geometry/point_f.h"
++
++@class SafariumContentSettingPopover;
++
++namespace {
++
++constexpr CGFloat kWidth = 300;
++constexpr CGFloat kInset = 14;
++
++// Keeps the open popover alive (NSPopover does not retain its controller
++// beyond showing it).
++SafariumContentSettingPopover* g_open_popover = nil;
++
++}  // namespace
++
++@interface SafariumContentSettingPopover : NSViewController <NSPopoverDelegate>
++- (instancetype)initWithModel:(std::unique_ptr<ContentSettingBubbleModel>)model
++                      onClose:(void (^)(void))onClose;
++- (void)showRelativeToView:(NSView*)anchor;
++- (int)selectedRadio;
++- (void)rebuild;
++- (void)close;
++@end
++
++namespace {
++
++// The model reports back through this (radio choice, list changes, close).
++class PopoverOwner : public ContentSettingBubbleModel::Owner {
++ public:
++  explicit PopoverOwner(SafariumContentSettingPopover* controller)
++      : controller_(controller) {}
++  void OnListItemAdded(const ContentSettingBubbleModel::ListItem&) override {
++    [controller_ rebuild];
++  }
++  void OnListItemRemovedAt(int) override { [controller_ rebuild]; }
++  int GetSelectedRadioOption() override { return [controller_ selectedRadio]; }
++  void CloseBubble() override { [controller_ close]; }
++
++ private:
++  __weak SafariumContentSettingPopover* controller_;
++};
++
++NSTextField* WrappingLabel(const std::u16string& text,
++                           NSFont* font,
++                           NSColor* color) {
++  NSTextField* label =
++      [NSTextField wrappingLabelWithString:base::SysUTF16ToNSString(text)];
++  label.font = font;
++  label.textColor = color;
++  label.preferredMaxLayoutWidth = kWidth - 2 * kInset;
++  label.selectable = NO;
++  return label;
++}
++
++NSButton* LinkButton(const std::u16string& text, id target, SEL action) {
++  NSButton* button = [NSButton buttonWithTitle:base::SysUTF16ToNSString(text)
++                                        target:target
++                                        action:action];
++  button.bordered = NO;
++  button.attributedTitle = [[NSAttributedString alloc]
++      initWithString:base::SysUTF16ToNSString(text)
++          attributes:@{
++            NSForegroundColorAttributeName : NSColor.linkColor,
++            NSFontAttributeName : [NSFont systemFontOfSize:13],
++          }];
++  button.lineBreakMode = NSLineBreakByTruncatingMiddle;
++  // No focus highlight on the first link when the popover opens.
++  button.refusesFirstResponder = YES;
++  [button setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
++                                   forOrientation:
++                                       NSLayoutConstraintOrientationHorizontal];
++  return button;
++}
++
++}  // namespace
++
++@implementation SafariumContentSettingPopover {
++  std::unique_ptr<ContentSettingBubbleModel> _model;
++  std::unique_ptr<PopoverOwner> _owner;
++  NSPopover* _popover;
++  NSStackView* _stack;
++  int _selectedRadio;
++  BOOL _closed;
++  void (^_onClose)(void);
++}
++
++- (instancetype)initWithModel:(std::unique_ptr<ContentSettingBubbleModel>)model
++                      onClose:(void (^)(void))onClose {
++  if ((self = [super initWithNibName:nil bundle:nil])) {
++    _onClose = [onClose copy];
++    _model = std::move(model);
++    _owner = std::make_unique<PopoverOwner>(self);
++    _model->set_owner(_owner.get());
++    _selectedRadio = _model->bubble_content().radio_group.default_item;
++  }
++  return self;
++}
++
++- (void)loadView {
++  _stack = [NSStackView stackViewWithViews:@[]];
++  _stack.orientation = NSUserInterfaceLayoutOrientationVertical;
++  _stack.alignment = NSLayoutAttributeLeading;
++  _stack.spacing = 8;
++  _stack.edgeInsets = NSEdgeInsetsMake(kInset, kInset, kInset, kInset);
++  [_stack.widthAnchor constraintEqualToConstant:kWidth].active = YES;
++  self.view = _stack;
++  [self rebuild];
++}
++
++- (void)rebuild {
++  if (!_stack || !_model) {
++    return;
++  }
++  for (NSView* view in [_stack.arrangedSubviews copy]) {
++    [_stack removeArrangedSubview:view];
++    [view removeFromSuperview];
++  }
++  const ContentSettingBubbleModel::BubbleContent& content =
++      _model->bubble_content();
++
++  if (!content.title.empty()) {
++    [_stack addArrangedSubview:WrappingLabel(content.title,
++                                             [NSFont boldSystemFontOfSize:13],
++                                             NSColor.labelColor)];
++  }
++  for (const std::u16string* text : {&content.subtitle, &content.message}) {
++    if (!text->empty()) {
++      [_stack addArrangedSubview:WrappingLabel(*text,
++                                               [NSFont systemFontOfSize:12],
++                                               NSColor.secondaryLabelColor)];
++    }
++  }
++
++  // Blocked pop-ups / redirects…: links that open them.
++  for (size_t i = 0; i < content.list_items.size(); ++i) {
++    const ContentSettingBubbleModel::ListItem& item = content.list_items[i];
++    const std::u16string& text =
++        item.title.empty() ? item.description : item.title;
++    NSView* row;
++    if (item.has_link) {
++      NSButton* link = LinkButton(text, self, @selector(listItemClicked:));
++      link.tag = static_cast<NSInteger>(i);
++      row = link;
++    } else {
++      row = WrappingLabel(text, [NSFont systemFontOfSize:13],
++                          NSColor.labelColor);
++    }
++    [_stack addArrangedSubview:row];
++    [row.widthAnchor constraintLessThanOrEqualToConstant:kWidth - 2 * kInset]
++        .active = YES;
++  }
++
++  // "Always allow …" / "Continue blocking": radio buttons sharing one
++  // action, which AppKit treats as one group.
++  if (content.is_user_modifiable) {
++    for (size_t i = 0; i < content.radio_group.radio_items.size(); ++i) {
++      NSButton* radio = [NSButton
++          radioButtonWithTitle:base::SysUTF16ToNSString(
++                                   content.radio_group.radio_items[i])
++                        target:self
++                        action:@selector(radioClicked:)];
++      radio.tag = static_cast<NSInteger>(i);
++      radio.state = static_cast<int>(i) == _selectedRadio
++                        ? NSControlStateValueOn
++                        : NSControlStateValueOff;
++      radio.lineBreakMode = NSLineBreakByWordWrapping;
++      [_stack addArrangedSubview:radio];
++      [radio.widthAnchor
++          constraintLessThanOrEqualToConstant:kWidth - 2 * kInset]
++          .active = YES;
++    }
++  }
++
++  if (!content.custom_link.empty()) {
++    NSButton* link =
++        LinkButton(content.custom_link, self, @selector(customLinkClicked:));
++    link.enabled = content.custom_link_enabled;
++    [_stack addArrangedSubview:link];
++  }
++
++  // Bottom row: Manage (button or checkbox) on the leading side, then
++  // Cancel / Done.
++  NSMutableArray<NSView*>* buttons = [NSMutableArray array];
++  const std::u16string& manage = content.manage_text;
++  if (!manage.empty()) {
++    if (content.manage_text_style ==
++        ContentSettingBubbleModel::ManageTextStyle::kButton) {
++      NSButton* button =
++          [NSButton buttonWithTitle:base::SysUTF16ToNSString(manage)
++                             target:self
++                             action:@selector(manageClicked:)];
++      button.toolTip = base::SysUTF16ToNSString(content.manage_tooltip);
++      [buttons addObject:button];
++    } else if (content.manage_text_style ==
++               ContentSettingBubbleModel::ManageTextStyle::kCheckbox) {
++      NSButton* box =
++          [NSButton checkboxWithTitle:base::SysUTF16ToNSString(manage)
++                               target:self
++                               action:@selector(manageCheckboxClicked:)];
++      [buttons addObject:box];
++    }
++  }
++  NSView* spacer = [[NSView alloc] initWithFrame:NSZeroRect];
++  [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow
++                     forOrientation:NSLayoutConstraintOrientationHorizontal];
++  [buttons addObject:spacer];
++  if (!content.cancel_button_text.empty()) {
++    [buttons addObject:[NSButton buttonWithTitle:base::SysUTF16ToNSString(
++                                                     content.cancel_button_text)
++                                          target:self
++                                          action:@selector(cancelClicked:)]];
++  }
++  NSButton* done = [NSButton
++      buttonWithTitle:content.done_button_text.empty()
++                          ? @"Done"
++                          : base::SysUTF16ToNSString(content.done_button_text)
++               target:self
++               action:@selector(doneClicked:)];
++  done.keyEquivalent = @"\r";
++  [buttons addObject:done];
++  NSView* lastBeforeRow = _stack.arrangedSubviews.lastObject;
++  NSStackView* row = [NSStackView stackViewWithViews:buttons];
++  row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
++  row.spacing = 8;
++  [_stack addArrangedSubview:row];
++  [row.widthAnchor constraintEqualToConstant:kWidth - 2 * kInset].active = YES;
++  if (lastBeforeRow) {
++    [_stack setCustomSpacing:14 afterView:lastBeforeRow];
++  }
++
++  [_stack layoutSubtreeIfNeeded];
++  self.preferredContentSize = _stack.fittingSize;
++}
++
++- (void)showRelativeToView:(NSView*)anchor {
++  _popover = [[NSPopover alloc] init];
++  _popover.contentViewController = self;
++  _popover.behavior = NSPopoverBehaviorTransient;
++  _popover.animates = YES;
++  _popover.delegate = self;
++  [_popover showRelativeToRect:anchor.bounds
++                        ofView:anchor
++                 preferredEdge:NSRectEdgeMaxY];
++  g_open_popover = self;
++}
++
++- (int)selectedRadio {
++  return _selectedRadio;
++}
++
++- (void)close {
++  [_popover performClose:nil];
++}
++
++// Chrome commits the radio choice when its bubble closes, however it closes.
++- (void)popoverDidClose:(NSNotification*)notification {
++  if (!_closed && _model) {
++    _closed = YES;
++    _model->CommitChanges();
++    _model->set_owner(nullptr);
++  }
++  if (_onClose) {
++    auto onClose = _onClose;
++    _onClose = nil;
++    onClose();
++  }
++  if (g_open_popover == self) {
++    g_open_popover = nil;
++  }
++}
++
++- (void)listItemClicked:(NSButton*)sender {
++  if (!_model) {
++    return;
++  }
++  // A plain left click (Chrome picks the disposition from the flags).
++  ui::MouseEvent event(ui::EventType::kMousePressed, gfx::PointF(),
++                       gfx::PointF(), base::TimeTicks::Now(),
++                       ui::EF_LEFT_MOUSE_BUTTON, ui::EF_LEFT_MOUSE_BUTTON);
++  _model->OnListItemClicked(static_cast<int>(sender.tag), event);
++}
++
++- (void)radioClicked:(NSButton*)sender {
++  _selectedRadio = static_cast<int>(sender.tag);
++}
++
++- (void)customLinkClicked:(id)sender {
++  if (_model) {
++    _model->OnCustomLinkClicked();
++  }
++  [self close];
++}
++
++- (void)manageClicked:(id)sender {
++  if (_model) {
++    _model->OnManageButtonClicked();
++  }
++  [self close];
++}
++
++- (void)manageCheckboxClicked:(NSButton*)sender {
++  if (_model) {
++    _model->OnManageCheckboxChecked(sender.state == NSControlStateValueOn);
++  }
++}
++
++- (void)cancelClicked:(id)sender {
++  if (_model) {
++    _model->OnCancelButtonClicked();
++  }
++  [self close];
++}
++
++- (void)doneClicked:(id)sender {
++  if (_model) {
++    _model->OnDoneButtonClicked();
++  }
++  [self close];
++}
++
++@end
++
++namespace safarium {
++
++void ShowContentSettingPopover(std::unique_ptr<ContentSettingBubbleModel> model,
++                               NSView* anchor,
++                               void (^on_close)(void)) {
++  if (!model || !anchor.window) {
++    if (on_close) {
++      on_close();
++    }
++    return;
++  }
++  [g_open_popover close];
++  SafariumContentSettingPopover* popover =
++      [[SafariumContentSettingPopover alloc] initWithModel:std::move(model)
++                                                   onClose:on_close];
++  [popover showRelativeToView:anchor];
++}
++
++void CloseContentSettingPopover() {
++  [g_open_popover close];
++}
++
++}  // namespace safarium
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index fc7d85bcf5..1994e14f00 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -13,6 +13,9 @@
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "ui/base/base_window.h"
+ #include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/browser_content_setting_bubble_model_delegate.h"
++#include "chrome/browser/ui/content_settings/content_setting_bubble_model.h"
++#include "chrome/browser/ui/content_settings/content_setting_image_model.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_muted_utils.h"
+@@ -304,6 +307,24 @@ BarState TabBarController::BuildState() const {
+       }
+     }
+     if (item.active) {
++      if (content_setting_models_.empty()) {
++        content_setting_models_ =
++            ContentSettingImageModel::GenerateContentSettingImageModels();
++      }
++      for (size_t m = 0; m < content_setting_models_.size(); ++m) {
++        ContentSettingImageModel* image_model = content_setting_models_[m].get();
++        image_model->Update(contents);
++        if (!image_model->is_visible()) {
++          continue;
++        }
++        ContentSettingItem setting;
++        setting.model_index = static_cast<int>(m);
++        setting.image_type = static_cast<int>(image_model->image_type());
++        setting.blocked = image_model->is_blocked();
++        setting.tooltip = image_model->get_tooltip();
++        setting.icon = image_model->GetIcon(SK_ColorBLACK);
++        state.content_settings.push_back(std::move(setting));
++      }
+       state.is_loading = item.loading;
+       state.load_progress = contents->GetLoadProgress();
+       state.can_go_back = contents->GetController().CanGoBack();
+@@ -681,6 +702,28 @@ void TabBarController::ExecuteTabMenuCommand(int64_t tab_id,
+   }
+ }
+ 
++std::unique_ptr<ContentSettingBubbleModel>
++TabBarController::CreateContentSettingBubble(int model_index) {
++  content::WebContents* contents =
++      browser_->GetTabStripModel()->GetActiveWebContents();
++  if (!contents || model_index < 0 ||
++      model_index >= static_cast<int>(content_setting_models_.size())) {
++    return nullptr;
++  }
++  ContentSettingImageModel* image_model =
++      content_setting_models_[model_index].get();
++  image_model->Update(contents);
++  if (!image_model->is_visible()) {
++    return nullptr;
++  }
++  return image_model->CreateBubbleModel(
++      BrowserContentSettingBubbleModelDelegate::From(browser_), contents);
++}
++
++void TabBarController::ContentSettingsChanged() {
++  PushState();
++}
++
+ bool TabBarController::IsTabMuted(int64_t tab_id) const {
+   tabs::TabInterface* tab = FindTab(tab_id);
+   return tab && tab->GetContents() && tab->GetContents()->IsAudioMuted();
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index cf1cf69e3b..30d5cdbc46 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -27,6 +27,8 @@
+ #include "ui/gfx/native_ui_types.h"
+ 
+ class BrowserWindowInterface;
++class ContentSettingBubbleModel;
++class ContentSettingImageModel;
+ class Profile;
+ class WebUIToolbarExtensionsContainer;
+ 
+@@ -59,8 +61,24 @@ struct TabItem {
+   std::u16string alert_text;
+ };
+ 
++// A content-setting indicator for the current page (pop-ups blocked, camera
++// in use, location blocked…), from Chrome's ContentSettingImageModel.
++struct ContentSettingItem {
++  // Pass back to TabBarController::CreateContentSettingBubble().
++  int model_index = 0;
++  // toolbar_ui_api::mojom::ContentSettingImageType.
++  int image_type = 0;
++  bool blocked = false;
++  std::u16string tooltip;
++  // Chrome's own icon (with its blocked badge), for types without an SF
++  // Symbol.
++  gfx::Image icon;
++};
++
+ struct BarState {
+   std::vector<TabItem> tabs;
++  // Indicators for the current tab, in Chrome's order.
++  std::vector<ContentSettingItem> content_settings;
+   int active_index = -1;
+   bool can_go_back = false;
+   bool can_go_forward = false;
+@@ -141,6 +159,13 @@ class TabBarController : public TabStripModelObserver,
+   bool IsTabMenuCommandEnabled(int64_t tab_id, TabMenuCommand command) const;
+   void ExecuteTabMenuCommand(int64_t tab_id, TabMenuCommand command);
+   bool IsTabMuted(int64_t tab_id) const;
++
++  // The bubble behind a content-setting indicator, for the current page;
++  // null if its state is gone (refresh the icons instead).
++  std::unique_ptr<ContentSettingBubbleModel> CreateContentSettingBubble(
++      int model_index);
++  // Chrome's location bar hook: the page's content-setting state changed.
++  void ContentSettingsChanged();
+   bool IsTabPinned(int64_t tab_id) const;
+   GURL TabURL(int64_t tab_id) const;
+ 
+@@ -218,6 +243,10 @@ class TabBarController : public TabStripModelObserver,
+   PrefChangeRegistrar pref_change_registrar_;
+   int64_t hover_card_tab_ = 0;
+   std::map<int64_t, base::CallbackListSubscription> alert_subscriptions_;
++  // One of each content-setting indicator, as Chrome's location bar keeps;
++  // updated for the current page in BuildState() (hence mutable).
++  mutable std::vector<std::unique_ptr<ContentSettingImageModel>>
++      content_setting_models_;
+   std::unique_ptr<ThumbnailImage::Subscription> hover_card_thumbnail_;
+   base::ScopedObservation<TabResourceUsageCollector,
+                           TabResourceUsageCollector::Observer>
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index f9644f81e7..84bc71d844 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -28,7 +28,10 @@
+ #include "chrome/browser/extensions/extension_context_menu_model.h"
+ #include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_extensions_container.h"
++#include "chrome/browser/ui/content_settings/content_setting_bubble_model.h"
++#include "chrome/browser/ui/content_settings/content_setting_image_model.h"
+ #import "chrome/browser/ui/webui_browser/safarium_bookmark_panel.h"
++#import "chrome/browser/ui/webui_browser/safarium_content_setting_popover.h"
+ #import "chrome/browser/ui/webui_browser/safarium_downloads_popover.h"
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+@@ -158,6 +161,56 @@ NSPoint ScreenPointForMouseEvent(NSEvent* event) {
+   }
+ }
+ 
++// A content-setting indicator as an SF Symbol, or nil to use Chrome's own
++// icon (types without a fitting symbol, e.g. camera-and-microphone, which
++// Chrome draws as whichever is in use).
++NSString* ContentSettingSymbol(int image_type, bool blocked) {
++  using Type = ContentSettingImageModel::ImageType;
++  switch (static_cast<Type>(image_type)) {
++    case Type::kPopups:
++      return @"rectangle.on.rectangle.slash";
++    case Type::kGeolocation:
++      return blocked ? @"location.slash.fill" : @"location.fill";
++    case Type::kNotifications:
++      return blocked ? @"bell.slash.fill" : @"bell.fill";
++    case Type::kAutomaticDownloads:
++      return @"arrow.down.circle";
++    case Type::kSound:
++      return @"speaker.slash.fill";
++    case Type::kJavaScript:
++      return @"curlybraces";
++    case Type::kImages:
++      return @"photo";
++    case Type::kClipboardReadWrite:
++      return @"doc.on.clipboard";
++    case Type::kMidiSysex:
++      return @"pianokeys";
++    case Type::kProtocolHandlers:
++      return @"link";
++    default:
++      return nil;
++  }
++}
++
++NSImage* ContentSettingImage(const safarium::ContentSettingItem& item) {
++  if (NSString* name = ContentSettingSymbol(item.image_type, item.blocked)) {
++    if (NSImage* image = Symbol(name, 11, NSFontWeightMedium)) {
++      return image;
++    }
++  }
++  if (item.icon.IsEmpty()) {
++    return Symbol(@"exclamationmark.circle", 11, NSFontWeightMedium);
++  }
++  // Chrome's icon, drawn in black: tint it like the other icons.
++  NSImage* image = [item.icon.ToNSImage() copy];
++  [image setTemplate:YES];
++  image.size = NSMakeSize(14, 14);
++  return image;
++}
++
++// At most this many content-setting indicators fit next to the address.
++constexpr size_t kMaxContentSettingIcons = 3;
++
+ bool AlertTogglesMute(tabs::TabAlert alert) {
+   return alert == tabs::TabAlert::kAudioPlaying ||
+          alert == tabs::TabAlert::kAudioMuting;
+@@ -1278,6 +1331,10 @@ @implementation SafariumTabBarView {
+   // The current tab's alert (speaker, camera…), left of ↻/≡; -1 for none.
+   SafariumOverlayButton* _activeAlertButton;
+   int _activeAlert;
++  // Content-setting indicators (pop-ups blocked, camera…), left of the
++  // alert; tag = ContentSettingItem::model_index.
++  NSMutableArray<SafariumOverlayButton*>* _contentSettingButtons;
++  NSUInteger _contentSettingCount;
+   CGFloat _idleGroupLocalX;  // Idle [icon + text] x inside the active pill.
+   CGFloat _idleFieldX;  // Text x in idle / editing layouts (strip coords).
+   CGFloat _editFieldX;
+@@ -1395,6 +1452,17 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _activeAlertButton.shown = NO;
+     [_strip addSubview:_activeAlertButton];
+ 
++    _contentSettingButtons = [NSMutableArray array];
++    for (size_t i = 0; i < kMaxContentSettingIcons; ++i) {
++      SafariumOverlayButton* button =
++          MakeIconButton(@"circle", 11, self, @selector(contentSettingClicked:));
++      button.contentTintColor = NSColor.secondaryLabelColor;
++      button.alphaValue = 0;
++      button.shown = NO;
++      [_strip addSubview:button];
++      [_contentSettingButtons addObject:button];
++    }
++
+     _progressLine = [[SafariumPassiveView alloc] initWithFrame:NSZeroRect];
+     _progressLine.wantsLayer = YES;
+     _progressLine.layer.cornerRadius = 1;
+@@ -1961,7 +2029,34 @@ - (void)relayoutAnimated:(BOOL)animated {
+   [self show:_closeActiveButton visible:showClose animated:animated];
+ 
+   // Trailing slots.
+-  //   untouched: [↻ on hover] ≡        typed: ↻ on hover, else × (clear)
++  //   untouched: [↻ on hover] [indicators] ≡   typed: ↻ on hover, else ×
++  // Indicators, right to left from ≡: the alert (🔊 …), then the content
++  // settings (pop-ups blocked, camera…). They hide while editing, like the
++  // page menu, and never move when ↻ shows (it appears left of them), so a
++  // popover anchored to one stays put.
++  const BOOL showIndicators = !editing && hasPage;
++  NSMutableArray<SafariumOverlayButton*>* indicators = [NSMutableArray array];
++  if (_activeAlert >= 0) {
++    [indicators addObject:_activeAlertButton];
++  } else {
++    [self show:_activeAlertButton visible:NO animated:animated];
++  }
++  for (NSUInteger i = 0; i < _contentSettingButtons.count; ++i) {
++    if (i < _contentSettingCount) {
++      [indicators addObject:_contentSettingButtons[i]];
++    } else {
++      [self show:_contentSettingButtons[i] visible:NO animated:animated];
++    }
++  }
++  const CGFloat slotStep = kIconSize + 6;
++  for (NSUInteger i = 0; i < indicators.count; ++i) {
++    [self place:indicators[i]
++          frame:NSOffsetRect(beforeTrailing, -slotStep * i, 0)
++       animated:overlayAnimated];
++    [self show:indicators[i] visible:showIndicators animated:animated];
++  }
++  const NSUInteger shownIndicators = showIndicators ? indicators.count : 0;
++
+   const BOOL showReload = _activeHovered && hasPage;
+   const BOOL showClear =
+       typed && !showReload && _addressField.stringValue.length > 0;
+@@ -1969,7 +2064,9 @@ - (void)relayoutAnimated:(BOOL)animated {
+       setImage:Symbol(_isLoading ? @"xmark" : @"arrow.clockwise", 11,
+                       NSFontWeightMedium)];
+   [self place:_hoverReloadButton
+-        frame:typed ? trailing : beforeTrailing
++        frame:typed ? trailing
++                    : NSOffsetRect(beforeTrailing,
++                                   -slotStep * shownIndicators, 0)
+      animated:overlayAnimated];
+   [self place:_clearButton frame:trailing animated:overlayAnimated];
+   [self place:_pageMenuButton frame:trailing animated:overlayAnimated];
+@@ -1978,14 +2075,6 @@ - (void)relayoutAnimated:(BOOL)animated {
+   // No page menu on a blank tab (nothing to act on), like Safari.
+   [self show:_pageMenuButton visible:!typed && hasPage animated:animated];
+ 
+-  // The alert (🔊 …) sits just left of ↻'s slot, moving one slot further
+-  // left while ↻ shows. Hidden while editing, like the page menu.
+-  const BOOL showAlert = _activeAlert >= 0 && !editing && hasPage;
+-  const NSRect alertSlot = NSOffsetRect(
+-      beforeTrailing, showReload ? -(kIconSize + 6) : 0, 0);
+-  [self place:_activeAlertButton frame:alertSlot animated:overlayAnimated];
+-  [self show:_activeAlertButton visible:showAlert animated:animated];
+-
+   // Load progress: a thin accent line along the bottom of the pill.
+   {
+     const CGFloat inset = kTabHeight / 2;
+@@ -2022,10 +2111,10 @@ - (void)relayoutAnimated:(BOOL)animated {
+   const CGFloat groupLeft =
+       _vertical ? NSMinX(leading)
+                 : (hasPage ? NSMaxX(leading) + 6 : NSMinX(activeFrame) + 12);
+-  // With an alert the text keeps clear of both slots it can use, so it does
+-  // not shift when ↻ appears on hover.
++  // The text keeps clear of the indicators and of ↻'s slot left of them, so
++  // it does not shift when ↻ appears on hover.
+   const CGFloat groupRight =
+-      hasPage ? NSMinX(beforeTrailing) - 6 - (showAlert ? kIconSize + 6 : 0)
++      hasPage ? NSMinX(beforeTrailing) - 6 - shownIndicators * slotStep
+               : NSMaxX(activeFrame) - 12;
+   textW = MAX(0, MIN(textW, groupRight - groupLeft - kIconSize - 6));
+   const CGFloat groupW = kIconSize + 6 + textW;
+@@ -2106,6 +2195,11 @@ - (void)setActiveOverlayHidden:(BOOL)hidden {
+       view.hidden = hidden;
+     }
+   }
++  for (NSView* view in _contentSettingButtons) {
++    if (view.hidden != hidden) {
++      view.hidden = hidden;
++    }
++  }
+   if (hidden) {
+     _focusRing.alphaValue = 0;
+   }
+@@ -2313,6 +2407,7 @@ - (void)applyState:(const safarium::BarState&)state {
+                       text:base::SysUTF16ToNSString(t.alert_text)];
+     }
+   }
++  [self setContentSettings:state.content_settings];
+   _activeIndex = state.active_index;
+   _activeChangedThisLayout = activeChanged;
+   _revealActive = _activeChangedThisLayout || countChanged;
+@@ -2320,6 +2415,10 @@ - (void)applyState:(const safarium::BarState&)state {
+     _activeHovered = _activeIndex >= 0 && _activeIndex < (NSInteger)count &&
+                      _cells[_activeIndex].hovered;
+   }
++  if (activeChanged) {
++    // Its page is no longer the one shown (as Chrome's bubble closes).
++    safarium::CloseContentSettingPopover();
++  }
+   if (activeChanged && _addressField.editing) {
+     [self.window makeFirstResponder:nil];  // Ends editing → idle text.
+   }
+@@ -3100,6 +3199,34 @@ - (void)setActiveAlert:(int)alert text:(NSString*)text {
+   }
+ }
+ 
++- (void)setContentSettings:
++    (const std::vector<safarium::ContentSettingItem>&)items {
++  _contentSettingCount = std::min(items.size(), kMaxContentSettingIcons);
++  for (NSUInteger i = 0; i < _contentSettingCount; ++i) {
++    SafariumOverlayButton* button = _contentSettingButtons[i];
++    [button setImage:ContentSettingImage(items[i])];
++    button.tag = items[i].model_index;
++    NSString* tip = base::SysUTF16ToNSString(items[i].tooltip);
++    button.toolTip = tip;
++    [button setAccessibilityLabel:tip];
++  }
++}
++
++// A content-setting indicator: Chrome's bubble for it, as a native popover.
++- (void)contentSettingClicked:(SafariumOverlayButton*)sender {
++  if (!_controller) {
++    return;
++  }
++  std::unique_ptr<ContentSettingBubbleModel> model =
++      _controller->CreateContentSettingBubble(static_cast<int>(sender.tag));
++  if (!model) {
++    _controller->ContentSettingsChanged();  // Its state is gone: refresh.
++    return;
++  }
++  [self hideHoverCard];
++  safarium::ShowContentSettingPopover(std::move(model), sender, nil);
++}
++
+ // 🔊 in a tab: mute or unmute it, as in Safari. Other alerts (camera,
+ // screen sharing…) just select the tab.
+ - (void)tabCellAlertClicked:(SafariumTabCell*)cell {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index cdb691183c..311e19d726 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -1101,6 +1101,12 @@ void WebUIBrowserWindow::SetFocusToLocationBar(bool is_user_initiated) {
+   }
+ }
+ 
++void WebUIBrowserWindow::SafariumContentSettingsChanged() {
++  if (safarium_controller_) {
++    safarium_controller_->ContentSettingsChanged();
++  }
++}
++
+ void WebUIBrowserWindow::UpdateReloadStopState(bool is_loading, bool force) {
+   if (safarium_controller_) {
+     safarium_controller_->PushState();
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index cf5ed26075..f45aabc724 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -76,6 +76,9 @@ class WebUIBrowserWindow : public BrowserWindow,
+   bool IsSafariumVideoFullscreenActive() const;
+   std::optional<bool> GetSafariumVideoFullscreenOverride(
+       const content::WebContents* contents) const;
++  // Safarium: the current page's content-setting indicators changed (the
++  // location bar's UpdateContentSettingsIcons()).
++  void SafariumContentSettingsChanged();
+   static const WebUIBrowserWindow* FromBrowser(
+       const BrowserWindowInterface* browser);
+ 
+diff --git a/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc b/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
+index ab943f463f..e2b10fdedc 100644
+--- a/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
++++ b/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
+@@ -57,6 +57,11 @@ void WebUIStubLocationBar::UpdateFocusBehavior(bool toolbar_visible) {
+ }
+ 
+ void WebUIStubLocationBar::UpdateContentSettingsIcons() {
++  // Safarium draws these in its native address field.
++  if (safarium::IsNativeUIEnabled()) {
++    window_->SafariumContentSettingsChanged();
++    return;
++  }
+   NOTIMPLEMENTED();
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

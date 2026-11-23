@@ -1,0 +1,100 @@
+From 97388b7988c1e066f350fafd22188dbb6f84d79b Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:17:08 -0500
+Subject: [PATCH 38/41] Safarium: pinned-only tab bars are clickable; full-size
+ pinned speaker
+
+With only pinned tabs the bar's minimum width (one tab's width) exceeded
+its maximum (the pinned tiles' width). Auto Layout dropped the minimum, so
+the view was ~87 pt wide while the capsule was laid out ~246 pt wide around
+it: clicks on the tiles fell outside the view and started a window drag,
+and the other pinned tab could not be selected. The minimum now follows the
+tabs when they need less.
+
+A pinned tile's alert icon is now the normal size, beside the favicon.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 29 ++++++++++---------
+ 1 file changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 7788bb750c..f9644f81e7 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -650,11 +650,10 @@ @implementation SafariumTabCell {
+   // toolbar a pinned tab is an icon-only tile instead).
+   NSImageView* _pinView;
+   // Speaker / camera / … after the title (sidebar: at the trailing edge;
+-  // pinned tile: a badge on the icon). Click: mute or unmute.
++  // pinned tile: beside the icon). Click: mute or unmute.
+   SafariumOverlayButton* _alertButton;
+   int _alert;
+-  int _alertImageFor;    // The alert and size `_alertButton.image` was made
+-  BOOL _alertImageBadge;  // for.
++  int _alertImageFor;  // The alert `_alertButton.image` was made for.
+   BOOL _hovered;
+   CGFloat _contentX;
+   BOOL _hasContentX;
+@@ -765,20 +764,16 @@ - (void)setAlert:(int)alert text:(NSString*)text {
+   self.needsLayout = YES;
+ }
+ 
+-// Full size after the title; a small badge on a pinned tile's icon.
+ - (void)refreshAlertImage {
+   if (_alert < 0) {
+     return;
+   }
+-  const BOOL badge = _pinned && ![self.bar isVertical];
+-  if (_alertImageFor == _alert && _alertImageBadge == badge) {
++  if (_alertImageFor == _alert) {
+     return;
+   }
+   _alertImageFor = _alert;
+-  _alertImageBadge = badge;
+   const auto alert = static_cast<tabs::TabAlert>(_alert);
+-  _alertButton.image = Symbol(AlertSymbol(alert), badge ? 9 : 11,
+-                              NSFontWeightMedium);
++  _alertButton.image = Symbol(AlertSymbol(alert), 11, NSFontWeightMedium);
+   _alertButton.contentTintColor = AlertTint(alert);
+ }
+ 
+@@ -809,17 +804,15 @@ - (void)layout {
+   _alertButton.hidden = !showAlert;
+   [self refreshAlertImage];
+   if (_pinned && !vertical) {
+-    // [icon] or [icon 🔊]: a small alert beside the icon, centered together.
+-    constexpr CGFloat kBadge = 11;
+-    const CGFloat groupW = kIconSize + (showAlert ? 2 + kBadge : 0);
++    // [icon] or [icon 🔊], centered together.
++    const CGFloat groupW = kIconSize + (showAlert ? 2 + kIconSize : 0);
+     const CGFloat x = floor((b.size.width - groupW) / 2);
+     _iconView.frame = NSMakeRect(x, iconY, kIconSize, kIconSize);
+     _titleLabel.hidden = YES;
+     _iconView.hidden = NO;
+     if (showAlert) {
+       _alertButton.frame =
+-          NSMakeRect(x + kIconSize + 2, floor((b.size.height - kBadge) / 2),
+-                     kBadge, kBadge);
++          NSMakeRect(x + kIconSize + 2, iconY, kIconSize, kIconSize);
+     }
+     return;
+   }
+@@ -1611,6 +1604,14 @@ - (void)updatePreferredWidthAnimated:(BOOL)animated {
+     ]];
+   }
+   const CGFloat width = [self preferredStripWidth];
++  // Only pinned tabs need less than one tab's width: lower the minimum with
++  // them. A minimum above the maximum made Auto Layout drop one of the two,
++  // and the capsule was drawn wider than this view, where the tabs could
++  // not be clicked (clicks started a window drag instead).
++  const CGFloat minWidth = MIN(kMaxTabWidth + 2 * kCapsuleInset, width);
++  if (_minWidth.constant != minWidth) {
++    _minWidth.constant = minWidth;
++  }
+   if (_maxWidth.constant == width) {
+     return;
+   }
+-- 
+2.54.0 (Apple Git-157)
+

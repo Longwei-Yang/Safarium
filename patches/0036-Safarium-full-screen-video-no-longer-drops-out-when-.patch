@@ -1,0 +1,69 @@
+From 23badd3c676a3fc5d7d4cebbb700e4d448ba5ea2 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:11:39 -0500
+Subject: [PATCH 36/41] Safarium: full screen video no longer drops out when
+ switching away
+
+Chromium (non-Chrome-branded) builds apply
+testing/variations/fieldtrial_testing_config.json, which turns on
+AutoPictureInPictureOnWindowOccluded on Mac; Chrome ships it off. With it,
+switching away from a full screen video with sound occluded the page, Chrome
+opened picture-in-picture, which ended full screen, and switching back closed
+picture-in-picture and left the video in the page.
+
+Safarium never creates the window occlusion helper. Manual picture-in-picture
+and Chrome's tab-switch automatic picture-in-picture are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/picture_in_picture/BUILD.gn                 | 1 +
+ .../auto_picture_in_picture_tab_helper.cc                  | 7 +++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/chrome/browser/picture_in_picture/BUILD.gn b/chrome/browser/picture_in_picture/BUILD.gn
+index 04ab831ceb..cf949e765b 100644
+--- a/chrome/browser/picture_in_picture/BUILD.gn
++++ b/chrome/browser/picture_in_picture/BUILD.gn
+@@ -99,6 +99,7 @@ source_set("impl") {
+   deps = [
+     ":picture_in_picture",
+     "//base",
++    "//build:safarium_buildflags",
+     "//chrome/browser:browser_process",
+     "//chrome/browser/content_settings:content_settings_factory",
+     "//chrome/browser/media",
+diff --git a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
+index 3e5428108c..5e408d2f30 100644
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
+@@ -10,6 +10,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/clock.h"
+ #include "base/time/default_tick_clock.h"
++#include "build/safarium_buildflags.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/media/media_engagement_service.h"
+@@ -99,6 +100,11 @@ AutoPictureInPictureTabHelper::AutoPictureInPictureTabHelper(
+       base::BindRepeating(&AutoPictureInPictureTabHelper::OnTabActivatedChanged,
+                           base::Unretained(this)));
+ 
++  // Safarium: never on. Chromium builds turn this experiment on through
++  // fieldtrial_testing_config.json (Chrome ships it off); it took full screen
++  // video out of its Space as soon as the user switched away. Manual and
++  // tab-switch picture-in-picture are unaffected.
++#if !BUILDFLAG(SAFARIUM_BRANDING)
+   if (base::FeatureList::IsEnabled(
+           media::kAutoPictureInPictureOnWindowOccluded)) {
+     // `base::Unretained` is safe here since we own `window_occlusion_helper_`.
+@@ -109,6 +115,7 @@ AutoPictureInPictureTabHelper::AutoPictureInPictureTabHelper(
+                 &AutoPictureInPictureTabHelper::OnOcclusionStateChanged,
+                 base::Unretained(this)));
+   }
++#endif  // !BUILDFLAG(SAFARIUM_BRANDING)
+ 
+   // On non-Android platforms, we observe the internal AudioFocusManager to
+   // track audio focus state. Android has a native system-wide AudioManager,
+-- 
+2.54.0 (Apple Git-157)
+

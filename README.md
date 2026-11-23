@@ -40,7 +40,7 @@ The interface and its animations will keep being refined.
 
 ![Tab Overview](docs/screenshots/overview.png)
 
-**Full screen video.** A video goes into its own full-screen space and returns to where you were, the desktop or a full-screen browser window.
+**Full screen video.** A video goes into its own full-screen space and returns to where you were, the desktop or a full-screen browser window. It stays full screen when you switch to another app or space.
 
 **Bookmarks.** ⌘D opens Safari's Add Bookmark panel from the address field: pick a folder, edit the title, then Add. Nothing is saved if you cancel. On a page that is already bookmarked the panel edits or removes that bookmark.
 
@@ -54,7 +54,9 @@ The interface and its animations will keep being refined.
 
 **Downloads on quit.** Quitting or closing the last window while a download is in progress asks first.
 
-**Site permissions.** When a site asks for your location, notifications, camera, microphone or similar, Safarium shows Chrome's permission prompt centered over the page. Chrome's other popups (saving passwords and addresses, zoom, QR code, sharing, extension dialogs) appear there too.
+**Tab status.** A tab playing sound shows a speaker; click it to mute or unmute the tab. Tabs using the camera, microphone or screen sharing show a red indicator, and picture-in-picture and connected devices have their own icons.
+
+**Site permissions.** When a site asks for your location, notifications, camera, microphone or similar, the request opens in a popover under the address field (beside the current tab in the sidebar), with Chrome's choices: allow while visiting the site, allow this time, or never allow. Indicators in the address field show what the page is using or was blocked from (pop-ups, location, camera and microphone, notifications…); click one to see what happened and change the setting. Chrome's other popups (saving passwords and addresses, zoom, QR code, sharing, extension dialogs) appear centered over the page.
 
 **Updates.** Safarium › Check for Updates… looks for a newer release here on GitHub, shows its notes and installs it: the DMG is downloaded and checked against the SHA-256 GitHub publishes, then Safarium quits, replaces itself and reopens with your windows and tabs. Safarium also checks once a day and only speaks up when there is something new; "Skip This Version" silences one release.
 

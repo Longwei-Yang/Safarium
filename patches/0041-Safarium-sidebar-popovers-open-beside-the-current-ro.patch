@@ -1,0 +1,177 @@
+From 79faea063fdae3fc53ef9480bbccbb0cf2b298d3 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:10:30 -0500
+Subject: [PATCH 41/41] Safarium: sidebar popovers open beside the current row
+
+With tabs in the sidebar, the permission prompt and the content-setting
+popovers opened below the current row, covering the tabs under it (and,
+with the window near the screen edge, being pushed over the sidebar). They
+now open to the right of the row, as the bookmark panel does: the
+permission prompt from the row (the tab answers -safariumPopoverEdge), and
+the indicator popovers from the row's trailing edge level with the
+indicator, so they cover none of the row. The toolbar keeps them below the
+address field.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_content_setting_popover.h        |  3 +++
+ .../safarium_content_setting_popover.mm       | 16 +++++++-----
+ .../safarium_permission_prompt_mac.mm         | 12 ++++++++-
+ .../safarium_tab_bar_host_mac.mm              | 26 ++++++++++++++++++-
+ 4 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h
+index 9cca8f0071..ca9ae9a760 100644
+--- a/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h
++++ b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.h
+@@ -18,8 +18,11 @@ namespace safarium {
+ // address field. Owns `model` while open and commits its choice when it
+ // closes, as Chrome's own bubble does; then runs `on_close`. Opening another
+ // one closes this one.
++// `rect` is where to point, in `anchor`'s coordinates.
+ void ShowContentSettingPopover(std::unique_ptr<ContentSettingBubbleModel> model,
+                                NSView* anchor,
++                               NSRect rect,
++                               NSRectEdge edge,
+                                void (^on_close)(void));
+ 
+ // Closes the open content-setting popover, if any (e.g. the tab changed).
+diff --git a/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm
+index c61021be8e..270eb9ad38 100644
+--- a/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm
++++ b/chrome/browser/ui/webui_browser/safarium_content_setting_popover.mm
+@@ -30,7 +30,9 @@
+ @interface SafariumContentSettingPopover : NSViewController <NSPopoverDelegate>
+ - (instancetype)initWithModel:(std::unique_ptr<ContentSettingBubbleModel>)model
+                       onClose:(void (^)(void))onClose;
+-- (void)showRelativeToView:(NSView*)anchor;
++- (void)showRelativeToView:(NSView*)anchor
++                      rect:(NSRect)rect
++                      edge:(NSRectEdge)edge;
+ - (int)selectedRadio;
+ - (void)rebuild;
+ - (void)close;
+@@ -246,15 +248,15 @@ - (void)rebuild {
+   self.preferredContentSize = _stack.fittingSize;
+ }
+ 
+-- (void)showRelativeToView:(NSView*)anchor {
++- (void)showRelativeToView:(NSView*)anchor
++                      rect:(NSRect)rect
++                      edge:(NSRectEdge)edge {
+   _popover = [[NSPopover alloc] init];
+   _popover.contentViewController = self;
+   _popover.behavior = NSPopoverBehaviorTransient;
+   _popover.animates = YES;
+   _popover.delegate = self;
+-  [_popover showRelativeToRect:anchor.bounds
+-                        ofView:anchor
+-                 preferredEdge:NSRectEdgeMaxY];
++  [_popover showRelativeToRect:rect ofView:anchor preferredEdge:edge];
+   g_open_popover = self;
+ }
+ 
+@@ -338,6 +340,8 @@ - (void)doneClicked:(id)sender {
+ 
+ void ShowContentSettingPopover(std::unique_ptr<ContentSettingBubbleModel> model,
+                                NSView* anchor,
++                               NSRect rect,
++                               NSRectEdge edge,
+                                void (^on_close)(void)) {
+   if (!model || !anchor.window) {
+     if (on_close) {
+@@ -349,7 +353,7 @@ void ShowContentSettingPopover(std::unique_ptr<ContentSettingBubbleModel> model,
+   SafariumContentSettingPopover* popover =
+       [[SafariumContentSettingPopover alloc] initWithModel:std::move(model)
+                                                    onClose:on_close];
+-  [popover showRelativeToView:anchor];
++  [popover showRelativeToView:anchor rect:rect edge:edge];
+ }
+ 
+ void CloseContentSettingPopover() {
+diff --git a/chrome/browser/ui/webui_browser/safarium_permission_prompt_mac.mm b/chrome/browser/ui/webui_browser/safarium_permission_prompt_mac.mm
+index 1493642746..72c3af8b7d 100644
+--- a/chrome/browser/ui/webui_browser/safarium_permission_prompt_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_permission_prompt_mac.mm
+@@ -32,6 +32,11 @@
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/gfx/mac/coordinate_conversion.h"
+ 
++// Implemented by the tab bar's tabs (safarium_tab_bar_host_mac.mm).
++@protocol SafariumPopoverAnchor
++- (NSRectEdge)safariumPopoverEdge;
++@end
++
+ namespace {
+ 
+ constexpr CGFloat kWidth = 300;
+@@ -281,9 +286,14 @@ - (void)showRelativeToView:(NSView*)anchor {
+   _popover.behavior = NSPopoverBehaviorApplicationDefined;
+   _popover.animates = YES;
+   _popover.delegate = self;
++  // Below the address field; beside it when the anchor (a sidebar row) asks.
++  NSRectEdge edge = NSRectEdgeMaxY;
++  if ([anchor respondsToSelector:@selector(safariumPopoverEdge)]) {
++    edge = [static_cast<id<SafariumPopoverAnchor>>(anchor) safariumPopoverEdge];
++  }
+   [_popover showRelativeToRect:anchor.bounds
+                         ofView:anchor
+-                 preferredEdge:NSRectEdgeMaxY];
++                 preferredEdge:edge];
+   _acceptClicksAfter = base::TimeTicks::Now() + kInputProtection;
+   __weak SafariumPermissionPopover* weakSelf = self;
+   _activationObserver = [NSNotificationCenter.defaultCenter
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 9b9947f614..260a74720d 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -677,6 +677,9 @@ @interface SafariumTabCell : NSView
+ @property(nonatomic) int64_t tabId;
+ @property(nonatomic, copy) NSString* domain;
+ - (void)setIcon:(NSImage*)icon;
++// Where a popover anchored to this tab opens: below it, or beside it in the
++// sidebar (asked for by other files' popovers through -respondsToSelector:).
++- (NSRectEdge)safariumPopoverEdge;
+ // The tab's alert icon (speaker, camera…); `alert` is a tabs::TabAlert, or
+ // -1 for none.
+ - (void)setAlert:(int)alert text:(NSString*)text;
+@@ -804,6 +807,13 @@ - (int)alert {
+   return _alert;
+ }
+ 
++- (NSRectEdge)safariumPopoverEdge {
++  if ([self.bar isVertical]) {
++    return NSRectEdgeMaxX;
++  }
++  return self.isFlipped ? NSRectEdgeMaxY : NSRectEdgeMinY;
++}
++
+ - (void)setAlert:(int)alert text:(NSString*)text {
+   NSString* symbol =
+       alert >= 0 ? AlertSymbol(static_cast<tabs::TabAlert>(alert)) : nil;
+@@ -3236,7 +3246,21 @@ - (void)contentSettingClicked:(SafariumOverlayButton*)sender {
+     return;
+   }
+   [self hideHoverCard];
+-  safarium::ShowContentSettingPopover(std::move(model), sender, nil);
++  // Toolbar: below the indicator. Sidebar: beside the row (below would cover
++  // the next tabs), from the row's trailing edge level with the indicator,
++  // as the bookmark panel opens, so it covers none of the row.
++  NSView* anchor = sender;
++  NSRect rect = sender.bounds;
++  NSRectEdge edge = NSRectEdgeMaxY;
++  if (_vertical && _activeCell) {
++    const NSRect icon = [_activeCell convertRect:sender.bounds fromView:sender];
++    anchor = _activeCell;
++    rect = NSMakeRect(NSMaxX(_activeCell.bounds) - 1, NSMinY(icon), 1,
++                      NSHeight(icon));
++    edge = NSRectEdgeMaxX;
++  }
++  safarium::ShowContentSettingPopover(std::move(model), anchor, rect, edge,
++                                      nil);
+ }
+ 
+ // 🔊 in a tab: mute or unmute it, as in Safari. Other alerts (camera,
+-- 
+2.54.0 (Apple Git-157)
+

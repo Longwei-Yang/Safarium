@@ -1,0 +1,509 @@
+From e096a6dd1941ec4ff75f970e99cc27fd811d7166 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:10:34 -0500
+Subject: [PATCH 37/41] Safarium: speaker and other alert icons on tabs
+
+Each tab shows Chrome's tab alert (TabAlertController) as an SF Symbol:
+playing audio, muted, camera / microphone / screen capture (red),
+picture-in-picture, Bluetooth / USB / HID / serial devices, VR. Inactive
+tabs show it after the title (sidebar: at the row's trailing edge; pinned
+tile: beside the icon); the current tab shows it in the address field left
+of reload / page menu. Clicking the speaker mutes or unmutes that tab, as in
+Safari; other alerts just select the tab.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/ui/webui_browser/BUILD.gn      |   1 +
+ .../safarium_tab_bar_controller.cc            |  34 +++
+ .../safarium_tab_bar_controller.h             |  10 +
+ .../safarium_tab_bar_host_mac.mm              | 219 +++++++++++++++++-
+ 4 files changed, 258 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index f858c0cf07..c8c59e5b64 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -197,6 +197,7 @@ source_set("impl") {
+     "//chrome/browser/ui/side_panel",
+     "//chrome/browser/ui/side_panel:side_panel_views_dependent",
+     "//chrome/browser/ui/tabs:tabs_public",
++    "//chrome/browser/ui/tabs/alert:tab_alert",
+     "//chrome/browser/ui/tabs/tab_drag_api",
+     "//chrome/browser/ui/tabs/tab_drag_api:impl",
+     "//chrome/browser/ui/tabs/tab_strip_api",
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+index eedd01cb0c..fc7d85bcf5 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "ui/base/base_window.h"
+ #include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_muted_utils.h"
+ #include "base/i18n/case_conversion.h"
+@@ -279,6 +280,14 @@ BarState TabBarController::BuildState() const {
+     item.domain = HoverCardDomain(contents);
+     item.pinned = model->IsTabPinned(i);
+     item.id = model->GetTabAtIndex(i)->GetHandle().raw_value();
++    if (const auto* alerts =
++            tabs::TabAlertController::From(model->GetTabAtIndex(i))) {
++      item.alert = alerts->GetAlertToShow();
++      if (item.alert) {
++        item.alert_text =
++            tabs::TabAlertController::GetTabAlertStateText(*item.alert);
++      }
++    }
+     if (auto* favicon_driver =
+             favicon::ContentFaviconDriver::FromWebContents(contents)) {
+       item.favicon = favicon_driver->GetFavicon();
+@@ -480,10 +489,35 @@ void TabBarController::OnThumbnail(int64_t tab_id, gfx::ImageSkia image) {
+   }
+ }
+ 
++void TabBarController::UpdateAlertSubscriptions() {
++  TabStripModel* model = browser_->GetTabStripModel();
++  std::map<int64_t, base::CallbackListSubscription> kept;
++  for (int i = 0; i < model->count(); ++i) {
++    tabs::TabInterface* tab = model->GetTabAtIndex(i);
++    const int64_t id = tab->GetHandle().raw_value();
++    if (auto it = alert_subscriptions_.find(id);
++        it != alert_subscriptions_.end()) {
++      kept.emplace(id, std::move(it->second));
++      continue;
++    }
++    if (auto* alerts = tabs::TabAlertController::From(tab)) {
++      kept.emplace(id, alerts->AddAlertToShowChangedCallback(
++                           base::BindRepeating(
++                               [](TabBarController* self,
++                                  std::optional<tabs::TabAlert>) {
++                                 self->PushState();
++                               },
++                               base::Unretained(this))));
++    }
++  }
++  alert_subscriptions_ = std::move(kept);
++}
++
+ void TabBarController::PushState() {
+   if (wants_thumbnails_) {
+     UpdateThumbnailSubscriptions();
+   }
++  UpdateAlertSubscriptions();
+   // Track the active tab for load progress.
+   content::WebContents* active =
+       browser_->GetTabStripModel()->GetActiveWebContents();
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+index 4f0bdeb476..cf1cf69e3b 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h
+@@ -7,10 +7,12 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/callback_list.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/performance_controls/tab_resource_usage_collector.h"
+@@ -18,6 +20,7 @@
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tabs/public/tab_alert.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "url/gurl.h"
+ #include "ui/gfx/image/image.h"
+@@ -50,6 +53,10 @@ struct TabItem {
+   bool is_search = false;
+   // Origin shown in the hover card (Chrome's hover-card formatting).
+   std::u16string domain;
++  // The tab's most important alert (playing audio, muted, camera in use…),
++  // as Chrome's tab strip would show it, and its description.
++  std::optional<tabs::TabAlert> alert;
++  std::u16string alert_text;
+ };
+ 
+ struct BarState {
+@@ -201,6 +208,8 @@ class TabBarController : public TabStripModelObserver,
+   // background thumbnail capturer can run.
+   void PrepareForThumbnail(tabs::TabInterface* tab) const;
+   void PushHoverCardMemory();
++  // Follows each tab's TabAlertController so alert icons stay current.
++  void UpdateAlertSubscriptions();
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const base::WeakPtr<WebUIToolbarExtensionsContainer> extensions_;
+@@ -208,6 +217,7 @@ class TabBarController : public TabStripModelObserver,
+   bool wants_thumbnails_ = false;
+   PrefChangeRegistrar pref_change_registrar_;
+   int64_t hover_card_tab_ = 0;
++  std::map<int64_t, base::CallbackListSubscription> alert_subscriptions_;
+   std::unique_ptr<ThumbnailImage::Subscription> hover_card_thumbnail_;
+   base::ScopedObservation<TabResourceUsageCollector,
+                           TabResourceUsageCollector::Observer>
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 50cc930779..7788bb750c 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -110,6 +110,59 @@ NSPoint ScreenPointForMouseEvent(NSEvent* event) {
+                                             weight:weight]];
+ }
+ 
++// Chrome's tab alert (TabAlertController) drawn the Safari way: an SF Symbol
++// and tint. Returns nil for alerts Safarium has no use for (Gemini, AI
++// features, which are switched off).
++NSString* AlertSymbol(tabs::TabAlert alert) {
++  switch (alert) {
++    case tabs::TabAlert::kAudioPlaying:
++      return @"speaker.wave.2.fill";
++    case tabs::TabAlert::kAudioMuting:
++      return @"speaker.slash.fill";
++    case tabs::TabAlert::kMediaRecording:
++    case tabs::TabAlert::kVideoRecording:
++      return @"video.fill";
++    case tabs::TabAlert::kAudioRecording:
++      return @"mic.fill";
++    case tabs::TabAlert::kTabCapturing:
++    case tabs::TabAlert::kDesktopCapturing:
++      return @"rectangle.on.rectangle";
++    case tabs::TabAlert::kPipPlaying:
++      return @"pip";
++    case tabs::TabAlert::kBluetoothConnected:
++    case tabs::TabAlert::kBluetoothScanActive:
++      return @"antenna.radiowaves.left.and.right";
++    case tabs::TabAlert::kUsbConnected:
++    case tabs::TabAlert::kHidConnected:
++    case tabs::TabAlert::kSerialConnected:
++      return @"cable.connector";
++    case tabs::TabAlert::kVrPresentingInHeadset:
++      return @"eyeglasses";
++    default:
++      return nil;
++  }
++}
++
++// Capture (camera, microphone, screen) is red, as macOS marks it; the rest
++// match the other tab icons.
++NSColor* AlertTint(tabs::TabAlert alert) {
++  switch (alert) {
++    case tabs::TabAlert::kMediaRecording:
++    case tabs::TabAlert::kVideoRecording:
++    case tabs::TabAlert::kAudioRecording:
++    case tabs::TabAlert::kTabCapturing:
++    case tabs::TabAlert::kDesktopCapturing:
++      return NSColor.systemRedColor;
++    default:
++      return NSColor.secondaryLabelColor;
++  }
++}
++
++bool AlertTogglesMute(tabs::TabAlert alert) {
++  return alert == tabs::TabAlert::kAudioPlaying ||
++         alert == tabs::TabAlert::kAudioMuting;
++}
++
+ NSMenuItem* AddPageMenuItem(NSMenu* menu,
+                            NSString* title,
+                            NSString* symbol,
+@@ -569,6 +622,10 @@ @interface SafariumTabCell : NSView
+ @property(nonatomic) int64_t tabId;
+ @property(nonatomic, copy) NSString* domain;
+ - (void)setIcon:(NSImage*)icon;
++// The tab's alert icon (speaker, camera…); `alert` is a tabs::TabAlert, or
++// -1 for none.
++- (void)setAlert:(int)alert text:(NSString*)text;
++@property(nonatomic, readonly) int alert;
+ // Where the [icon + title] group was last drawn, in cell coordinates. The
+ // bar sets this for the tab that was just deactivated (its content was drawn
+ // by the address overlay).
+@@ -584,6 +641,7 @@ - (void)refreshHoverFromPointer;
+ @interface SafariumTabBarView ()
+ - (void)tabCellCloseClicked:(SafariumTabCell*)cell;
+ - (void)tabCellHoverChanged:(SafariumTabCell*)cell;
++- (void)tabCellAlertClicked:(SafariumTabCell*)cell;
+ @end
+ 
+ @implementation SafariumTabCell {
+@@ -591,6 +649,12 @@ @implementation SafariumTabCell {
+   // Sidebar rows mark pinned tabs with a pin at the trailing edge (in the
+   // toolbar a pinned tab is an icon-only tile instead).
+   NSImageView* _pinView;
++  // Speaker / camera / … after the title (sidebar: at the trailing edge;
++  // pinned tile: a badge on the icon). Click: mute or unmute.
++  SafariumOverlayButton* _alertButton;
++  int _alert;
++  int _alertImageFor;    // The alert and size `_alertButton.image` was made
++  BOOL _alertImageBadge;  // for.
+   BOOL _hovered;
+   CGFloat _contentX;
+   BOOL _hasContentX;
+@@ -661,6 +725,14 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _pinView.hidden = YES;
+     _pinView.accessibilityElement = NO;
+     [self addSubview:_pinView];
++
++    _alert = -1;
++    _alertImageFor = -1;
++    _alertButton = MakeIconButton(@"speaker.wave.2.fill", 11, self,
++                                  @selector(alertClicked:));
++    _alertButton.wantsLayer = YES;
++    _alertButton.hidden = YES;
++    [self addSubview:_alertButton];
+     [self refreshColors];
+   }
+   return self;
+@@ -674,6 +746,46 @@ - (void)setIcon:(NSImage*)icon {
+   _iconView.image = icon;
+ }
+ 
++- (int)alert {
++  return _alert;
++}
++
++- (void)setAlert:(int)alert text:(NSString*)text {
++  NSString* symbol =
++      alert >= 0 ? AlertSymbol(static_cast<tabs::TabAlert>(alert)) : nil;
++  if (!symbol) {
++    alert = -1;
++  }
++  _alertButton.toolTip = alert >= 0 ? text : nil;
++  [_alertButton setAccessibilityLabel:alert >= 0 ? text : nil];
++  if (_alert == alert) {
++    return;
++  }
++  _alert = alert;
++  self.needsLayout = YES;
++}
++
++// Full size after the title; a small badge on a pinned tile's icon.
++- (void)refreshAlertImage {
++  if (_alert < 0) {
++    return;
++  }
++  const BOOL badge = _pinned && ![self.bar isVertical];
++  if (_alertImageFor == _alert && _alertImageBadge == badge) {
++    return;
++  }
++  _alertImageFor = _alert;
++  _alertImageBadge = badge;
++  const auto alert = static_cast<tabs::TabAlert>(_alert);
++  _alertButton.image = Symbol(AlertSymbol(alert), badge ? 9 : 11,
++                              NSFontWeightMedium);
++  _alertButton.contentTintColor = AlertTint(alert);
++}
++
++- (void)alertClicked:(id)sender {
++  [self.bar tabCellAlertClicked:self];
++}
++
+ - (void)setPinned:(BOOL)pinned {
+   if (_pinned == pinned) {
+     return;
+@@ -691,11 +803,24 @@ - (void)layout {
+   const BOOL vertical = [self.bar isVertical];
+   [self updateCloseAffordanceAnimated:NO];
+   _pinView.hidden = !(_pinned && vertical && !_active);
++  // The current tab's alert is drawn by the address overlay, except on a
++  // pinned tile (which stays a tile while current).
++  const BOOL showAlert = _alert >= 0 && (!_active || (_pinned && !vertical));
++  _alertButton.hidden = !showAlert;
++  [self refreshAlertImage];
+   if (_pinned && !vertical) {
+-    _iconView.frame = NSMakeRect(floor((b.size.width - kIconSize) / 2), iconY,
+-                                 kIconSize, kIconSize);
++    // [icon] or [icon 🔊]: a small alert beside the icon, centered together.
++    constexpr CGFloat kBadge = 11;
++    const CGFloat groupW = kIconSize + (showAlert ? 2 + kBadge : 0);
++    const CGFloat x = floor((b.size.width - groupW) / 2);
++    _iconView.frame = NSMakeRect(x, iconY, kIconSize, kIconSize);
+     _titleLabel.hidden = YES;
+     _iconView.hidden = NO;
++    if (showAlert) {
++      _alertButton.frame =
++          NSMakeRect(x + kIconSize + 2, floor((b.size.height - kBadge) / 2),
++                     kBadge, kBadge);
++    }
+     return;
+   }
+   // In the sidebar the icon shares its slot with the hover close button.
+@@ -713,19 +838,32 @@ - (void)layout {
+                                 height);
+     trailingReserve += kIconSize + 6;
+   }
++  // Sidebar: the alert sits at the trailing edge (left of a pin). Toolbar:
++  // right after the title, inside the centered group.
++  if (showAlert && vertical) {
++    _alertButton.frame = NSMakeRect(b.size.width - trailingReserve + 10 -
++                                        8 - kIconSize,
++                                    iconY, kIconSize, kIconSize);
++    trailingReserve += kIconSize + 6;
++  }
++  const CGFloat alertW = showAlert && !vertical ? kIconSize + 4 : 0;
+   CGFloat maxTitle = MAX(0, b.size.width - leadingReserve - trailingReserve -
+-                                kIconSize - 6);
++                                kIconSize - 6 - alertW);
+   CGFloat textW = ceil([_titleLabel.stringValue sizeWithAttributes:@{
+                     NSFontAttributeName : _titleLabel.font
+                   }].width) + 4;
+   CGFloat titleW = MIN(maxTitle, textW);
+-  CGFloat groupW = kIconSize + 6 + titleW;
++  CGFloat groupW = kIconSize + 6 + titleW + alertW;
+   const CGFloat x =
+       vertical ? leadingReserve
+                : MAX(leadingReserve, floor((b.size.width - groupW) / 2));
+   _iconView.frame = NSMakeRect(x, iconY, kIconSize, kIconSize);
+   _titleLabel.frame =
+       NSMakeRect(x + kIconSize + 6, floor((b.size.height - 17) / 2), titleW, 17);
++  if (showAlert && !vertical) {
++    _alertButton.frame =
++        NSMakeRect(NSMaxX(_titleLabel.frame) + 4, iconY, kIconSize, kIconSize);
++  }
+   // The active tab's content is drawn by the bar's address overlay.
+   _titleLabel.hidden = _active || titleW < 10;
+   _iconView.hidden = _active;
+@@ -743,6 +881,9 @@ - (void)layout {
+     slide.timingFunction = SafariTiming();
+     [_iconView.layer addAnimation:slide forKey:@"safariumContent"];
+     [_titleLabel.layer addAnimation:slide forKey:@"safariumContent"];
++    if (!vertical) {
++      [_alertButton.layer addAnimation:slide forKey:@"safariumContent"];
++    }
+   }
+   _animateContentOnce = NO;
+   if (!_active) {
+@@ -1141,6 +1282,9 @@ @implementation SafariumTabBarView {
+   SafariumOverlayButton* _hoverReloadButton;  // ↻ / stop while hovered.
+   SafariumOverlayButton* _clearButton;        // × once the user has typed.
+   SafariumOverlayButton* _pageMenuButton;     // ≡ unless the user has typed.
++  // The current tab's alert (speaker, camera…), left of ↻/≡; -1 for none.
++  SafariumOverlayButton* _activeAlertButton;
++  int _activeAlert;
+   CGFloat _idleGroupLocalX;  // Idle [icon + text] x inside the active pill.
+   CGFloat _idleFieldX;  // Text x in idle / editing layouts (strip coords).
+   CGFloat _editFieldX;
+@@ -1251,6 +1395,13 @@ - (instancetype)initWithFrame:(NSRect)frame {
+     _pageMenuButton.toolTip = @"Page Menu";
+     [_strip addSubview:_pageMenuButton];
+ 
++    _activeAlert = -1;
++    _activeAlertButton = MakeIconButton(@"speaker.wave.2.fill", 11, self,
++                                        @selector(activeAlertClicked:));
++    _activeAlertButton.alphaValue = 0;
++    _activeAlertButton.shown = NO;
++    [_strip addSubview:_activeAlertButton];
++
+     _progressLine = [[SafariumPassiveView alloc] initWithFrame:NSZeroRect];
+     _progressLine.wantsLayer = YES;
+     _progressLine.layer.cornerRadius = 1;
+@@ -1826,6 +1977,14 @@ - (void)relayoutAnimated:(BOOL)animated {
+   // No page menu on a blank tab (nothing to act on), like Safari.
+   [self show:_pageMenuButton visible:!typed && hasPage animated:animated];
+ 
++  // The alert (🔊 …) sits just left of ↻'s slot, moving one slot further
++  // left while ↻ shows. Hidden while editing, like the page menu.
++  const BOOL showAlert = _activeAlert >= 0 && !editing && hasPage;
++  const NSRect alertSlot = NSOffsetRect(
++      beforeTrailing, showReload ? -(kIconSize + 6) : 0, 0);
++  [self place:_activeAlertButton frame:alertSlot animated:overlayAnimated];
++  [self show:_activeAlertButton visible:showAlert animated:animated];
++
+   // Load progress: a thin accent line along the bottom of the pill.
+   {
+     const CGFloat inset = kTabHeight / 2;
+@@ -1862,8 +2021,11 @@ - (void)relayoutAnimated:(BOOL)animated {
+   const CGFloat groupLeft =
+       _vertical ? NSMinX(leading)
+                 : (hasPage ? NSMaxX(leading) + 6 : NSMinX(activeFrame) + 12);
++  // With an alert the text keeps clear of both slots it can use, so it does
++  // not shift when ↻ appears on hover.
+   const CGFloat groupRight =
+-      hasPage ? NSMinX(beforeTrailing) - 6 : NSMaxX(activeFrame) - 12;
++      hasPage ? NSMinX(beforeTrailing) - 6 - (showAlert ? kIconSize + 6 : 0)
++              : NSMaxX(activeFrame) - 12;
+   textW = MAX(0, MIN(textW, groupRight - groupLeft - kIconSize - 6));
+   const CGFloat groupW = kIconSize + 6 + textW;
+   const CGFloat gx =
+@@ -1937,7 +2099,7 @@ - (void)relayoutAnimated:(BOOL)animated {
+ - (void)setActiveOverlayHidden:(BOOL)hidden {
+   for (NSView* view in @[
+          _addressField, _activeIcon, _pageMenuButton, _closeActiveButton,
+-         _hoverReloadButton, _clearButton, _progressLine
++         _hoverReloadButton, _clearButton, _progressLine, _activeAlertButton
+        ]) {
+     if (view.hidden != hidden) {
+       view.hidden = hidden;
+@@ -2135,6 +2297,8 @@ - (void)applyState:(const safarium::BarState&)state {
+     cell.tabId = t.id;
+     cell.domain = base::SysUTF16ToNSString(t.domain);
+     [cell setIcon:favicon];
++    [cell setAlert:t.alert ? static_cast<int>(*t.alert) : -1
++              text:base::SysUTF16ToNSString(t.alert_text)];
+     cell.needsLayout = YES;
+     if (t.active) {
+       _pageIdleImage =
+@@ -2144,6 +2308,8 @@ - (void)applyState:(const safarium::BarState&)state {
+       _pageDisplayText = base::SysUTF16ToNSString(t.display_url);
+       _pageEditText = base::SysUTF16ToNSString(t.edit_url);
+       [self applyPageTexts];
++      [self setActiveAlert:cell.alert
++                      text:base::SysUTF16ToNSString(t.alert_text)];
+     }
+   }
+   _activeIndex = state.active_index;
+@@ -2920,6 +3086,47 @@ - (void)clearClicked:(id)sender {
+   [self relayoutAnimated:NO];
+ }
+ 
++- (void)setActiveAlert:(int)alert text:(NSString*)text {
++  _activeAlertButton.toolTip = alert >= 0 ? text : nil;
++  [_activeAlertButton setAccessibilityLabel:alert >= 0 ? text : nil];
++  if (alert >= 0 && alert != _activeAlert) {
++    const auto a = static_cast<tabs::TabAlert>(alert);
++    [_activeAlertButton setImage:Symbol(AlertSymbol(a), 11, NSFontWeightMedium)];
++    _activeAlertButton.contentTintColor = AlertTint(a);
++  }
++  if (alert != _activeAlert) {
++    _activeAlert = alert;
++  }
++}
++
++// 🔊 in a tab: mute or unmute it, as in Safari. Other alerts (camera,
++// screen sharing…) just select the tab.
++- (void)tabCellAlertClicked:(SafariumTabCell*)cell {
++  if (!_controller) {
++    return;
++  }
++  if (cell.alert >= 0 &&
++      AlertTogglesMute(static_cast<tabs::TabAlert>(cell.alert))) {
++    _controller->ExecuteTabMenuCommand(
++        cell.tabId, safarium::TabBarController::TabMenuCommand::kToggleMuted);
++    return;
++  }
++  if (!cell.active) {
++    _controller->ActivateTab(cell.index);
++  }
++}
++
++- (void)activeAlertClicked:(NSButton*)sender {
++  if (!_controller || _activeIndex < 0 ||
++      _activeIndex >= (NSInteger)_cells.count || _activeAlert < 0 ||
++      !AlertTogglesMute(static_cast<tabs::TabAlert>(_activeAlert))) {
++    return;
++  }
++  _controller->ExecuteTabMenuCommand(
++      _cells[_activeIndex].tabId,
++      safarium::TabBarController::TabMenuCommand::kToggleMuted);
++}
++
+ - (void)pageMenuClicked:(NSButton*)sender {
+   if (!_controller) {
+     return;
+-- 
+2.54.0 (Apple Git-157)
+
