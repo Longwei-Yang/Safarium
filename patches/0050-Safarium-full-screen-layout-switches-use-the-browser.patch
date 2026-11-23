@@ -1,0 +1,100 @@
+From 91cf6ae62b7005bbe0c2c863b9c561d77914e9a8 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:40:13 -0500
+Subject: [PATCH 50/52] Safarium: full screen layout switches use the browser
+ window's geometry
+
+Vertical sidebar: row 0 is placed beside the traffic lights, whose
+position is measured in windowed mode and reused in full screen. It was
+measured relative to the sidebar view, which right after full screen
+ends can still have its full screen height while the buttons already sit
+in the smaller window, so row 0 could end up lower by the difference
+(1296 - 830pt on a user's external display) and stay there in the next
+full screen. Measure from the window's top-left corner instead.
+
+Compact tab bar: size tabs from the browser window, also in full screen,
+where the toolbar lives in AppKit's separate toolbar window, and follow
+that window's resizing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 34 ++++++++++++++-----
+ 1 file changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index fa44d72319..5dc4049725 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/ui/webui_browser/safarium_root_view.h"
+ #include "chrome/browser/ui/webui_browser/safarium_tab_bar_controller.h"
+ #import "components/remote_cocoa/app_shim/browser_native_widget_window_mac.h"
++#import "components/remote_cocoa/app_shim/immersive_mode_controller_cocoa.h"
+ #include "net/base/apple/url_conversions.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -1558,27 +1559,38 @@ - (void)layout {
+   [self relayoutAnimated:NO];
+ }
+ 
++// The browser window. In full screen the toolbar (and this view) moves into
++// AppKit's separate toolbar window, whose size isn't the browser's while it
++// is being set up and whose resizing isn't reliably reported.
++- (NSWindow*)browserWindow {
++  NSWindow* window = self.window;
++  if (window.parentWindow && remote_cocoa::IsNSToolbarFullScreenWindow(window)) {
++    return window.parentWindow;
++  }
++  return window;
++}
++
+ - (CGFloat)maxTabWidth {
+-  if (!self.window) {
++  NSWindow* window = [self browserWindow];
++  if (!window) {
+     return kMaxTabWidth;
+   }
+-  return MAX(kMinTabWidth,
+-             floor(NSWidth(self.window.frame) * kMaxTabWidthFraction));
++  return MAX(kMinTabWidth, floor(NSWidth(window.frame) * kMaxTabWidthFraction));
+ }
+ 
+-// The max tab width follows the window width.
++// The max tab width follows the browser window's width.
+ - (void)viewDidMoveToWindow {
+   [super viewDidMoveToWindow];
+   [NSNotificationCenter.defaultCenter
+       removeObserver:self
+                 name:NSWindowDidResizeNotification
+               object:nil];
+-  if (self.window) {
++  if (NSWindow* window = [self browserWindow]) {
+     [NSNotificationCenter.defaultCenter
+         addObserver:self
+            selector:@selector(windowDidResize:)
+                name:NSWindowDidResizeNotification
+-             object:self.window];
++             object:window];
+     [self updatePreferredWidthAnimated:NO];
+   }
+   [self updateContextClickMonitor];
+@@ -5187,8 +5199,14 @@ - (void)layout {
+     NSButton* close = [window standardWindowButton:NSWindowCloseButton];
+     NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
+     if (close.window == window && zoom.window == window) {
+-      _lightsCenterY = NSMidY([self convertRect:close.bounds fromView:close]);
+-      _lightsRight = NSMaxX([self convertRect:zoom.bounds fromView:zoom]) + 12;
++      // From the window's top-left corner (this view starts there), not
++      // from this view: right after full screen ends, this view can still
++      // have its full screen height while the buttons already sit in the
++      // smaller window, which put row 0 that difference too low, also in
++      // the next full screen (where this isn't measured).
++      _lightsCenterY = NSHeight(window.frame) -
++                       NSMidY([close convertRect:close.bounds toView:nil]);
++      _lightsRight = NSMaxX([zoom convertRect:zoom.bounds toView:nil]) + 12;
+     }
+   }
+   const CGFloat centerY = _lightsCenterY > 0 ? _lightsCenterY : 26;
+-- 
+2.54.0 (Apple Git-157)
+

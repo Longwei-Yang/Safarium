@@ -1,0 +1,87 @@
+From dcf9be9ac6990d005add4d4e3cec7ed9955c7ff9 Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:56:49 -0500
+Subject: [PATCH 51/52] Safarium: the tab bar knows its browser window
+
+Size the compact tab bar's tabs from the browser window it was installed
+in, instead of finding it through the full screen toolbar window's
+parent, which may not be set yet when the toolbar moves there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../safarium_tab_bar_host_mac.mm              | 21 ++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 5dc4049725..9cad92327f 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -395,6 +395,8 @@ - (void)hideHoverCard;
+ - (void)hoverCardThumbnail:(NSImage*)image forTab:(int64_t)tabId;
+ - (void)hoverCardMemory:(NSString*)text high:(BOOL)high forTab:(int64_t)tabId;
+ - (void)updatePreferredWidthAnimated:(BOOL)animated;
++// The browser window this bar belongs to; its width sets the tab widths.
++- (void)setHostWindow:(NSWindow*)window;
+ - (void)tabMouseDragged:(NSEvent*)event;
+ - (void)tabMouseUp:(NSEvent*)event;
+ // Called right before the address field takes keyboard focus.
+@@ -1372,6 +1374,7 @@ @implementation SafariumTabBarView {
+   NSLayoutConstraint* _minWidth;
+   NSLayoutConstraint* _maxWidth;
+   NSLayoutConstraint* _preferredWidth;
++  __weak NSWindow* _hostWindow;
+   NSLayoutConstraint* _pinnedWidth;  // Required; only while animating.
+   NSUInteger _pinGeneration;
+   // While the item width animates, tabs are laid out for the final width
+@@ -1563,6 +1566,9 @@ - (void)layout {
+ // AppKit's separate toolbar window, whose size isn't the browser's while it
+ // is being set up and whose resizing isn't reliably reported.
+ - (NSWindow*)browserWindow {
++  if (_hostWindow) {
++    return _hostWindow;
++  }
+   NSWindow* window = self.window;
+   if (window.parentWindow && remote_cocoa::IsNSToolbarFullScreenWindow(window)) {
+     return window.parentWindow;
+@@ -1578,9 +1584,22 @@ - (CGFloat)maxTabWidth {
+   return MAX(kMinTabWidth, floor(NSWidth(window.frame) * kMaxTabWidthFraction));
+ }
+ 
++- (void)setHostWindow:(NSWindow*)window {
++  if (_hostWindow == window) {
++    return;
++  }
++  _hostWindow = window;
++  [self observeBrowserWindowResize];
++}
++
+ // The max tab width follows the browser window's width.
+ - (void)viewDidMoveToWindow {
+   [super viewDidMoveToWindow];
++  [self observeBrowserWindowResize];
++  [self updateContextClickMonitor];
++}
++
++- (void)observeBrowserWindowResize {
+   [NSNotificationCenter.defaultCenter
+       removeObserver:self
+                 name:NSWindowDidResizeNotification
+@@ -1593,7 +1612,6 @@ - (void)viewDidMoveToWindow {
+              object:window];
+     [self updatePreferredWidthAnimated:NO];
+   }
+-  [self updateContextClickMonitor];
+ }
+ 
+ - (void)windowDidResize:(NSNotification*)notification {
+@@ -5710,6 +5728,7 @@ - (void)removeExtensionButton:(id)sender {
+ 
+ - (void)installInWindow:(NSWindow*)window {
+   _window = window;
++  [_tabView setHostWindow:window];
+   if (!_extensionClickMonitor) {
+     __weak SafariumToolbarController* weakSelf = self;
+     _extensionClickMonitor = [NSEvent
+-- 
+2.54.0 (Apple Git-157)
+

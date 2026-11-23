@@ -1,0 +1,42 @@
+From 561759bc31d91ab0273be5d8005744d17b9a661c Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:03:55 -0500
+Subject: [PATCH 52/52] Safarium: compact tab bar no longer collapses with
+ dozens of tabs
+
+The tab bar item's maximum width was every tab at its largest width, and
+that width follows the window's. With dozens of tabs it reached tens of
+thousands of points; once the window grew past a certain width, NSToolbar
+gave the item only its minimum width (one tab), centered, in a window or
+in full screen. Cap the maximum at the window's width; the strip scrolls
+beyond it anyway.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/safarium_tab_bar_host_mac.mm      | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+index 9cad92327f..aaa90ba97b 100644
+--- a/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_tab_bar_host_mac.mm
+@@ -1630,8 +1630,14 @@ - (CGFloat)preferredStripWidth {
+   const NSUInteger n = std::max<NSUInteger>(_cells.count, 1);
+   // With no tabs yet, size for one.
+   const NSUInteger normal = _cells.count ? _cells.count - pinned : 1;
+-  return 2 * kCapsuleInset + pinned * kPinnedTabWidth +
+-         normal * [self maxTabWidth] + kGap * (n - 1);
++  const CGFloat width = 2 * kCapsuleInset + pinned * kPinnedTabWidth +
++                        normal * [self maxTabWidth] + kGap * (n - 1);
++  // Never wider than the window (the strip scrolls beyond that). With dozens
++  // of tabs this reached tens of thousands of points, and once the window
++  // grew wide enough NSToolbar gave the item only its minimum width,
++  // centered.
++  NSWindow* window = [self browserWindow];
++  return window ? MIN(width, NSWidth(window.frame)) : width;
+ }
+ 
+ - (void)updateAddressPlaceholder {
+-- 
+2.54.0 (Apple Git-157)
+

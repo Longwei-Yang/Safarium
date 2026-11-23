@@ -1,13 +1,20 @@
 #!/bin/zsh
-# Package out/Release/Safarium.app into an ad-hoc signed DMG in ~/chromium/dist.
+# Package out/Release/Safarium.app into a signed DMG in ~/chromium/dist.
 #
 # Why not just Chromium's sign_chrome.py output:
-#  - it enables hardened runtime + library validation; with an ad-hoc
-#    signature (no Team ID) the app then refuses to load its own framework
+#  - it enables hardened runtime + library validation; without a Team ID
+#    (ad hoc or self-signed) the app then refuses to load its own framework
 #    ("Library not loaded ... libaperitif.dylib"), so we re-sign without them;
 #  - its pkg-dmg step leaves com.apple.FinderInfo on every file, which fails
 #    `codesign --verify --strict`, so we build the DMG with hdiutil instead.
 # With a real Developer ID, use sign_chrome.py --identity <ID> --notarize instead.
+#
+# The app is signed with a fixed self-signed certificate (see
+# make-signing-identity.sh), so its designated requirement is the same in
+# every build and macOS keeps Safarium's permission for its "Safarium Safe
+# Storage" keychain item across updates. An ad hoc signature changes with
+# every build, so macOS asks again after each update; if the app can't read
+# that key at startup, Chromium drops the cookies and settings it encrypted.
 set -euo pipefail
 
 SRC=${SAFARIUM_SRC:-$HOME/chromium/src}
@@ -28,7 +35,7 @@ echo "== sign (Chromium signing pipeline, ad-hoc)"
   --input "$OUT" --output "$WORK/signed" > "$WORK/sign.log" 2>&1) || { tail -20 "$WORK/sign.log"; exit 1; }
 APP=$(find "$WORK/signed" -maxdepth 3 -name Safarium.app -type d | head -1)
 
-echo "== re-sign ad-hoc without hardened runtime"
+echo "== re-sign without hardened runtime"
 mkdir -p "$WORK/stage"
 ditto --noextattr --noqtn "$APP" "$WORK/stage/Safarium.app"
 xattr -cr "$WORK/stage/Safarium.app"
@@ -48,7 +55,22 @@ plutil -replace SafariumBuild -integer "$FIX" "$PLIST"
 plutil -replace SafariumTag -string "$TAG" "$PLIST"
 plutil -replace SafariumCommit -string "$COMMIT" "$PLIST"
 echo "   $TAG (fix$FIX, $COMMIT)"
-codesign --force --deep --sign - --preserve-metadata=entitlements "$WORK/stage/Safarium.app"
+SIGN_DIR=${SAFARIUM_SIGNING_DIR:-$HOME/chromium/signing}
+KEYCHAIN=$SIGN_DIR/safarium-signing.keychain-db
+if [[ -f $KEYCHAIN && -f $SIGN_DIR/keychain-password ]]; then
+  security unlock-keychain -p "$(<$SIGN_DIR/keychain-password)" "$KEYCHAIN"
+  IDENTITY=$(security find-identity -p codesigning "$KEYCHAIN" | awk '/"Safarium Code Signing"/ {print $2; exit}')
+fi
+if [[ -n ${IDENTITY:-} ]]; then
+  echo "   signing as Safarium Code Signing ($IDENTITY)"
+  SIGN=(--sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none)
+elif [[ -n ${SAFARIUM_TAG:-} ]]; then
+  echo "No signing identity in $SIGN_DIR (run make-signing-identity.sh); a release must keep its certificate."; exit 1
+else
+  echo "   WARNING: no signing identity in $SIGN_DIR, signing ad hoc (macOS will ask for keychain access again)"
+  SIGN=(--sign -)
+fi
+codesign --force --deep "${SIGN[@]}" --preserve-metadata=entitlements "$WORK/stage/Safarium.app"
 codesign --verify --deep --strict "$WORK/stage/Safarium.app"
 ln -s /Applications "$WORK/stage/Applications"
 

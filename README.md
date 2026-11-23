@@ -60,7 +60,7 @@ The interface and its animations will keep being refined.
 
 **Site permissions.** When a site asks for your location, notifications, camera, microphone or similar, the request opens in a popover under the address field (beside the current tab in the sidebar), with Chrome's choices: allow while visiting the site, allow this time, or never allow. Indicators in the address field show what the page is using or was blocked from (pop-ups, location, camera and microphone, notifications…); click one to see what happened and change the setting. Chrome's other popups (saving passwords and addresses, zoom, QR code, sharing, extension dialogs) appear centered over the page.
 
-**Updates.** Safarium › Check for Updates… looks for a newer release here on GitHub, shows its notes and installs it: the DMG is downloaded and checked against the SHA-256 GitHub publishes, then Safarium quits, replaces itself and reopens with your windows and tabs. Safarium also checks once a day and only speaks up when there is something new; "Skip This Version" silences one release.
+**Updates.** Safarium › Check for Updates… looks for a newer release here on GitHub, shows its notes in a sheet on the browser window and installs it: the DMG is downloaded and checked against the SHA-256 GitHub publishes, then Safarium quits, replaces itself and reopens with your windows and tabs. Safarium also checks once a day and only speaks up when there is something new; "Skip This Version" silences one release.
 
 **New Tab shortcuts.** The New Tab page holds up to 20 shortcuts.
 
@@ -72,7 +72,7 @@ Safarium runs on Apple silicon Macs with macOS 26 or later. It is built and test
 
 1. Download the latest `Safarium-<version>-arm64.dmg` from [Releases](../../releases).
 2. Open it and drag **Safarium** into **Applications**.
-3. The app is signed ad hoc and not notarized, so the first launch shows **"Safarium.app" Not Opened**. Click **Done** (not Move to Trash), then either:
+3. The app is signed with Safarium's own self-signed certificate, not an Apple Developer ID, and isn't notarized, so the first launch shows **"Safarium.app" Not Opened**. Click **Done** (not Move to Trash), then either:
    - open **System Settings › Privacy & Security**, scroll to the message about Safarium, click **Open Anyway** and confirm, then open Safarium again and choose **Open Anyway**; or
    - run this once in Terminal:
 
@@ -82,7 +82,7 @@ Safarium runs on Apple silicon Macs with macOS 26 or later. It is built and test
 
    Right-click › Open no longer bypasses this check on macOS 15 and later.
 
-To update, use Safarium › Check for Updates… (from the first release that has it, fix6 on). For older copies, quit Safarium and replace the app with the one from the newer DMG, then repeat step 3 for the new copy. Bookmarks, history, passwords and extensions are stored in `~/Library/Application Support/Safarium` and are kept. macOS may ask once more for permission to use the "Safarium Safe Storage" keychain item.
+To update, use Safarium › Check for Updates… (from the first release that has it, fix6 on). For older copies, quit Safarium and replace the app with the one from the newer DMG, then repeat step 3 for the new copy. Bookmarks, history, passwords and extensions are stored in `~/Library/Application Support/Safarium` and are kept. Safarium encrypts cookies and checks its settings with a key in the "Safarium Safe Storage" keychain item. Up to fix8 the app was signed ad hoc, so macOS asked again for that item after every update. If you choose **Always Allow** once for a build signed with the certificate, later builds signed with the same certificate keep that permission. When macOS asks, choose **Always Allow**.
 
 ## Limitations
 
@@ -112,7 +112,10 @@ cp /path/to/Safarium/build/args.gn out/Release/args.gn
 gn gen out/Release
 autoninja -C out/Release chrome
 
-# 4. Package an ad hoc signed DMG into ~/chromium/dist.
+# 4. Once per build machine: create the signing certificate in its own
+#    keychain (~/chromium/signing; back it up). Then package a signed DMG
+#    into ~/chromium/dist.
+/path/to/Safarium/scripts/make-signing-identity.sh
 SAFARIUM_SRC="$PWD" /path/to/Safarium/scripts/package-safarium.sh
 ```
 
@@ -127,7 +130,8 @@ The script stamps the app for the updater: without `SAFARIUM_TAG` the DMG is a l
 | `patches/` | The Safarium changes as `git format-patch` files, applied in order |
 | `build/args.gn` | GN arguments for the release build |
 | `scripts/apply-patches.sh` | Applies the patches to a checkout at the base revision |
-| `scripts/package-safarium.sh` | Signs the release app ad hoc and builds the DMG |
+| `scripts/package-safarium.sh` | Signs the release app with the Safarium certificate and builds the DMG |
+| `scripts/make-signing-identity.sh` | Creates that self-signed certificate in its own keychain (once per build machine) |
 
 ## License
 

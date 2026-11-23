@@ -1,0 +1,96 @@
+From 2e886cda35cd007a1b171abd883ef843c580e2db Mon Sep 17 00:00:00 2001
+From: Longwei Yang <19267252+Longwei-Yang@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:26:15 -0500
+Subject: [PATCH 49/52] Safarium: update offer as a sheet; its notes scroll
+ smoothly
+
+Trackpad scrolling of the release notes stuttered in the update alert.
+The same NSAlert + NSTextView in a plain AppKit app stutters too, and so
+does a regular window run with NSApp runModalForWindow:, while the same
+window non-modal or as a sheet scrolls smoothly (user-tested with a real
+trackpad): AppKit's app-modal loop is the cause.
+
+The offer is now a sheet on the main window, or the frontmost window
+when Safarium is in the background (the daily check). It falls back to
+the modal alert when there is no window to attach to. The updater stays
+busy until the sheet closes; Check for Updates meanwhile brings that
+window forward instead of offering again.
+
+Tested: user scrolled the sheet (smooth); a second check while open
+shows the same sheet; a check with Finder frontmost attaches the sheet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ui/webui_browser/safarium_updater_mac.mm  | 42 ++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/ui/webui_browser/safarium_updater_mac.mm b/chrome/browser/ui/webui_browser/safarium_updater_mac.mm
+index bc7ac7414f..85e9758b4d 100644
+--- a/chrome/browser/ui/webui_browser/safarium_updater_mac.mm
++++ b/chrome/browser/ui/webui_browser/safarium_updater_mac.mm
+@@ -174,6 +174,7 @@ @implementation SafariumUpdater {
+   NSPanel* _progressPanel;
+   NSProgressIndicator* _progress;
+   NSTextField* _progressLabel;
++  NSWindow* _offerParent;  // The window showing the update offer sheet.
+ }
+ 
+ + (instancetype)shared {
+@@ -212,6 +213,8 @@ - (void)checkUserInitiated:(BOOL)userInitiated {
+   if (_busy) {
+     if (userInitiated && _progressPanel) {
+       [_progressPanel makeKeyAndOrderFront:nil];
++    } else if (userInitiated && _offerParent) {
++      [_offerParent makeKeyAndOrderFront:nil];
+     }
+     return;
+   }
+@@ -363,7 +366,44 @@ - (void)offerRelease:(NSDictionary*)release
+   [alert addButtonWithTitle:@"Remind Me Later"];
+   [alert addButtonWithTitle:@"Skip This Version"];
+   [NSApp activate];
+-  const NSModalResponse response = [alert runModal];
++  // A sheet on the browser window rather than an app-modal alert: in
++  // AppKit's modal loop trackpad scrolling of the notes stutters, while a
++  // sheet (or a regular window) scrolls smoothly. Without a window to attach
++  // to, fall back to the modal alert. A background app (the daily check)
++  // has no main window; use its frontmost window then.
++  NSWindow* parent = NSApp.mainWindow;
++  if (!parent) {
++    for (NSWindow* window in NSApp.orderedWindows) {
++      if (window.isVisible && window.canBecomeMainWindow &&
++          !window.sheetParent) {
++        parent = window;
++        break;
++      }
++    }
++  }
++  if (parent.isVisible && !parent.attachedSheet) {
++    _busy = YES;  // Until the sheet closes; a new check shows this one.
++    _offerParent = parent;
++    [parent makeKeyAndOrderFront:nil];
++    __weak SafariumUpdater* weakSelf = self;
++    [alert beginSheetModalForWindow:parent
++                  completionHandler:^(NSModalResponse response) {
++                    [weakSelf finishOffer:response
++                                      tag:tag
++                                      url:url
++                                   sha256:sha256];
++                  }];
++    return;
++  }
++  [self finishOffer:[alert runModal] tag:tag url:url sha256:sha256];
++}
++
++- (void)finishOffer:(NSModalResponse)response
++                tag:(NSString*)tag
++                url:(NSURL*)url
++             sha256:(NSString*)sha256 {
++  _busy = NO;
++  _offerParent = nil;
+   if (response == NSAlertThirdButtonReturn) {
+     [NSUserDefaults.standardUserDefaults setObject:tag forKey:kSkippedTagKey];
+     return;
+-- 
+2.54.0 (Apple Git-157)
+
